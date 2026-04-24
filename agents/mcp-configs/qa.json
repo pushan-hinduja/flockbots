@@ -1,0 +1,20 @@
+{
+  "_comment": "QA agent MCP config — Playwright for browser control + Supabase for DB verification. No knowledge graph (QA doesn't need it). Uses Chromium (not Google Chrome) so the browser binary auto-installs via Playwright's postinstall when `npm install` runs in coordinator/ — no manual browser install step required.",
+  "mcpServers": {
+    "playwright": {
+      "command": "npx",
+      "args": ["-y", "@playwright/mcp@latest", "--browser", "chromium"],
+      "env": {
+        "PLAYWRIGHT_HEADLESS": "${QA_HEADLESS:-true}"
+      }
+    },
+    "supabase": {
+      "command": "npx",
+      "args": ["-y", "@supabase/mcp-server-supabase@latest", "--read-only=false"],
+      "env": {
+        "SUPABASE_URL": "${SUPABASE_URL}",
+        "SUPABASE_SERVICE_ROLE_KEY": "${SUPABASE_SERVICE_ROLE_KEY}"
+      }
+    }
+  }
+}

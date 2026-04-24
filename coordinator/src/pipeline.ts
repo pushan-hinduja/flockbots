@@ -1,0 +1,1711 @@
+import { readFileSync, rmSync, writeFileSync } from 'fs';
+import { join } from 'path';
+import simpleGit from 'simple-git';
+import { db, logEvent, Task, createEscalation, dismissEscalationsForTask, consumeAnsweredEscalations } from './queue';
+import { getOctokit, getReviewerOctokit, GITHUB_OWNER, GITHUB_REPO, GITHUB_STAGING_BRANCH, GITHUB_PROD_BRANCH } from './github-auth';
+import { createWorktree, cleanupWorktree } from './worktree-manager';
+import { canRunAgent, pickNextTask } from './scheduler';
+import {
+  runAgentWithRetry, AgentConfig, SessionResult,
+  AGENT_DEFAULTS, readJSON, fileExists
+} from './session-manager';
+import { runTestGate } from './test-gate';
+import { syncToSupabase } from './supabase-sync';
+import { notifyOperator } from './notifier';
+import { updateLinearIssue, createLinearIssue, enrichLinearIssue } from './linear-sync';
+import { validatePmOutput, validateUxOutput, validateDevOutput, validateReviewerOutput, validateQAOutput, buildValidationRetryPrompt } from './output-validator';
+import { rebaseOnStaging } from './worktree-manager';
+import { flockbotsHome, tasksDir } from './paths';
+
+const TARGET_REPO_PATH = process.env.TARGET_REPO_PATH || '';
+const TASKS_DIR = tasksDir();
+
+// --- Per-Agent Concurrency Locks ---
+// Each agent (pm, ux, dev, reviewer) can run one task at a time.
+// Different agents can run concurrently.
+
+const agentLocks = new Map<string, { taskId: string; lockedAt: number }>();
+const STALE_LOCK_MS = 65 * 60 * 1000; // 65 minutes
+
+function agentForStatus(status: string): string {
+  switch (status) {
+    case 'inbox': case 'researching': case 'design_review':
+      return 'pm';
+    case 'design_pending': case 'designing':
+      return 'ux';
+    case 'dev_ready': case 'developing': case 'testing':
+      return 'dev';
+    case 'review_pending': case 'reviewing':
+      return 'reviewer';
+    case 'qa_pending': case 'qa_running':
+      return 'qa';
+    default:
+      return status;
+  }
+}
+
+function acquireAgentLock(agent: string, taskId: string): boolean {
+  const existing = agentLocks.get(agent);
+  if (existing) {
+    // Auto-release stale locks
+    if (Date.now() - existing.lockedAt > STALE_LOCK_MS) {
+      agentLocks.delete(agent);
+    } else {
+      return false;
+    }
+  }
+  agentLocks.set(agent, { taskId, lockedAt: Date.now() });
+  return true;
+}
+
+function releaseAgentLock(agent: string): void {
+  agentLocks.delete(agent);
+}
+
+function isAgentLocked(agent: string): boolean {
+  const existing = agentLocks.get(agent);
+  if (!existing) return false;
+  if (Date.now() - existing.lockedAt > STALE_LOCK_MS) {
+    agentLocks.delete(agent);
+    return false;
+  }
+  return true;
+}
+
+// Legacy compatibility
+function isLocked(): boolean {
+  return false; // No longer a single global lock
+}
+
+// --- Status Management ---
+
+const STATUS_LABELS: Record<string, string> = {
+  researching: 'Research started',
+  design_pending: 'Queued for design',
+  designing: 'Design started',
+  design_review: 'Design under review',
+  dev_ready: 'Ready for development',
+  developing: 'Development started',
+  testing: 'Running tests',
+  review_pending: 'Queued for PR & review',
+  reviewing: 'Code review started',
+  qa_pending: 'Queued for QA',
+  qa_running: 'QA verification running',
+  qa_done: 'QA passed',
+  qa_failed: 'QA failed — auto fix task created',
+  merged: 'Merged to staging',
+  deployed: 'Deployed to production',
+  failed: 'Task failed',
+  awaiting_human: 'Waiting for human input',
+};
+
+async function updateStatus(taskId: string, status: string): Promise<void> {
+  db.prepare('UPDATE tasks SET status = ?, updated_at = ? WHERE id = ?')
+    .run(status, Date.now(), taskId);
+  logEvent(taskId, 'system', 'status_change', STATUS_LABELS[status] || `Status: ${status}`);
+  // Auto-clear pending escalations when task moves past awaiting_human
+  if (status !== 'awaiting_human') {
+    dismissEscalationsForTask(taskId);
+  }
+  await syncToSupabase('task_update', { id: taskId, status });
+}
+
+// --- Escalation Handling ---
+
+function extractEscalation(taskId: string): string {
+  const questions: string[] = [];
+
+  // 1. Check questions.md — if it contains any question marker, send the full content
+  const questionsPath = join(TASKS_DIR, taskId, 'questions.md');
+  if (fileExists(questionsPath)) {
+    const content = readFileSync(questionsPath, 'utf-8').trim();
+    if (content.length > 0) {
+      // If the file has any PM_QUESTION or DEV_QUESTION marker (with any prefix like "## "),
+      // send the entire file — agents often write multi-line questions with context,
+      // recommendations, and escalation reasons that are all useful to the human.
+      if (/PM_QUESTION|DEV_QUESTION/i.test(content)) {
+        questions.push(content);
+      } else {
+        // No marker at all — still include the content as it may be a plain question
+        questions.push(content);
+      }
+    }
+  }
+
+  // 2. Check context.json for escalation_reason or questions field
+  const contextPath = join(TASKS_DIR, taskId, 'context.json');
+  if (fileExists(contextPath)) {
+    try {
+      const ctx = JSON.parse(readFileSync(contextPath, 'utf-8'));
+      if (ctx.escalation_reason) questions.push(`Reason: ${ctx.escalation_reason}`);
+      if (ctx.questions && Array.isArray(ctx.questions)) {
+        for (const q of ctx.questions) questions.push(typeof q === 'string' ? q : JSON.stringify(q));
+      } else if (ctx.question) {
+        questions.push(typeof ctx.question === 'string' ? ctx.question : JSON.stringify(ctx.question));
+      }
+    } catch {}
+  }
+
+  return questions.length > 0 ? questions.join('\n') : '';
+}
+
+async function handleEscalation(task: Task, result: SessionResult, customMessage?: string): Promise<void> {
+  let question = customMessage || extractEscalation(task.id);
+
+  // If still no specific question, build a rich fallback with context + recent output
+  if (!question || question.trim().length === 0) {
+    const recentOutput = result.output
+      ? result.output.slice(-1000).trim()
+      : '';
+    const parts = [
+      `No specific question found in questions.md or context.json.`,
+      `Task: ${task.title}`,
+      task.description ? `Description: ${task.description.slice(0, 300)}` : '',
+      recentOutput ? `\nLast agent output:\n${recentOutput}` : '',
+      `\nTo unblock: check tasks/${task.id}/ on the coordinator for partial output, or /retry ${task.id} to re-run from the last safe stage.`,
+    ].filter(Boolean);
+    question = parts.join('\n');
+  }
+
+  createEscalation(task.id, question);
+  // Cap WhatsApp message to 4000 chars (WhatsApp API limit is 4096)
+  const shortTitle = task.title.length > 80 ? task.title.slice(0, 80) + '...' : task.title;
+  const header = `Task ${task.id} needs input\n${shortTitle}\n\n`;
+  const maxQuestionLen = 4000 - header.length;
+  const whatsappMsg = header + question.slice(0, maxQuestionLen);
+  await notifyOperator(whatsappMsg);
+  // Re-fetch current status from DB — the in-memory task object may be stale because
+  // processTaskStage transitions status (e.g. inbox → researching) before calling the agent
+  const currentStatus = (db.prepare('SELECT status FROM tasks WHERE id = ?').get(task.id) as { status: string })?.status || task.status;
+  db.prepare('UPDATE tasks SET error = ?, updated_at = ? WHERE id = ?')
+    .run(JSON.stringify({ previous_status: currentStatus }), Date.now(), task.id);
+  await updateStatus(task.id, 'awaiting_human');
+}
+
+async function handleFailure(task: Task, result: SessionResult): Promise<void> {
+  // Re-fetch current status from DB — in-memory task object may be stale
+  const currentStatus = (db.prepare('SELECT status FROM tasks WHERE id = ?').get(task.id) as { status: string })?.status || task.status;
+  const errorInfo = JSON.stringify({
+    previous_status: currentStatus,
+    output: result.output.slice(0, 2000),
+  });
+  db.prepare('UPDATE tasks SET error = ?, updated_at = ? WHERE id = ?')
+    .run(errorInfo, Date.now(), task.id);
+  await updateStatus(task.id, 'failed');
+  await notifyOperator(`Task failed: ${task.title}\n${result.output.slice(0, 500)}`);
+}
+
+async function handleAgentResult(task: Task, result: SessionResult): Promise<void> {
+  switch (result.status) {
+    case 'questions_pending':
+    case 'escalate':
+      await handleEscalation(task, result);
+      break;
+    case 'rate_limited':
+      logEvent(task.id, 'scheduler', 'rate_limited', 'Hit rate limit, will retry next cycle');
+      break;
+    case 'killed':
+      // WhatsApp override killed the session; override handler already reset status.
+      // No-op — just let the next pipeline tick re-run the stage with new settings.
+      break;
+    case 'failed':
+      await handleFailure(task, result);
+      break;
+  }
+}
+
+async function handleDevQuestions(task: Task): Promise<void> {
+  const result = await runAgentWithRetry({
+    agent: 'pm',
+    taskId: task.id,
+    model: 'claude-sonnet-4-6',
+    tools: ['Read', 'Write', 'Glob', 'Grep'],
+    resume: true, // Resume PM's original research session — it knows the codebase already
+    extraPromptContext: 'Answer DEV_QUESTION entries in questions.md. Write answers to context.json under "qa".',
+    cwd: TARGET_REPO_PATH,
+    enableStreaming: true,
+  }, 2);
+
+  if (result.status === 'complete') {
+    await updateStatus(task.id, 'developing');
+  } else if (result.status === 'escalate') {
+    await handleEscalation(task, result);
+  }
+}
+
+// --- Stage Handlers ---
+
+async function runResearchStage(task: Task): Promise<void> {
+  if (!canRunAgent('claude-sonnet-4-6', 'S')) {
+    logEvent(task.id, 'scheduler', 'defer', 'Budget too low for research');
+    return;
+  }
+
+  // If resuming after an answered escalation, inject the answer as context
+  const escalation = db.prepare(
+    "SELECT answer FROM escalations WHERE task_id = ? AND status = 'answered' ORDER BY answered_at DESC LIMIT 1"
+  ).get(task.id) as { answer: string } | undefined;
+  const isResume = !!escalation?.answer;
+  const answerContext = isResume
+    ? `\n\nHUMAN ANSWER TO YOUR QUESTION(S):\n${escalation.answer}\n\nContinue your research with this information. The questions.md file has been cleared since they are now answered. Only create a new questions.md if you have GENUINELY NEW questions the human hasn't answered yet.`
+    : '';
+
+  // Clear the old questions.md so the resumed session doesn't see stale questions
+  // that would make deriveStatus think questions are still pending
+  if (isResume) {
+    const questionsPath = join(TASKS_DIR, task.id, 'questions.md');
+    if (fileExists(questionsPath)) {
+      try { rmSync(questionsPath); } catch {}
+    }
+  }
+
+  const result = await runAgentWithRetry({
+    agent: 'pm',
+    taskId: task.id,
+    model: 'claude-sonnet-4-6',
+    tools: AGENT_DEFAULTS.pm.tools,
+    cwd: TARGET_REPO_PATH,
+    resume: isResume, // Resume PM's session if continuing after an escalation answer
+    extraPromptContext: answerContext || undefined,
+    enableStreaming: true,
+  }, 3);
+
+  // Mark any answered escalations as consumed so they don't re-inject on next run
+  if (isResume && result.status !== 'questions_pending' && result.status !== 'escalate') {
+    consumeAnsweredEscalations(task.id);
+  }
+
+  // Update task title from context.json if PM wrote one — even if escalating/failing,
+  // so downstream messaging uses the clean title instead of the raw description
+  try {
+    const earlyCtx = readJSON(join(TASKS_DIR, task.id, 'context.json'));
+    if (earlyCtx?.research?.title && earlyCtx.research.title.length > 0 && earlyCtx.research.title !== task.title) {
+      db.prepare('UPDATE tasks SET title = ?, updated_at = ? WHERE id = ?')
+        .run(earlyCtx.research.title, Date.now(), task.id);
+      task.title = earlyCtx.research.title; // Update in-memory so handleEscalation uses it
+      await syncToSupabase('task_update', { id: task.id });
+    }
+  } catch {}
+
+  switch (result.status) {
+    case 'complete': {
+      const ctx = readJSON(join(TASKS_DIR, task.id, 'context.json'));
+      if (ctx.effort) {
+        db.prepare(`
+          UPDATE tasks SET effort_size = ?, estimated_turns = ?,
+          dev_model = ?, reviewer_model = ?,
+          dev_effort = ?, reviewer_effort = ?,
+          use_swarm = ?,
+          updated_at = ?
+          WHERE id = ?
+        `).run(
+          ctx.effort.size, ctx.effort.estimated_turns,
+          ctx.effort.dev_model, ctx.effort.reviewer_model,
+          ctx.effort.dev_effort, ctx.effort.reviewer_effort,
+          ctx.effort.use_swarm ? 1 : 0,
+          Date.now(), task.id
+        );
+      }
+
+      // Persist affected_files for scheduler's overlap-based serialization.
+      // Tasks with empty/missing lists are treated conservatively (serialize against all).
+      if (Array.isArray(ctx.research?.affected_files)) {
+        db.prepare('UPDATE tasks SET affected_files = ?, updated_at = ? WHERE id = ?')
+          .run(JSON.stringify(ctx.research.affected_files), Date.now(), task.id);
+      } else {
+        logEvent(task.id, 'validator', 'pm_missing_affected_files',
+          'PM did not produce research.affected_files — scheduler will serialize against all in-flight tasks');
+      }
+
+      // Validate PM output (includes title check)
+      const pmValidation = validatePmOutput(task.id);
+      if (!pmValidation.valid) {
+        logEvent(task.id, 'validator', 'pm_retry', `PM output invalid: ${pmValidation.errors.join(', ')}`);
+        const retryResult = await runAgentWithRetry({
+          agent: 'pm', taskId: task.id, model: 'claude-sonnet-4-6',
+          tools: AGENT_DEFAULTS.pm.tools, cwd: TARGET_REPO_PATH,
+          resume: true, // Resume — validation retry is a tight loop fixing the output we just produced
+          extraPromptContext: buildValidationRetryPrompt(pmValidation.errors),
+          enableStreaming: true,
+        }, 1);
+        if (retryResult.status !== 'complete' || !validatePmOutput(task.id).valid) {
+          await handleFailure(task, { ...result, output: `PM validation failed: ${pmValidation.errors.join(', ')}` });
+          break;
+        }
+        // Re-read context after retry
+        const retryCtx = readJSON(join(TASKS_DIR, task.id, 'context.json'));
+        Object.assign(ctx, retryCtx);
+      }
+
+      // Update task title from PM research (after validation ensures it exists)
+      const pmTitle = ctx.research?.title;
+      if (pmTitle && pmTitle.length > 0) {
+        db.prepare('UPDATE tasks SET title = ?, updated_at = ? WHERE id = ?')
+          .run(pmTitle, Date.now(), task.id);
+        await syncToSupabase('task_update', { id: task.id });
+      }
+
+      // Sync research findings to Linear
+      const cleanTitle = pmTitle || task.title;
+      if (task.source === 'linear' && task.source_id) {
+        await enrichLinearIssue(task.source_id, ctx, pmTitle);
+      } else if (!task.source_id) {
+        const linearId = await createLinearIssue(
+          cleanTitle,
+          `${task.description}\n\n${ctx.research?.summary || ''}`,
+          task.priority
+        );
+        if (linearId) {
+          db.prepare('UPDATE tasks SET source_id = ?, source = COALESCE(source, ?), updated_at = ? WHERE id = ?')
+            .run(linearId, 'manual', Date.now(), task.id);
+          await enrichLinearIssue(linearId, ctx);
+          logEvent(task.id, 'system', 'linear_created', 'Created and enriched Linear issue from task');
+          await syncToSupabase('task_update', { id: task.id });
+        }
+      }
+
+      // Design skip — if PM flagged this as non-UI, jump straight to dev_ready
+      if (ctx.effort?.skip_design) {
+        logEvent(task.id, 'system', 'design_skipped', 'PM flagged as non-UI task, skipping design phase');
+        await updateStatus(task.id, 'dev_ready');
+      } else {
+        await updateStatus(task.id, 'design_pending');
+      }
+      break;
+    }
+    case 'questions_pending':
+    case 'escalate':
+      await handleEscalation(task, result);
+      break;
+    case 'rate_limited':
+      logEvent(task.id, 'scheduler', 'rate_limited', 'Hit rate limit during research, will retry');
+      break;
+    case 'failed':
+      await handleFailure(task, result);
+      break;
+  }
+}
+
+async function runDesignStage(task: Task): Promise<void> {
+  if (!canRunAgent('claude-sonnet-4-6', 'S')) return;
+
+  // If resuming after an answered escalation, inject the answer as context
+  const escalation = db.prepare(
+    "SELECT answer FROM escalations WHERE task_id = ? AND status = 'answered' ORDER BY answered_at DESC LIMIT 1"
+  ).get(task.id) as { answer: string } | undefined;
+  const isResume = !!escalation?.answer;
+  const answerContext = isResume
+    ? `\n\nHUMAN ANSWER TO YOUR QUESTION(S):\n${escalation.answer}\n\nContinue your design with this information. The questions.md file has been cleared since they are now answered. Only create a new questions.md if you have GENUINELY NEW questions.`
+    : '';
+
+  // Clear old questions.md so resumed session doesn't see stale questions
+  if (isResume) {
+    const questionsPath = join(TASKS_DIR, task.id, 'questions.md');
+    if (fileExists(questionsPath)) {
+      try { rmSync(questionsPath); } catch {}
+    }
+  }
+
+  const result = await runAgentWithRetry({
+    agent: 'ux',
+    taskId: task.id,
+    model: 'claude-sonnet-4-6',
+    tools: AGENT_DEFAULTS.ux.tools,
+    cwd: TARGET_REPO_PATH,
+    resume: isResume, // Resume UX's session if continuing after an escalation answer
+    extraPromptContext: answerContext || undefined,
+    enableStreaming: true,
+  }, 3);
+
+  if (isResume && result.status !== 'questions_pending' && result.status !== 'escalate') {
+    consumeAnsweredEscalations(task.id);
+  }
+
+  if (result.status === 'complete') {
+    await updateStatus(task.id, 'design_review');
+  } else {
+    await handleAgentResult(task, result);
+  }
+}
+
+async function runDesignReview(task: Task): Promise<void> {
+  if (!canRunAgent('claude-sonnet-4-6', 'S')) return;
+
+  // If resuming after an answered escalation, inject the answer as context
+  const escalation = db.prepare(
+    "SELECT answer FROM escalations WHERE task_id = ? AND status = 'answered' ORDER BY answered_at DESC LIMIT 1"
+  ).get(task.id) as { answer: string } | undefined;
+  const isResume = !!escalation?.answer;
+  const basePrompt = 'You are reviewing the UX design spec. Read design-spec.md and write your handoff decision to context.json.';
+  const extraContext = isResume
+    ? `${basePrompt}\n\nHUMAN ANSWER TO YOUR QUESTION(S):\n${escalation.answer}\n\nContinue your review with this information. The questions.md file has been cleared since they are now answered. Only create a new questions.md if you have GENUINELY NEW questions.`
+    : basePrompt;
+
+  // Clear old questions.md so resumed session doesn't see stale questions
+  if (isResume) {
+    const questionsPath = join(TASKS_DIR, task.id, 'questions.md');
+    if (fileExists(questionsPath)) {
+      try { rmSync(questionsPath); } catch {}
+    }
+  }
+
+  const result = await runAgentWithRetry({
+    agent: 'pm',
+    taskId: task.id,
+    model: 'claude-sonnet-4-6',
+    tools: ['Read', 'Write'],
+    resume: isResume,
+    extraPromptContext: extraContext,
+    cwd: TARGET_REPO_PATH,
+    enableStreaming: true,
+  }, 3);
+
+  if (isResume && result.status !== 'questions_pending' && result.status !== 'escalate') {
+    consumeAnsweredEscalations(task.id);
+  }
+
+  if (result.status === 'complete') {
+    const ctx = readJSON(join(TASKS_DIR, task.id, 'context.json'));
+    if (ctx.handoff?.HANDOFF_READY === true) {
+      logEvent(task.id, 'pm', 'design_approved', 'Design approved, ready for development');
+      await updateStatus(task.id, 'dev_ready');
+    } else {
+      logEvent(task.id, 'pm', 'design_revision', 'Design needs revision, sending back to designer');
+      await updateStatus(task.id, 'design_pending');
+    }
+  } else {
+    await handleAgentResult(task, result);
+  }
+}
+
+/**
+ * Resume dev agent on a task that was escalated and answered by a human.
+ * Includes the human's answer and prior review history as context.
+ */
+async function resumeDevWithContext(task: Task): Promise<void> {
+  const worktreePath = task.worktree_path || '';
+  if (!worktreePath) {
+    await handleFailure(task, { status: 'failed', output: 'Missing worktree_path for dev resume', durationMs: 0, exitCode: 1 });
+    return;
+  }
+
+  // Get the human's answer from the most recent answered escalation
+  const escalation = db.prepare(
+    "SELECT answer FROM escalations WHERE task_id = ? AND status = 'answered' ORDER BY answered_at DESC LIMIT 1"
+  ).get(task.id) as { answer: string } | undefined;
+
+  // Get prior review history from GitHub
+  let priorReviews = '';
+  if (task.pr_number) {
+    try {
+      const octokit = await getOctokit();
+      const { data: allReviews } = await octokit.pulls.listReviews({
+        owner: GITHUB_OWNER, repo: GITHUB_REPO,
+        pull_number: task.pr_number,
+      });
+      const changesRequested = allReviews.filter((r: any) => r.state === 'CHANGES_REQUESTED' && r.body);
+      if (changesRequested.length > 0) {
+        const lastReview = changesRequested[changesRequested.length - 1];
+        priorReviews = `\n\nMOST RECENT REVIEW:\n${(lastReview as any).body!.slice(0, 2000)}`;
+      }
+    } catch {}
+  }
+
+  const humanContext = escalation?.answer
+    ? `\n\nHUMAN ARCHITECT GUIDANCE (follow this exactly):\n${escalation.answer}`
+    : '';
+
+  // Clear old questions.md so the resumed session doesn't see stale questions
+  if (escalation?.answer) {
+    const questionsPath = join(TASKS_DIR, task.id, 'questions.md');
+    if (fileExists(questionsPath)) {
+      try { rmSync(questionsPath); } catch {}
+    }
+  }
+
+  logEvent(task.id, 'system', 'dev_resumed', 'Dev agent resumed with human guidance');
+
+  const result = await runAgentWithRetry({
+    agent: 'dev',
+    taskId: task.id,
+    model: (task.dev_model || 'claude-sonnet-4-6') as any,
+    tools: AGENT_DEFAULTS.dev.tools,
+    promptVariant: 'single',
+    resume: true, // Resume dev's session — human answer fills in missing context, continue where we left off
+    extraPromptContext: `RESUMING AFTER HUMAN REVIEW
+
+A human architect has reviewed the prior review cycles and provided specific guidance.
+Follow their instructions precisely — they've identified the root cause of the recurring issues.
+${humanContext}${priorReviews}`,
+    cwd: worktreePath,
+    effortSize: task.effort_size || 'M',
+    effortLevel: (task.dev_effort || 'medium') as any,
+    enableStreaming: true,
+  }, 3);
+
+  if (result.status !== 'questions_pending' && result.status !== 'escalate') {
+    consumeAnsweredEscalations(task.id);
+  }
+
+  if (result.status === 'complete') {
+    await updateStatus(task.id, 'review_pending');
+  } else {
+    await handleAgentResult(task, result);
+  }
+}
+
+async function runDevPipeline(task: Task): Promise<void> {
+  const worktreePath = await createWorktree(task.id);
+  db.prepare('UPDATE tasks SET worktree_path = ?, branch_name = ?, updated_at = ? WHERE id = ?')
+    .run(worktreePath, `task/${task.id}`, Date.now(), task.id);
+  await syncToSupabase('task_update', { id: task.id });
+
+  await updateStatus(task.id, 'developing');
+
+  const variant = task.use_swarm ? 'swarm' : 'single';
+
+  const result = await runAgentWithRetry({
+    agent: 'dev',
+    taskId: task.id,
+    model: (task.dev_model || 'claude-sonnet-4-6') as any,
+    tools: task.use_swarm
+      ? [...AGENT_DEFAULTS.dev.tools, 'Agent']
+      : AGENT_DEFAULTS.dev.tools,
+    promptVariant: variant as any,
+    cwd: worktreePath,
+    effortSize: task.effort_size || 'M',
+    effortLevel: (task.dev_effort || 'medium') as any,
+    enableStreaming: true,
+  }, 3);
+
+  switch (result.status) {
+    case 'complete': {
+      const ctx = readJSON(join(TASKS_DIR, task.id, 'context.json'));
+      if (ctx.SECURITY_BLOCK) {
+        await handleEscalation(task, result, 'Security issue found - review required');
+        return;
+      }
+      // Validate dev output
+      const devValidation = validateDevOutput(task.id);
+      if (!devValidation.valid) {
+        logEvent(task.id, 'validator', 'dev_incomplete', devValidation.errors.join(', '));
+        // Retry once with validation feedback
+        const retryResult = await runAgentWithRetry({
+          agent: 'dev', taskId: task.id, model: (task.dev_model || 'claude-sonnet-4-6') as any,
+          tools: AGENT_DEFAULTS.dev.tools, promptVariant: 'single', cwd: worktreePath,
+          resume: true, // Resume — validation retry is a tight loop fixing output we just produced
+          extraPromptContext: buildValidationRetryPrompt(devValidation.errors),
+          effortSize: task.effort_size || 'M',
+          effortLevel: (task.dev_effort || 'medium') as any,
+        }, 1);
+        if (retryResult.status !== 'complete' || !validateDevOutput(task.id).valid) {
+          await handleFailure(task, { ...result, output: `Dev validation failed: ${devValidation.errors.join(', ')}` });
+          break;
+        }
+      }
+      await updateStatus(task.id, 'review_pending');
+      break;
+    }
+    case 'questions_pending':
+      await handleDevQuestions(task);
+      break;
+    case 'rate_limited':
+      await updateStatus(task.id, 'dev_ready');
+      break;
+    case 'killed':
+      // WhatsApp override handled state reset. Leave task alone for next pipeline tick.
+      break;
+    case 'failed':
+      await handleFailure(task, result);
+      break;
+  }
+}
+
+async function runTestStage(task: Task): Promise<void> {
+  const worktreePath = task.worktree_path || '';
+  if (!worktreePath) { await handleFailure(task, { status: 'failed', output: 'Missing worktree_path', durationMs: 0, exitCode: 1 }); return; }
+  const testResult = await runTestGate(task.id, worktreePath);
+
+  if (testResult.passed) {
+    await updateStatus(task.id, 'review_pending');
+  } else {
+    if (task.test_retry_count < 3) {
+      db.prepare('UPDATE tasks SET test_retry_count = test_retry_count + 1, updated_at = ? WHERE id = ?')
+        .run(Date.now(), task.id);
+      await syncToSupabase('task_update', { id: task.id });
+
+      logEvent(task.id, 'test_gate', 'retry',
+        `Tests failed (attempt ${task.test_retry_count + 1}/3), sending back to dev`);
+
+      const result = await runAgentWithRetry({
+        agent: 'dev',
+        taskId: task.id,
+        model: (task.dev_model || 'claude-sonnet-4-6') as any,
+        tools: AGENT_DEFAULTS.dev.tools,
+        promptVariant: 'single',
+        resume: true, // Resume — tight feedback loop, dev just wrote the code that failed
+        extraPromptContext: `TESTS FAILED. Fix the following failures and commit:\n\n${testResult.output}`,
+        cwd: worktreePath,
+        effortSize: task.effort_size || 'M',
+        effortLevel: (task.dev_effort || 'medium') as any,
+        enableStreaming: true,
+      }, 2);
+
+      if (result.status === 'complete') {
+        await updateStatus(task.id, 'testing');
+      } else {
+        await handleAgentResult(task, result);
+      }
+    } else {
+      await handleEscalation(
+        task,
+        { status: 'failed', output: testResult.output, durationMs: 0, exitCode: 1 },
+        'Tests failed after 3 attempts'
+      );
+    }
+  }
+}
+
+async function runCreatePR(task: Task): Promise<void> {
+  const worktreePath = task.worktree_path || '';
+  const branchName = task.branch_name || '';
+  if (!worktreePath || !branchName) { await handleFailure(task, { status: 'failed', output: 'Missing worktree_path or branch_name', durationMs: 0, exitCode: 1 }); return; }
+  const octokit = await getOctokit();
+
+  // Rebase on latest staging to avoid merge conflicts. The helper escalates
+  // rebase → merge → AI conflict resolver before giving up.
+  const rebaseResult = await rebaseOnStaging(task.id);
+  if (rebaseResult.ok && rebaseResult.strategy !== 'rebase') {
+    logEvent(task.id, 'system', 'rebase_recovered',
+      `Integrated staging via "${rebaseResult.strategy}" strategy (rebase had conflicts)`);
+  }
+  if (!rebaseResult.ok) {
+    // Network errors are transient — leave the task at review_pending and let the next
+    // pipeline cycle retry. Don't waste a retry slot or escalate.
+    if (rebaseResult.reason === 'network') {
+      logEvent(task.id, 'system', 'rebase_network_retry',
+        'Network error during rebase — will retry next cycle (no recovery action taken)');
+      return;
+    }
+
+    // Conflict — auto-recovery: another task likely touched the same files and merged.
+    // Clean up the worktree and reset to dev_ready so the dev agent re-implements on top
+    // of the latest staging. Cap to 2 attempts to avoid loops.
+    if (rebaseResult.reason === 'conflict') {
+      const retryCount = task.retry_count || 0;
+      if (retryCount < 2) {
+        logEvent(task.id, 'system', 'rebase_conflict_recover',
+          `Rebase conflict detected — cleaning up and re-running dev on fresh worktree (attempt ${retryCount + 1}/2)`);
+
+        try { await cleanupWorktree(task.id); } catch {}
+        if (branchName && TARGET_REPO_PATH) {
+          try { await simpleGit(TARGET_REPO_PATH).branch(['-D', branchName]); } catch {}
+        }
+
+        db.prepare(`
+          UPDATE tasks SET
+            status = 'dev_ready', worktree_path = NULL, branch_name = NULL,
+            pr_url = NULL, pr_number = NULL,
+            retry_count = ?, test_retry_count = 0, error = NULL,
+            updated_at = ?
+          WHERE id = ?
+        `).run(retryCount + 1, Date.now(), task.id);
+
+        await syncToSupabase('task_update', { id: task.id });
+        return;
+      }
+
+      // Exceeded auto-recovery attempts — escalate with manual resolution instructions
+      await handleEscalation(task, {
+        status: 'failed', output: 'Rebase on staging failed after 2 auto-recovery attempts', durationMs: 0, exitCode: 1,
+      }, `Branch ${branchName} has persistent conflicts with staging.
+
+Auto-recovery (re-running dev on fresh worktree) was attempted twice and failed.
+
+To resolve manually:
+1. SSH into the coordinator
+2. cd to the worktree (TARGET_REPO_PATH/.worktrees/task-${task.id})
+3. git fetch origin && git rebase origin/staging
+4. Resolve conflicts, git add, git rebase --continue
+5. git push --force-with-lease
+6. /answer ${task.id} resolved
+
+Or use the dashboard to revert the task to Ready and let dev re-implement.`);
+      return;
+    }
+
+    // Other failure — escalate with the raw error
+    await handleEscalation(task, {
+      status: 'failed', output: rebaseResult.message, durationMs: 0, exitCode: 1,
+    }, `Rebase failed: ${rebaseResult.message.slice(0, 500)}`);
+    return;
+  }
+
+  const git = simpleGit(worktreePath);
+  await git.push('origin', branchName, ['--force-with-lease']);
+
+  let prBody = '';
+  try {
+    prBody = readFileSync(join(TASKS_DIR, task.id, 'implementation-summary.md'), 'utf-8');
+  } catch {
+    prBody = `Automated implementation for task ${task.id}`;
+  }
+
+  let pr: { html_url: string; number: number } = null as any;
+
+  // If the task already has a PR from a previous cycle, reuse it
+  if (task.pr_number) {
+    try {
+      const { data: existingPr } = await octokit.pulls.get({
+        owner: GITHUB_OWNER, repo: GITHUB_REPO,
+        pull_number: task.pr_number,
+      });
+      if (existingPr.state === 'open') {
+        // Update the PR title/body in case they changed
+        await octokit.pulls.update({
+          owner: GITHUB_OWNER, repo: GITHUB_REPO,
+          pull_number: task.pr_number,
+          title: task.title,
+          body: prBody,
+        });
+        pr = existingPr;
+        logEvent(task.id, 'system', 'pr_reused', `Using existing PR #${pr.number}`);
+      } else {
+        // PR was closed/merged — create a new one
+        task.pr_number = null;
+        task.pr_url = null;
+        pr = null as any; // Will be created below
+      }
+    } catch {
+      task.pr_number = null;
+      task.pr_url = null;
+      pr = null as any;
+    }
+  }
+
+  if (!task.pr_number) {
+    try {
+      const { data } = await octokit.pulls.create({
+        owner: GITHUB_OWNER,
+        repo: GITHUB_REPO,
+        title: task.title,
+        head: branchName,
+        base: GITHUB_STAGING_BRANCH,
+        body: prBody,
+      });
+      pr = data;
+    } catch (err: any) {
+      const ghErrors = err.response?.data?.errors?.map((e: any) => e.message || JSON.stringify(e)).join('; ') || '';
+      const detail = ghErrors ? `${err.message} — ${ghErrors}` : err.message;
+      logEvent(task.id, 'system', 'pr_error', `PR creation failed: ${detail}`);
+
+      // 422 — PR already exists for this branch. Find it (open or closed).
+      if (err.status === 422) {
+        const { data: openPrs } = await octokit.pulls.list({
+          owner: GITHUB_OWNER, repo: GITHUB_REPO,
+          head: `${GITHUB_OWNER}:${branchName}`, state: 'open',
+        });
+        if (openPrs.length > 0) {
+          pr = openPrs[0];
+          logEvent(task.id, 'system', 'pr_reused', `Using existing open PR #${pr.number}`);
+        } else {
+          // Try closed PRs — reopen if possible
+          const { data: closedPrs } = await octokit.pulls.list({
+            owner: GITHUB_OWNER, repo: GITHUB_REPO,
+            head: `${GITHUB_OWNER}:${branchName}`, state: 'closed',
+          });
+          const unmerged = closedPrs.find(p => !p.merged_at);
+          if (unmerged) {
+            await octokit.pulls.update({
+              owner: GITHUB_OWNER, repo: GITHUB_REPO,
+              pull_number: unmerged.number, state: 'open',
+              title: task.title, body: prBody,
+            });
+            pr = unmerged;
+            logEvent(task.id, 'system', 'pr_reopened', `Reopened PR #${pr.number}`);
+          } else {
+            await handleFailure(task, { status: 'failed', output: `PR creation failed: ${detail}`, durationMs: 0, exitCode: 1 });
+            return;
+          }
+        }
+      } else {
+        await handleFailure(task, { status: 'failed', output: `PR creation failed: ${detail}`, durationMs: 0, exitCode: 1 });
+        return;
+      }
+    }
+  }
+
+  db.prepare('UPDATE tasks SET pr_url = ?, pr_number = ?, updated_at = ? WHERE id = ?')
+    .run(pr.html_url, pr.number, Date.now(), task.id);
+
+  logEvent(task.id, 'dev', 'pr_created', `PR #${pr.number} created: ${pr.html_url}`);
+  await updateStatus(task.id, 'reviewing');
+
+  const updatedTask = db.prepare('SELECT * FROM tasks WHERE id = ?').get(task.id) as Task;
+  await runReviewStage(updatedTask);
+}
+
+async function fetchPrDiff(prNumber: number): Promise<string> {
+  try {
+    const octokit = await getOctokit();
+    const { data } = await octokit.pulls.get({
+      owner: GITHUB_OWNER,
+      repo: GITHUB_REPO,
+      pull_number: prNumber,
+      mediaType: { format: 'diff' },
+    });
+    return data as unknown as string;
+  } catch {
+    return '';
+  }
+}
+
+async function runReviewStage(task: Task): Promise<void> {
+  const worktreePath = task.worktree_path || '';
+  if (!worktreePath || !task.pr_number) { await handleFailure(task, { status: 'failed', output: 'Missing worktree_path or pr_number', durationMs: 0, exitCode: 1 }); return; }
+  const prDiff = await fetchPrDiff(task.pr_number!);
+  const octokit = await getOctokit();
+
+  // Include Linear ticket context so reviewer can check against original intent
+  const ctx = readJSON(join(TASKS_DIR, task.id, 'context.json'));
+  const ticketContext = [
+    `PR #${task.pr_number} diff:\n\n${prDiff}`,
+    `\n---\n\nOriginal task: ${task.title}`,
+    task.description ? `Description: ${task.description}` : '',
+    ctx?.research?.summary ? `Research summary: ${ctx.research.summary}` : '',
+    ctx?.research?.root_cause ? `Root cause: ${ctx.research.root_cause}` : '',
+  ].filter(Boolean).join('\n');
+
+  // On review retries, scope the reviewer to verify fixes — not re-review the entire PR
+  let reviewMode = '';
+  if (task.retry_count > 0) {
+    let lastReviewBody = '';
+    try {
+      const { data: allReviews } = await octokit.pulls.listReviews({
+        owner: GITHUB_OWNER, repo: GITHUB_REPO,
+        pull_number: task.pr_number!,
+      });
+      const lastChangesRequested = allReviews
+        .filter((r: any) => r.state === 'CHANGES_REQUESTED' && r.body)
+        .pop();
+      if (lastChangesRequested) {
+        lastReviewBody = (lastChangesRequested as any).body!.slice(0, 2000);
+      }
+    } catch {}
+
+    reviewMode = `
+IMPORTANT — THIS IS REVIEW RETRY #${task.retry_count}. You are NOT doing a fresh review.
+
+Your previous review requested these changes:
+${lastReviewBody}
+
+Your job this round:
+1. VERIFY each requested change was correctly implemented. Check the specific files and lines.
+2. If a fix introduced a NEW bug in the changed code, flag it. Be specific.
+3. Do NOT re-review unchanged code. Do NOT raise new issues in code that existed before your last review.
+4. If all requested changes are correctly implemented, APPROVE. Don't keep finding new things to block on.
+5. Only REQUEST_CHANGES if a specific fix from your last review was done incorrectly or introduced a regression.
+
+`;
+  }
+
+  const result = await runAgentWithRetry({
+    agent: 'reviewer',
+    taskId: task.id,
+    model: (task.reviewer_model || 'claude-opus-4-7') as any,
+    tools: task.use_swarm
+      ? [...AGENT_DEFAULTS.reviewer.tools, 'Agent']
+      : AGENT_DEFAULTS.reviewer.tools,
+    promptVariant: task.use_swarm ? 'swarm' : 'single',
+    extraPromptContext: reviewMode + ticketContext,
+    cwd: worktreePath,
+    effortSize: task.effort_size || 'M',
+    effortLevel: (task.reviewer_effort || 'high') as any,
+    enableStreaming: true,
+  }, 3);
+
+  if (result.status === 'complete') {
+    // Validate reviewer output — never auto-approve on missing review.md
+    const reviewValidation = validateReviewerOutput(task.id);
+    if (!reviewValidation.valid) {
+      logEvent(task.id, 'validator', 'reviewer_invalid', reviewValidation.errors.join(', '));
+      await handleEscalation(task, result, `Reviewer did not produce valid output: ${reviewValidation.errors.join(', ')}`);
+      return;
+    }
+
+    const review = readFileSync(join(TASKS_DIR, task.id, 'review.md'), 'utf-8');
+    const reviewerOctokit = await getReviewerOctokit();
+    const octokit = await getOctokit();
+
+    if (review.includes('APPROVE')) {
+      logEvent(task.id, 'reviewer', 'review_approved', `PR #${task.pr_number} approved`);
+
+      // Post formal PR review via separate reviewer app (avoids self-approval restriction)
+      try {
+        await reviewerOctokit.pulls.createReview({
+          owner: GITHUB_OWNER,
+          repo: GITHUB_REPO,
+          pull_number: task.pr_number!,
+          body: review,
+          event: 'APPROVE',
+        });
+      } catch (err: any) {
+        logEvent(task.id, 'system', 'review_post_failed', `Failed to post review: ${err.message}`);
+      }
+
+      try {
+        await octokit.pulls.merge({
+          owner: GITHUB_OWNER,
+          repo: GITHUB_REPO,
+          pull_number: task.pr_number!,
+          merge_method: 'squash',
+        });
+      } catch (err: any) {
+        // PR may already be merged — check state before failing
+        try {
+          const { data: pr } = await octokit.pulls.get({
+            owner: GITHUB_OWNER, repo: GITHUB_REPO,
+            pull_number: task.pr_number!,
+          });
+          if (pr.merged) {
+            logEvent(task.id, 'system', 'pr_already_merged', `PR #${task.pr_number} was already merged`);
+          } else {
+            await handleFailure(task, { status: 'failed', output: `Merge failed: ${err.message}`, durationMs: 0, exitCode: 1 });
+            return;
+          }
+        } catch {
+          await handleFailure(task, { status: 'failed', output: `Merge failed: ${err.message}`, durationMs: 0, exitCode: 1 });
+          return;
+        }
+      }
+
+      logEvent(task.id, 'system', 'task_merged', `Merged: ${task.title}`);
+
+      db.prepare('UPDATE tasks SET completed_at = ?, updated_at = ? WHERE id = ?')
+        .run(Date.now(), Date.now(), task.id);
+      await cleanupWorktree(task.id);
+
+      // Decide next status: if reviewer flagged qa_required and QA is enabled,
+      // transition to qa_pending instead of merged. Otherwise go straight to merged.
+      const ctxAfterMerge = readJSON(join(TASKS_DIR, task.id, 'context.json'));
+      const qaRequired = ctxAfterMerge?.qa?.qa_required === true;
+      const qaEnabled = (process.env.QA_ENABLED || '').toLowerCase() === 'true';
+
+      if (qaRequired && qaEnabled) {
+        // Give Vercel time to finish deploying the merge before QA hits staging.
+        // Configurable via QA_DEPLOY_WAIT_MS; default 5 min.
+        const waitMs = parseInt(process.env.QA_DEPLOY_WAIT_MS || String(5 * 60 * 1000));
+        const readyAt = Date.now() + (Number.isFinite(waitMs) && waitMs >= 0 ? waitMs : 5 * 60 * 1000);
+        db.prepare('UPDATE tasks SET qa_ready_at = ?, updated_at = ? WHERE id = ?')
+          .run(readyAt, Date.now(), task.id);
+        const waitMinutes = Math.round((readyAt - Date.now()) / 60000);
+        logEvent(task.id, 'system', 'qa_queued',
+          `Reviewer flagged QA required — queued; will start in ~${waitMinutes}min to give Vercel time to deploy`);
+        await updateStatus(task.id, 'qa_pending');
+        await notifyOperator(`${task.title}\nMerged — QA verification starts in ~${waitMinutes}min (waiting for Vercel deploy).\nPR: ${task.pr_url}`);
+      } else {
+        // qa_required=false OR QA_ENABLED=false — no QA ran. Mark the task as
+        // 'skipped' so the dashboard can show it as pass-equivalent without
+        // conflating it with pre-feature tasks that have no QA info at all.
+        db.prepare("UPDATE tasks SET qa_status = 'skipped', updated_at = ? WHERE id = ?")
+          .run(Date.now(), task.id);
+        await updateStatus(task.id, 'merged');
+        await notifyOperator(`${task.title}\nPR: ${task.pr_url}`);
+        if (qaRequired && !qaEnabled) {
+          logEvent(task.id, 'system', 'qa_skipped', `QA was flagged required but QA_ENABLED=false — skipping`);
+        }
+      }
+
+      if (task.source_id) {
+        await updateLinearIssue(task.source_id, 'Done', task.pr_url || undefined);
+      }
+
+      // Post-merge knowledge update (graph rebuild + skills refresh)
+      await runPostMergeKnowledgeUpdate(task);
+    } else if (review.includes('REQUEST_CHANGES')) {
+      logEvent(task.id, 'reviewer', 'changes_requested', `PR #${task.pr_number} needs changes (attempt ${task.retry_count + 1}/5)`);
+
+      // Post formal PR review via separate reviewer app
+      await reviewerOctokit.pulls.createReview({
+        owner: GITHUB_OWNER,
+        repo: GITHUB_REPO,
+        pull_number: task.pr_number!,
+        body: review,
+        event: 'REQUEST_CHANGES',
+      });
+
+      if (task.retry_count < 5) {
+        db.prepare('UPDATE tasks SET retry_count = retry_count + 1, test_retry_count = 0, updated_at = ? WHERE id = ?')
+          .run(Date.now(), task.id);
+        await syncToSupabase('task_update', { id: task.id });
+        await updateStatus(task.id, 'developing');
+
+        // Fetch prior review history so the dev agent can see patterns and avoid circular fixes
+        let priorReviews = '';
+        if (task.retry_count > 0 && task.pr_number) {
+          try {
+            const { data: allReviews } = await octokit.pulls.listReviews({
+              owner: GITHUB_OWNER,
+              repo: GITHUB_REPO,
+              pull_number: task.pr_number,
+            });
+            const changesRequested = allReviews
+              .filter((r: any) => r.state === 'CHANGES_REQUESTED' && r.body)
+              .slice(0, -1); // Exclude the current review (already included below)
+            if (changesRequested.length > 0) {
+              priorReviews = '\n\nPRIOR REVIEW HISTORY (oldest first) — study these to avoid repeating the same fixes that were already tried and reverted):\n\n'
+                + changesRequested.map((r: any, i: number) =>
+                  `--- Review ${i + 1} ---\n${r.body!.slice(0, 1500)}`
+                ).join('\n\n');
+            }
+          } catch {}
+        }
+
+        const devResult = await runAgentWithRetry({
+          agent: 'dev',
+          taskId: task.id,
+          model: (task.dev_model || 'claude-sonnet-4-6') as any,
+          tools: AGENT_DEFAULTS.dev.tools,
+          promptVariant: 'single',
+          maxTurns: 20,
+          effortSize: task.effort_size || 'M',
+          effortLevel: (task.dev_effort || 'medium') as any,
+          extraPromptContext: `CODE REVIEW — CHANGES REQUESTED (attempt ${task.retry_count + 1}/5)
+
+The reviewer found issues in your implementation. Address ALL of the following, but critically:
+- Think about SIDE EFFECTS of each fix. Don't just change what was asked — consider what your change breaks or creates elsewhere.
+- After making fixes, re-read the full diff of your changes to verify you haven't introduced new issues.
+- If the reviewer says "use X instead of Y", understand WHY before making the change, and check if the same pattern exists elsewhere.
+- Pay special attention to: security implications, error handling paths, state consistency across tables/components.
+- IMPORTANT: Read the prior review history below. If you see the same issue raised multiple times, your previous fixes didn't work or caused regressions. Take a different approach this time.
+
+CURRENT review feedback:
+
+${review}${priorReviews}`,
+          cwd: worktreePath,
+          enableStreaming: true,
+        }, 2);
+
+        if (devResult.status === 'complete') {
+          await updateStatus(task.id, 'reviewing');
+        }
+      } else {
+        await handleEscalation(task, result, 'Review requested changes 5 times - needs human review');
+      }
+    }
+  } else {
+    await handleAgentResult(task, result);
+  }
+}
+
+// --- Post-Merge QA ---
+
+/**
+ * Run the QA agent against the merged staging. Verifies the task's described
+ * behavior via Playwright + Supabase MCP. On pass → merged. On fail → creates
+ * a new inbox task with parent_task_id linking back, and notifies via WhatsApp.
+ *
+ * Self-upgrade: if the previous QA pass left QA_ESCALATE_OPUS: true in
+ * context.json, this run uses Opus-4.7 / high for deeper analysis. Capped
+ * to one upgrade per task via ctx.qa.escalated_already.
+ */
+async function runQAStage(task: Task): Promise<void> {
+  const PROJECT_ROOT = flockbotsHome();
+  const ctx = readJSON(join(TASKS_DIR, task.id, 'context.json'));
+  const qaBlock = ctx?.qa || {};
+
+  if (!qaBlock.qa_required) {
+    logEvent(task.id, 'system', 'qa_not_required', 'qa_required was false — transitioning to merged');
+    await updateStatus(task.id, 'merged');
+    return;
+  }
+
+  // Vercel-deploy wait: don't run QA until `qa_ready_at` has passed. Each
+  // pipeline tick re-checks; when the timestamp is in the past we proceed.
+  // First time we defer, we log; subsequent deferrals stay silent to avoid
+  // spamming the event feed.
+  if (task.qa_ready_at && Date.now() < task.qa_ready_at) {
+    const waitMs = task.qa_ready_at - Date.now();
+    const waitSec = Math.ceil(waitMs / 1000);
+    // Check if we've already logged a wait for this task — use the event log
+    const alreadyLogged = db.prepare(
+      "SELECT 1 FROM events WHERE task_id = ? AND event_type = 'qa_waiting_deploy' LIMIT 1"
+    ).get(task.id);
+    if (!alreadyLogged) {
+      logEvent(task.id, 'system', 'qa_waiting_deploy',
+        `Waiting ~${waitSec}s for Vercel deploy before starting QA`);
+    }
+    // Put status back to qa_pending so the scheduler continues polling
+    if (task.status !== 'qa_pending') {
+      await updateStatus(task.id, 'qa_pending');
+    }
+    return;
+  }
+
+  // Self-upgrade detection
+  const escalateOpus = ctx?.QA_ESCALATE_OPUS === true && !qaBlock.escalated_already;
+  const model: 'claude-sonnet-4-6' | 'claude-opus-4-7' = escalateOpus ? 'claude-opus-4-7' : 'claude-sonnet-4-6';
+  const effort: 'medium' | 'high' = escalateOpus ? 'high' : 'medium';
+
+  if (escalateOpus) {
+    logEvent(task.id, 'qa', 'qa_escalated', `Self-upgrading to ${model}/${effort} for ambiguous verification`);
+    // Mark escalated so we don't loop
+    ctx.qa.escalated_already = true;
+    delete ctx.QA_ESCALATE_OPUS;
+    try {
+      writeFileSync(join(TASKS_DIR, task.id, 'context.json'), JSON.stringify(ctx, null, 2));
+    } catch {}
+  }
+
+  const mcpConfigPath = join(PROJECT_ROOT, 'agents', 'mcp-configs', 'qa.json');
+
+  // Build qa context for the prompt
+  const qaContext = [
+    `QA verification for task ${task.id}.`,
+    `qa_urls: ${JSON.stringify(qaBlock.qa_urls || [])}`,
+    `qa_instructions: ${qaBlock.qa_instructions || '(none)'}`,
+    `qa_uses_canvas: ${!!qaBlock.qa_uses_canvas}`,
+    `PR: ${task.pr_url || '(none)'}`,
+  ].join('\n');
+
+  const result = await runAgentWithRetry({
+    agent: 'qa',
+    taskId: task.id,
+    model,
+    effortLevel: effort as any,
+    tools: AGENT_DEFAULTS.qa.tools,
+    mcpConfigPath,
+    extraPromptContext: qaContext,
+    cwd: TARGET_REPO_PATH,
+    enableStreaming: true,
+  }, 1); // Single retry only — QA is expensive + Playwright flakiness isn't fixed by retrying
+
+  if (result.status !== 'complete') {
+    logEvent(task.id, 'qa', 'qa_session_failed', `QA session exited with ${result.status} — escalating`);
+    await handleEscalation(task, result, 'QA session failed to complete. Review QA agent output for details.');
+    return;
+  }
+
+  // Check for self-upgrade request — re-enter qa_pending so next tick picks up with Opus
+  const ctxAfter = readJSON(join(TASKS_DIR, task.id, 'context.json'));
+  if (ctxAfter?.QA_ESCALATE_OPUS === true && !ctxAfter?.qa?.escalated_already) {
+    logEvent(task.id, 'qa', 'qa_requested_opus', 'QA requested Opus upgrade — requeueing');
+    await updateStatus(task.id, 'qa_pending');
+    return;
+  }
+
+  // Determine pass/fail from QA output (structure check, not semantics)
+  const qaValidation = validateQAOutput(task.id);
+  if (!qaValidation.valid) {
+    await handleEscalation(task, result,
+      `QA agent output failed validation: ${qaValidation.errors.join('; ')}`);
+    return;
+  }
+
+  const reportPath = join(TASKS_DIR, task.id, 'qa-report.md');
+  const failurePath = join(TASKS_DIR, task.id, 'qa-failure.json');
+  const report = readFileSync(reportPath, 'utf-8');
+  const passed = /QA Report\s*[—-]\s*PASS/i.test(report);
+  const failed = /QA Report\s*[—-]\s*FAIL/i.test(report);
+
+  if (passed) {
+    logEvent(task.id, 'qa', 'qa_passed', `QA verification passed for ${task.title}`);
+    db.prepare("UPDATE tasks SET qa_status = 'passed' WHERE id = ?").run(task.id);
+    await updateStatus(task.id, 'qa_done');
+    // Transition through to merged after qa_done — keeps downstream state consistent
+    db.prepare('UPDATE tasks SET completed_at = ?, updated_at = ? WHERE id = ?')
+      .run(Date.now(), Date.now(), task.id);
+    await updateStatus(task.id, 'merged');
+    await notifyOperatorQAPass(task, ctxAfter);
+    return;
+  }
+
+  if (!failed || !fileExists(failurePath)) {
+    await handleEscalation(task, result, 'QA report did not clearly pass or fail, or qa-failure.json missing');
+    return;
+  }
+
+  // FAIL path. The parent task's FEATURE did merge — the regression is handled
+  // by a separate auto-created fix task. So we still land the parent at merged
+  // (with qa_failed as a short-lived intermediate for event-log visibility).
+  const failure = readJSON(failurePath);
+  logEvent(task.id, 'qa', 'qa_failed', `QA verification failed: ${failure.failing_step || 'unknown step'}`);
+  db.prepare("UPDATE tasks SET qa_status = 'failed' WHERE id = ?").run(task.id);
+  await updateStatus(task.id, 'qa_failed');
+  await createQAFixTask(task, failure);
+  await notifyOperatorQAFail(task, failure);
+  db.prepare('UPDATE tasks SET completed_at = ?, updated_at = ? WHERE id = ?')
+    .run(Date.now(), Date.now(), task.id);
+  await updateStatus(task.id, 'merged');
+}
+
+/**
+ * Create a new inbox task that links back to the failed QA's parent. The dev
+ * pipeline picks it up naturally on the next tick.
+ */
+async function createQAFixTask(parent: Task, failure: any): Promise<void> {
+  const { createTask } = await import('./queue');
+  const { randomUUID } = await import('crypto');
+  const newId = randomUUID().slice(0, 8);
+
+  const description = [
+    `QA regression detected against staging after merging task ${parent.id}.`,
+    '',
+    `**Failing step:** ${failure.failing_step || '(not specified)'}`,
+    `**Expected:** ${failure.expected || '(not specified)'}`,
+    `**Actual:** ${failure.actual || '(not specified)'}`,
+    failure.recommended_fix_hypothesis ? `\n**Hypothesis:** ${failure.recommended_fix_hypothesis}` : '',
+    failure.screenshot_path ? `\n**Screenshot:** ${failure.screenshot_path}` : '',
+    failure.console_errors?.length ? `\n**Console errors:**\n${failure.console_errors.map((e: string) => `- ${e}`).join('\n')}` : '',
+    '',
+    `Original PR: ${parent.pr_url || '(none)'}`,
+    `Read full failure details at tasks/${parent.id}/qa-failure.json before coding.`,
+  ].filter(Boolean).join('\n');
+
+  createTask(
+    newId,
+    `QA fix: ${parent.title}`,
+    description,
+    'qa-auto',
+    undefined,
+    parent.priority,
+  );
+  // Link parent → child via column (createTask doesn't accept it directly)
+  db.prepare('UPDATE tasks SET parent_task_id = ?, updated_at = ? WHERE id = ?')
+    .run(parent.id, Date.now(), newId);
+  await syncToSupabase('task_update', { id: newId });
+  logEvent(newId, 'system', 'qa_auto_task', `Auto-created QA fix task for parent ${parent.id}`);
+}
+
+async function notifyOperatorQAPass(task: Task, ctx: any): Promise<void> {
+  const screenshot = ctx?.qa_result?.screenshot_path;
+  const msg = `QA passed ✓\n${task.title}\nPR: ${task.pr_url || '(none)'}`;
+  if (screenshot) {
+    const { notifyOperatorMedia } = await import('./notifier');
+    const url = await uploadQAMedia(task.id, screenshot);
+    if (url) {
+      await notifyOperatorMedia(msg, url, 'image').catch((err: any) => console.error('WA media send failed:', err.message));
+      return;
+    }
+  }
+  await notifyOperator(msg);
+}
+
+async function notifyOperatorQAFail(task: Task, failure: any): Promise<void> {
+  const msg = [
+    `QA failed ✗`,
+    task.title,
+    `Step: ${failure.failing_step || '(unknown)'}`,
+    `Expected: ${failure.expected || '(unknown)'}`,
+    `Actual: ${failure.actual || '(unknown)'}`,
+    `Auto-created fix task is in the queue.`,
+  ].join('\n');
+  if (failure.screenshot_path) {
+    const { notifyOperatorMedia } = await import('./notifier');
+    const url = await uploadQAMedia(task.id, failure.screenshot_path);
+    if (url) {
+      await notifyOperatorMedia(msg, url, 'image').catch((err: any) => console.error('WA media send failed:', err.message));
+      return;
+    }
+  }
+  await notifyOperator(msg);
+}
+
+/**
+ * Upload a QA screenshot/recording to Supabase Storage and return a
+ * short-lived signed URL for WhatsApp media embedding.
+ */
+async function uploadQAMedia(taskId: string, localPath: string): Promise<string | null> {
+  try {
+    const { getSupabaseClient } = await import('./supabase-sync');
+    const supabase = getSupabaseClient();
+    if (!supabase) return null;
+
+    const bucket = process.env.SUPABASE_STORAGE_BUCKET_QA || 'qa-media';
+    const fullPath = localPath.startsWith('/') ? localPath : join(flockbotsHome(), localPath);
+    if (!fileExists(fullPath)) {
+      logEvent(taskId, 'qa', 'media_missing', `Screenshot not found at ${fullPath}`);
+      return null;
+    }
+
+    const key = `${taskId}/${Date.now()}-${localPath.split('/').pop()}`;
+    const buffer = readFileSync(fullPath);
+    const contentType = localPath.endsWith('.webm') ? 'video/webm' : 'image/png';
+
+    const { error: uploadErr } = await supabase.storage.from(bucket).upload(key, buffer, {
+      contentType, upsert: false,
+    });
+    if (uploadErr) {
+      logEvent(taskId, 'qa', 'media_upload_failed', uploadErr.message);
+      return null;
+    }
+
+    const { data: signed, error: signErr } = await supabase.storage
+      .from(bucket)
+      .createSignedUrl(key, 7 * 24 * 60 * 60); // 7 days
+    if (signErr || !signed?.signedUrl) {
+      logEvent(taskId, 'qa', 'media_sign_failed', signErr?.message || 'no signedUrl');
+      return null;
+    }
+    return signed.signedUrl;
+  } catch (err: any) {
+    logEvent(taskId, 'qa', 'media_error', err.message);
+    return null;
+  }
+}
+
+// --- Post-Merge Knowledge Update ---
+
+async function runPostMergeKnowledgeUpdate(task: Task): Promise<void> {
+  if (!canRunAgent('claude-sonnet-4-6', 'XS')) return; // Skip if budget is tight
+
+  const PROJECT_ROOT = flockbotsHome();
+
+  // Fire off an incremental graphify rebuild in the background so the next
+  // task's agents get a fresh graph. Runs as its own claude -p session via the
+  // build script; we don't await it — pipeline continues immediately.
+  try {
+    const { spawn } = await import('child_process');
+    const kgProc = spawn('bash', [join(PROJECT_ROOT, 'scripts/build-knowledge-graph.sh'), 'incremental'], {
+      cwd: PROJECT_ROOT,
+      detached: true,
+      stdio: 'ignore',
+      env: { ...process.env },
+    });
+    kgProc.unref();
+    logEvent(task.id, 'system', 'kg_incremental_started',
+      'Kicked off incremental knowledge-graph rebuild in background');
+  } catch (err: any) {
+    logEvent(task.id, 'system', 'kg_incremental_skipped',
+      `Could not start incremental KG rebuild: ${err.message}`);
+  }
+
+  try {
+    // Get the merged diff to understand what changed
+    let diff = '';
+    try {
+      const octokit = await getOctokit();
+      const { data } = await octokit.pulls.get({
+        owner: GITHUB_OWNER, repo: GITHUB_REPO,
+        pull_number: task.pr_number!,
+        mediaType: { format: 'diff' },
+      });
+      diff = (data as unknown as string).slice(0, 8000); // Cap diff size
+    } catch { return; } // If we can't get the diff, skip
+
+    logEvent(task.id, 'system', 'knowledge_update_started', `Updating system knowledge after merge: ${task.title}`);
+
+    const result = await runAgentWithRetry({
+      agent: 'pm',
+      taskId: task.id,
+      model: 'claude-sonnet-4-6',
+      tools: ['Read', 'Write', 'Glob', 'Grep'],
+      maxTurns: 10,
+      extraPromptContext: `POST-MERGE KNOWLEDGE UPDATE
+
+A feature was just merged. Review the diff below and update the relevant sharded skills files if any of these changed:
+- Architecture overview / technical decisions → skills/product/workflows.md
+- Key user workflows → skills/product/workflows.md
+- Domain concepts / entities → skills/product/domain.md
+- Tech stack
+- Integration points
+
+Rules:
+- Only update files that are actually affected by this diff
+- Do NOT touch skills/product/vision.md (vision, personas, scope, success metrics)
+- If nothing meaningful changed (just a bug fix, typo, etc.), write "NO_UPDATE_NEEDED" to context.json and stop
+- Keep updates concise — match the existing writing style
+- Append new workflows/entities if they were added, update existing ones if they changed
+
+Task: ${task.title}
+PR: ${task.pr_url}
+
+Merged diff (truncated):
+${diff}`,
+      cwd: TARGET_REPO_PATH,
+    }, 1); // Single attempt, non-critical
+
+    if (result.status === 'complete') {
+      logEvent(task.id, 'system', 'knowledge_updated', 'Product context updated after merge');
+    }
+  } catch (err: any) {
+    // Non-critical — log and continue
+    logEvent(task.id, 'system', 'knowledge_update_skipped', `Knowledge update failed: ${err.message}`);
+  }
+}
+
+// --- Main Processing Loop ---
+
+function getNextPendingStage(): Task | null {
+  return db.prepare(`
+    SELECT * FROM tasks
+    WHERE status IN ('inbox', 'researching', 'design_pending', 'designing',
+                     'design_review', 'developing', 'review_pending', 'reviewing')
+    ORDER BY
+      CASE status
+        WHEN 'reviewing' THEN 1
+        WHEN 'review_pending' THEN 2
+        WHEN 'developing' THEN 3
+        WHEN 'design_review' THEN 4
+        WHEN 'designing' THEN 5
+        WHEN 'design_pending' THEN 6
+        WHEN 'researching' THEN 7
+        WHEN 'inbox' THEN 8
+      END,
+      priority ASC,
+      created_at ASC
+    LIMIT 1
+  `).get() as Task | null;
+}
+
+async function processTaskStage(task: Task): Promise<void> {
+  switch (task.status) {
+    case 'inbox':
+      await updateStatus(task.id, 'researching');
+      await runResearchStage(task);
+      break;
+    case 'researching':
+      await runResearchStage(task);
+      break;
+    case 'design_pending':
+      await updateStatus(task.id, 'designing');
+      await runDesignStage(task);
+      break;
+    case 'designing':
+      await runDesignStage(task);
+      break;
+    case 'design_review':
+      await runDesignReview(task);
+      break;
+    case 'developing':
+      await resumeDevWithContext(task);
+      break;
+    case 'testing':
+      await runTestStage(task);
+      break;
+    case 'review_pending':
+      await runCreatePR(task);
+      break;
+    case 'reviewing':
+      await runReviewStage(task);
+      break;
+    case 'qa_pending':
+      await updateStatus(task.id, 'qa_running');
+      await runQAStage(task);
+      break;
+    case 'qa_running':
+      await runQAStage(task);
+      break;
+  }
+}
+
+export async function processNextTask(): Promise<void> {
+  // Find all pending tasks and try to run one per available agent.
+  // qa_pending tasks waiting for the post-merge Vercel deploy (qa_ready_at in the
+  // future) are excluded — picking them up would flap qa_pending → qa_running →
+  // qa_pending each tick, spam the activity tape, and show Zara as actively
+  // working when she's not. Wait quietly until the deploy buffer has elapsed.
+  const pendingTasks = db.prepare(`
+    SELECT * FROM tasks
+    WHERE status IN ('inbox', 'researching', 'design_pending', 'designing',
+                     'design_review', 'developing', 'review_pending', 'reviewing',
+                     'qa_pending', 'qa_running')
+      AND NOT (status = 'qa_pending' AND qa_ready_at IS NOT NULL AND qa_ready_at > ?)
+    ORDER BY
+      CASE status
+        WHEN 'reviewing' THEN 1
+        WHEN 'review_pending' THEN 2
+        WHEN 'developing' THEN 3
+        WHEN 'design_review' THEN 4
+        WHEN 'designing' THEN 5
+        WHEN 'design_pending' THEN 6
+        WHEN 'researching' THEN 7
+        WHEN 'inbox' THEN 8
+        WHEN 'qa_running' THEN 9
+        WHEN 'qa_pending' THEN 10
+      END,
+      priority ASC,
+      created_at ASC
+  `).all(Date.now()) as Task[];
+
+  // Also check for dev_ready tasks
+  const devTask = pickNextTask();
+  if (devTask && !pendingTasks.find(t => t.id === devTask.id)) {
+    const fullTask = db.prepare('SELECT * FROM tasks WHERE id = ?').get(devTask.id) as Task;
+    if (fullTask) pendingTasks.push(fullTask);
+  }
+
+  const launched: Promise<void>[] = [];
+
+  for (const task of pendingTasks) {
+    const agent = agentForStatus(task.status);
+    if (isAgentLocked(agent)) continue;
+    if (!acquireAgentLock(agent, task.id)) continue;
+
+    // Launch task processing without awaiting — allows multiple agents to run concurrently
+    const work = (async () => {
+      try {
+        if (task.status === 'dev_ready') {
+          await runDevPipeline(task);
+        } else {
+          await processTaskStage(task);
+        }
+      } catch (err: any) {
+        console.error(`Task ${task.id} stage error:`, err.message);
+      } finally {
+        releaseAgentLock(agent);
+      }
+    })();
+
+    launched.push(work);
+  }
+
+  // Wait for all launched tasks to complete before the next cycle
+  if (launched.length > 0) {
+    await Promise.all(launched);
+  }
+}
+
+/**
+ * Rollback a merged task by reverting its squash merge commit on staging.
+ */
+export async function rollbackTask(task: Task): Promise<string> {
+  try {
+    const octokit = await getOctokit();
+
+    // Get the merge commit SHA from the PR
+    const { data: pr } = await octokit.pulls.get({
+      owner: GITHUB_OWNER, repo: GITHUB_REPO,
+      pull_number: task.pr_number!,
+    });
+
+    if (!pr.merge_commit_sha) {
+      return `No merge commit found for PR #${task.pr_number}`;
+    }
+
+    // Revert locally: fetch staging, revert the merge commit, push
+    const git = simpleGit(TARGET_REPO_PATH);
+    await git.fetch('origin', GITHUB_STAGING_BRANCH);
+    await git.checkout(GITHUB_STAGING_BRANCH);
+    await git.pull('origin', GITHUB_STAGING_BRANCH);
+
+    try {
+      await git.raw(['revert', '--no-edit', pr.merge_commit_sha]);
+    } catch {
+      await git.raw(['revert', '--abort']).catch(() => {});
+      return `Revert has conflicts — needs manual resolution. Merge commit: ${pr.merge_commit_sha}`;
+    }
+
+    await git.push('origin', GITHUB_STAGING_BRANCH);
+
+    // Update task status
+    db.prepare('UPDATE tasks SET status = ?, error = ?, updated_at = ? WHERE id = ?')
+      .run('failed', JSON.stringify({ reverted: true, merge_commit: pr.merge_commit_sha }), Date.now(), task.id);
+
+    logEvent(task.id, 'system', 'rollback', `Reverted merge commit ${pr.merge_commit_sha}`);
+    await syncToSupabase('task_update', { id: task.id });
+
+    if (task.source_id) {
+      await updateLinearIssue(task.source_id, 'In Progress');
+    }
+
+    return `Rolled back: ${task.title}\nReverted commit ${pr.merge_commit_sha.slice(0, 7)} on ${GITHUB_STAGING_BRANCH}`;
+  } catch (err: any) {
+    return `Rollback failed: ${err.message}`;
+  }
+}
+
+/**
+ * Deploy staging to production by creating and merging a PR from staging → main/master.
+ */
+export async function deployToProduction(): Promise<string> {
+  const prodBranch = GITHUB_PROD_BRANCH;
+  try {
+    const octokit = await getOctokit();
+
+    // Check if there are commits ahead
+    const { data: comparison } = await octokit.repos.compareCommits({
+      owner: GITHUB_OWNER,
+      repo: GITHUB_REPO,
+      base: prodBranch,
+      head: GITHUB_STAGING_BRANCH,
+    });
+
+    if (comparison.total_commits === 0) {
+      return `Nothing to deploy — ${GITHUB_STAGING_BRANCH} is up to date with ${prodBranch}`;
+    }
+
+    // Create PR from staging → production
+    const { data: pr } = await octokit.pulls.create({
+      owner: GITHUB_OWNER,
+      repo: GITHUB_REPO,
+      title: `Deploy: ${GITHUB_STAGING_BRANCH} → ${prodBranch}`,
+      head: GITHUB_STAGING_BRANCH,
+      base: prodBranch,
+      body: `Automated deploy of ${comparison.total_commits} commit(s) from ${GITHUB_STAGING_BRANCH} to ${prodBranch}.`,
+    });
+
+    // Merge immediately
+    await octokit.pulls.merge({
+      owner: GITHUB_OWNER,
+      repo: GITHUB_REPO,
+      pull_number: pr.number,
+      merge_method: 'merge',
+    });
+
+    // Transition all staging-merged tasks to 'deployed' so they leave the
+    // "merged" column in the dashboard (which now reflects tasks currently
+    // in staging only). The new "Deployed" modal surfaces historical tasks.
+    const mergedTasks = db.prepare("SELECT id FROM tasks WHERE status = 'merged'").all() as { id: string }[];
+    if (mergedTasks.length > 0) {
+      const nowTs = Date.now();
+      db.prepare("UPDATE tasks SET status = 'deployed', updated_at = ? WHERE status = 'merged'").run(nowTs);
+      // Fire per-task sync so dashboard sees the new status immediately
+      for (const t of mergedTasks) {
+        syncToSupabase('task_update', { id: t.id }).catch((err: any) =>
+          console.error(`Failed to sync deployed task ${t.id}:`, err.message));
+      }
+    }
+
+    logEvent(null, 'system', 'deploy',
+      `Deployed ${comparison.total_commits} commit(s) to ${prodBranch} via PR #${pr.number} | ${mergedTasks.length} task(s) moved to deployed`);
+
+    return `Deployed to ${prodBranch}\n${comparison.total_commits} commit(s) merged via PR #${pr.number}\n${mergedTasks.length} task(s) moved to deployed\n${pr.html_url}`;
+  } catch (err: any) {
+    // PR might already exist
+    if (err.status === 422) {
+      try {
+        const octokit = await getOctokit();
+        const { data: existing } = await octokit.pulls.list({
+          owner: GITHUB_OWNER,
+          repo: GITHUB_REPO,
+          head: `${GITHUB_OWNER}:${GITHUB_STAGING_BRANCH}`,
+          base: prodBranch,
+          state: 'open',
+        });
+        if (existing.length > 0) {
+          await octokit.pulls.merge({
+            owner: GITHUB_OWNER,
+            repo: GITHUB_REPO,
+            pull_number: existing[0].number,
+            merge_method: 'merge',
+          });
+          // Same task-status flip as the primary deploy path
+          const mergedTasks = db.prepare("SELECT id FROM tasks WHERE status = 'merged'").all() as { id: string }[];
+          if (mergedTasks.length > 0) {
+            db.prepare("UPDATE tasks SET status = 'deployed', updated_at = ? WHERE status = 'merged'").run(Date.now());
+            for (const t of mergedTasks) {
+              syncToSupabase('task_update', { id: t.id }).catch(() => {});
+            }
+          }
+          logEvent(null, 'system', 'deploy',
+            `Deployed to ${prodBranch} via existing PR #${existing[0].number} | ${mergedTasks.length} task(s) moved to deployed`);
+          return `Deployed to ${prodBranch} via existing PR #${existing[0].number}\n${mergedTasks.length} task(s) moved to deployed\n${existing[0].html_url}`;
+        }
+      } catch {}
+    }
+    return `Deploy failed: ${err.message}`;
+  }
+}
+
+export { updateStatus, handleEscalation, handleFailure, isLocked };

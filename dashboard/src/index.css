@@ -1,0 +1,45 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  --background: 0 0% 100%;
+  --foreground: 0 0% 9%;
+  --card: 0 0% 99%;
+  --primary: 0 0% 9%;
+  --primary-foreground: 0 0% 100%;
+  --secondary: 0 0% 93%;
+  --muted: 0 0% 93%;
+  --muted-foreground: 0 0% 45%;
+  --accent: 142 71% 45%;
+  --destructive: 0 84% 60%;
+  --border: 0 0% 89%;
+  --radius: 0.75rem;
+}
+
+.dark {
+  --background: 0 0% 7%;
+  --foreground: 0 0% 95%;
+  --card: 0 0% 12%;
+  --primary: 0 0% 95%;
+  --primary-foreground: 0 0% 9%;
+  --secondary: 0 0% 20%;
+  --muted: 0 0% 20%;
+  --muted-foreground: 0 0% 60%;
+  --accent: 142 71% 45%;
+  --destructive: 0 84% 60%;
+  --border: 0 0% 20%;
+}
+
+body {
+  font-family: 'Hedvig Letters Sans', system-ui, -apple-system, sans-serif;
+  font-weight: 400;
+  letter-spacing: 0.005em;
+}
+
+/* Match the mission-console bg everywhere so overscroll / bounce areas
+   (iOS rubber-band, Mac trackpad) stay the same dark as the app. */
+html, body {
+  background-color: #0a0b0d;
+}
+html { color-scheme: dark; }

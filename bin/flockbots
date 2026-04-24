@@ -1,0 +1,29 @@
+#!/usr/bin/env node
+/*
+ * FlockBots CLI entrypoint.
+ * Resolves the compiled CLI at coordinator/dist/coordinator/src/cli/index.js
+ * (production) or falls back to ts-node for the source when running from a
+ * fresh checkout that hasn't been built yet.
+ */
+const path = require('path');
+const { existsSync } = require('fs');
+
+const repoRoot = path.resolve(__dirname, '..');
+const compiled = path.join(repoRoot, 'coordinator/dist/coordinator/src/cli/index.js');
+const source = path.join(repoRoot, 'coordinator/src/cli/index.ts');
+
+if (existsSync(compiled)) {
+  require(compiled);
+} else if (existsSync(source)) {
+  try {
+    require('ts-node').register({ transpileOnly: true });
+    require(source);
+  } catch (err) {
+    console.error('Build the coordinator first:  cd coordinator && npm run build');
+    console.error('(or install ts-node globally to run from source)');
+    process.exit(1);
+  }
+} else {
+  console.error(`Cannot find FlockBots CLI. Looked for:\n  ${compiled}\n  ${source}`);
+  process.exit(1);
+}

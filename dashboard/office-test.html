@@ -1,0 +1,28 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Office Test</title>
+    <style>
+      body { margin: 0; background: #222; color: #eee; font-family: system-ui; padding: 20px; }
+      .controls { margin-bottom: 12px; }
+      button { padding: 6px 12px; margin-right: 8px; background: #444; color: #eee; border: 1px solid #666; cursor: pointer; }
+      button.active { background: #4a8; }
+      canvas { background: #000; image-rendering: pixelated; display: block; }
+    </style>
+  </head>
+  <body>
+    <h2>Office Visualization Test</h2>
+    <div class="controls">
+      <label>Active agents (working):
+        <input type="text" id="active-input" value="pm,ux,dev,test,reviewer" style="background:#333;color:#eee;border:1px solid #555;padding:4px;width:260px;" />
+      </label>
+      <button id="set-active">Set Active</button>
+      <button id="set-idle">All Idle</button>
+      <button id="set-waiting">All Waiting</button>
+    </div>
+    <div id="root"></div>
+    <script type="module" src="/src/office-test.tsx"></script>
+  </body>
+</html>
