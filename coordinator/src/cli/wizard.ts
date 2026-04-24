@@ -43,6 +43,10 @@ export interface WizardConfig {
   supabaseUrl?: string;
   supabaseServiceRoleKey?: string;
   supabaseAnonKey?: string;
+  /** Admin email for the dashboard login (written to auth.users by the bootstrap SQL). */
+  dashboardAdminEmail?: string;
+  /** Admin password, held in memory only for the wizard run — never persisted. */
+  dashboardAdminPassword?: string;
   qaEnabled: boolean;
   stagingBaseUrl?: string;
   qaTestEmail?: string;
@@ -842,10 +846,38 @@ async function askSupabase(p: ClackModule, opts: { required?: boolean } = {}): P
   });
   if (p.isCancel(anonKey)) return null;
 
+  // Admin login for the dashboard. Bootstrapped into auth.users by the
+  // Supabase migration so the user can log in immediately once Vercel
+  // deploys. Password held in memory only — never written to .env.
+  p.note(
+    help([
+      'Pick the email + password you want to log into the dashboard with.',
+      '',
+      'The wizard will create a Supabase auth user for you as part of the',
+      "migration — so once Vercel deploys the dashboard you can log in",
+      'right away, no extra setup required.',
+    ].join('\n')),
+    'Dashboard login'
+  );
+  const adminEmail = await p.text({
+    message: 'Email:',
+    placeholder: 'you@company.com',
+    validate: (v) => (/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(v.trim()) ? undefined : 'Invalid email'),
+  });
+  if (p.isCancel(adminEmail)) return null;
+
+  const adminPassword = await p.password({
+    message: 'Password (minimum 8 characters):',
+    validate: (v) => (v && v.length >= 8 ? undefined : 'Must be at least 8 characters'),
+  });
+  if (p.isCancel(adminPassword)) return null;
+
   return {
     supabaseUrl: url as string,
     supabaseServiceRoleKey: serviceKey as string,
     supabaseAnonKey: anonKey as string,
+    dashboardAdminEmail: (adminEmail as string).trim(),
+    dashboardAdminPassword: adminPassword as string,
   };
 }
 
@@ -1142,7 +1174,10 @@ async function writeConfig(p: ClackModule, c: WizardConfig): Promise<void> {
   p.log.success(`Keys in → ${join(home, 'keys')}/`);
 
   if (c.supabaseUrl) {
-    await applySupabaseMigration(p, c.supabaseUrl, home);
+    const admin = c.dashboardAdminEmail && c.dashboardAdminPassword
+      ? { email: c.dashboardAdminEmail, password: c.dashboardAdminPassword }
+      : undefined;
+    await applySupabaseMigration(p, c.supabaseUrl, home, admin);
     await offerVercelDeploy(p, c.supabaseUrl, c.supabaseAnonKey || '');
     if (c.chatProvider === 'whatsapp') {
       await deployWebhookRelay(p, c.supabaseUrl, c.whatsappVerifyToken || '');
@@ -1180,10 +1215,30 @@ function supabaseProjectRef(url: string): string | null {
  * Offers three paths: automatic via the Management API (needs a PAT, one
  * HTTP call, nothing stored after), manual paste in the SQL editor (opens
  * the browser + clipboards the SQL on macOS), or skip.
+ *
+ * If `admin` is provided, the consolidated SQL is appended with a bootstrap
+ * block that creates (or updates) an auth.users row for that email/password
+ * so the operator can log into the dashboard as soon as it deploys.
  */
-async function applySupabaseMigration(p: ClackModule, supabaseUrl: string, home: string): Promise<void> {
+async function applySupabaseMigration(
+  p: ClackModule,
+  supabaseUrl: string,
+  home: string,
+  admin?: { email: string; password: string },
+): Promise<void> {
   const ref = supabaseProjectRef(supabaseUrl);
   const sqlPath = join(home, 'supabase', 'migrations', 'consolidated.sql');
+
+  if (!existsSync(sqlPath)) {
+    p.log.error(`Migration file not found at ${sqlPath}`);
+    return;
+  }
+
+  // Base migration + bootstrap admin block (if creds were collected)
+  let sql = readFileSync(sqlPath, 'utf-8');
+  if (admin) {
+    sql += '\n' + buildBootstrapAdminSql(admin.email, admin.password);
+  }
 
   p.note(
     help([
@@ -1191,7 +1246,9 @@ async function applySupabaseMigration(p: ClackModule, supabaseUrl: string, home:
       "subscriptions set up in your Supabase project before it can read",
       "any data. This is a single idempotent SQL migration — safe to",
       "re-run on an existing project.",
-    ].join('\n')),
+      admin ? '' : '',
+      admin ? `Will also create the dashboard login for ${admin.email}.` : '',
+    ].filter(Boolean).join('\n')),
     'Supabase schema migration'
   );
 
@@ -1207,27 +1264,44 @@ async function applySupabaseMigration(p: ClackModule, supabaseUrl: string, home:
   if (p.isCancel(mode)) return;
   if (mode === 'skip') {
     p.log.warn(`Skipped. Dashboard will 404 on queries until you apply ${sqlPath} in the Supabase SQL editor.`);
+    if (admin) p.log.warn('(Dashboard login was not created — re-run `flockbots init` when you are ready.)');
     return;
   }
 
+  let applied = false;
   if (mode === 'auto' && ref) {
-    const ok = await applyViaManagementAPI(p, ref, sqlPath);
-    if (ok) return;
-    p.log.info('Falling back to the manual paste flow.');
+    applied = await applyViaManagementAPI(p, ref, sql);
+    if (!applied) p.log.info('Falling back to the manual paste flow.');
   } else if (mode === 'auto' && !ref) {
     p.log.warn(`Couldn't parse a project ref from ${supabaseUrl}. Falling back to manual.`);
   }
 
-  await applyViaManualPaste(p, ref, sqlPath);
+  if (!applied) {
+    await applyViaManualPaste(p, ref, sql, home);
+  }
+
+  if (admin) {
+    p.note(
+      help([
+        `Dashboard login is ${admin.email} + the password you entered.`,
+        '',
+        'Security note: Supabase allows public email signups by default,',
+        'which means anyone with your anon key could create an account.',
+        'For a private dashboard, disable signups in your Supabase project:',
+        '  Authentication → Providers → Email → Enable Sign Ups: OFF',
+      ].join('\n')),
+      'Dashboard login ready'
+    );
+  }
 }
 
 /**
- * Apply the migration via Supabase's Management API — POST /v1/projects/
- * <ref>/database/query with the SQL as a JSON body. One HTTP call, runs
- * as a transaction on Supabase's side. Returns false on any failure so
- * the caller falls back to manual paste.
+ * Apply an in-memory SQL string via Supabase's Management API — POST
+ * /v1/projects/<ref>/database/query with the SQL as a JSON body. One HTTP
+ * call, runs as a transaction on Supabase's side. Returns false on any
+ * failure so the caller falls back to manual paste.
  */
-async function applyViaManagementAPI(p: ClackModule, ref: string, sqlPath: string): Promise<boolean> {
+async function applyViaManagementAPI(p: ClackModule, ref: string, sql: string): Promise<boolean> {
   p.note(help([
     'Go to https://supabase.com/dashboard/account/tokens',
     'Click "Generate new token", name it "FlockBots".',
@@ -1242,12 +1316,6 @@ async function applyViaManagementAPI(p: ClackModule, ref: string, sqlPath: strin
     validate: (v) => (v && v.length >= 20 ? undefined : 'Required — paste the token you just created'),
   });
   if (p.isCancel(pat)) return false;
-
-  if (!existsSync(sqlPath)) {
-    p.log.error(`Migration file not found at ${sqlPath}`);
-    return false;
-  }
-  const sql = readFileSync(sqlPath, 'utf-8');
 
   const spin = p.spinner();
   spin.start('Applying migration via Supabase Management API');
@@ -1273,6 +1341,70 @@ async function applyViaManagementAPI(p: ClackModule, ref: string, sqlPath: strin
     p.log.error(err?.message || String(err));
     return false;
   }
+}
+
+/**
+ * Build the bootstrap admin-user SQL block that gets appended to the
+ * consolidated migration. Creates (or updates — idempotent) a row in
+ * auth.users + auth.identities for the given email/password, using
+ * pgcrypto's bcrypt for password hashing (pre-installed on Supabase).
+ *
+ * Single-quotes in email/password are escaped by doubling them so user
+ * input with apostrophes doesn't break the DO block.
+ */
+function buildBootstrapAdminSql(email: string, password: string): string {
+  const esc = (s: string) => s.replace(/'/g, "''");
+  return [
+    '',
+    '-- -----------------------------------------------------------------------------',
+    '-- Bootstrap admin user (appended by `flockbots init`)',
+    '-- -----------------------------------------------------------------------------',
+    '-- Creates or updates an auth.users row for the email/password entered in',
+    "-- the wizard, so the dashboard login works as soon as it's deployed.",
+    '-- Uses pgcrypto (pre-installed on Supabase) for bcrypt hashing.',
+    'DO $bootstrap$',
+    'DECLARE',
+    `  v_email TEXT := '${esc(email)}';`,
+    `  v_password TEXT := '${esc(password)}';`,
+    '  v_user_id UUID;',
+    'BEGIN',
+    '  SELECT id INTO v_user_id FROM auth.users WHERE email = v_email;',
+    '',
+    '  IF v_user_id IS NOT NULL THEN',
+    '    -- Existing user — rotate password, re-confirm if needed',
+    '    UPDATE auth.users',
+    "      SET encrypted_password = crypt(v_password, gen_salt('bf', 10)),",
+    '          email_confirmed_at = COALESCE(email_confirmed_at, NOW()),',
+    '          updated_at = NOW()',
+    '      WHERE id = v_user_id;',
+    '  ELSE',
+    '    -- Fresh user — create auth.users + matching auth.identities row',
+    '    v_user_id := gen_random_uuid();',
+    '    INSERT INTO auth.users (',
+    '      instance_id, id, aud, role, email, encrypted_password, email_confirmed_at,',
+    '      raw_app_meta_data, raw_user_meta_data, created_at, updated_at,',
+    '      confirmation_token, email_change, email_change_token_new, recovery_token',
+    '    ) VALUES (',
+    "      '00000000-0000-0000-0000-000000000000', v_user_id,",
+    "      'authenticated', 'authenticated', v_email,",
+    "      crypt(v_password, gen_salt('bf', 10)), NOW(),",
+    `      '{"provider":"email","providers":["email"]}'::jsonb, '{}'::jsonb,`,
+    "      NOW(), NOW(), '', '', '', ''",
+    '    );',
+    '    INSERT INTO auth.identities (',
+    '      id, user_id, identity_data, provider, provider_id,',
+    '      last_sign_in_at, created_at, updated_at',
+    '    ) VALUES (',
+    '      gen_random_uuid(), v_user_id,',
+    "      jsonb_build_object('sub', v_user_id::text, 'email', v_email),",
+    "      'email', v_email,",
+    '      NOW(), NOW(), NOW()',
+    '    );',
+    '  END IF;',
+    'END',
+    '$bootstrap$;',
+    '',
+  ].join('\n');
 }
 
 /**
@@ -1315,11 +1447,19 @@ async function offerVercelDeploy(p: ClackModule, supabaseUrl: string, anonKey: s
   }
 
   const importUrl = buildVercelImportUrl();
-  const envInstructions = [
-    `When Vercel asks for environment variables, paste:`,
-    `  VITE_SUPABASE_URL       = ${supabaseUrl}`,
-    `  VITE_SUPABASE_ANON_KEY  = ${anonKey || '<your anon key>'}`,
-  ].join('\n');
+
+  // Copy anon key to clipboard on macOS so user can paste quickly when
+  // Vercel prompts for env vars. Done up-front so both 'now' and 'later'
+  // flows benefit; also lets us keep the JWT out of the note body (a
+  // 200-char JWT blows past any terminal width and breaks the box).
+  const clipboarded = (process.platform === 'darwin' && anonKey)
+    ? (() => { try { execSync('pbcopy', { input: anonKey }); return true; } catch { return false; } })()
+    : false;
+  const anonHint = clipboarded
+    ? '(copied to your clipboard — Cmd-V when Vercel prompts)'
+    : anonKey
+      ? '(paste from your Supabase dashboard → Settings → API Keys)'
+      : '(paste from your Supabase dashboard → Settings → API Keys)';
 
   if (mode === 'later') {
     p.note(
@@ -1328,7 +1468,9 @@ async function offerVercelDeploy(p: ClackModule, supabaseUrl: string, anonKey: s
         '',
         `  ${importUrl}`,
         '',
-        envInstructions,
+        'When Vercel asks for environment variables, paste:',
+        `  VITE_SUPABASE_URL       = ${supabaseUrl}`,
+        `  VITE_SUPABASE_ANON_KEY  ${anonHint}`,
         '',
         'After deploy, Settings → Domains → Add a custom domain.',
       ].join('\n')),
@@ -1347,23 +1489,14 @@ async function offerVercelDeploy(p: ClackModule, supabaseUrl: string, anonKey: s
       '  3. Paste these environment variables when prompted:',
       '',
       `       VITE_SUPABASE_URL       = ${supabaseUrl}`,
-      `       VITE_SUPABASE_ANON_KEY  = ${anonKey || '<paste your anon key>'}`,
+      `       VITE_SUPABASE_ANON_KEY  ${anonHint}`,
       '',
       '  4. Click Deploy — you\'ll have a live URL in ~2 minutes.',
       '',
       'For a custom domain later: Vercel Settings → Domains → Add.',
-      '',
-      "I've copied VITE_SUPABASE_ANON_KEY to your clipboard to make step 3 quick." +
-      (process.platform === 'darwin' && anonKey ? '' : ' (skipped — not on macOS or no key)'),
     ].join('\n')),
     'Deploy in browser'
   );
-
-  // Copy anon key to clipboard on macOS so user can paste quickly when
-  // Vercel prompts for env vars.
-  if (process.platform === 'darwin' && anonKey) {
-    try { execSync('pbcopy', { input: anonKey }); } catch { /* best effort */ }
-  }
 
   openBrowser(importUrl);
 
@@ -1514,11 +1647,16 @@ function buildVercelImportUrl(): string {
 }
 
 /** Paste-it-yourself fallback — copy SQL to clipboard on macOS, open SQL editor. */
-async function applyViaManualPaste(p: ClackModule, ref: string | null, sqlPath: string): Promise<void> {
+async function applyViaManualPaste(p: ClackModule, ref: string | null, sql: string, home: string): Promise<void> {
+  // Write the (possibly-augmented-with-admin-bootstrap) SQL to a tmp file
+  // so users on non-macOS can still find it. On macOS we also copy to
+  // clipboard for one-step paste.
+  const tmpPath = join(home, 'tmp-migration.sql');
+  try { writeFileSync(tmpPath, sql, { mode: 0o600 }); } catch { /* best effort */ }
+
   let clipboardOk = false;
-  if (process.platform === 'darwin' && existsSync(sqlPath)) {
+  if (process.platform === 'darwin') {
     try {
-      const sql = readFileSync(sqlPath, 'utf-8');
       execSync('pbcopy', { input: sql });
       clipboardOk = true;
     } catch { /* best effort */ }
@@ -1532,7 +1670,7 @@ async function applyViaManualPaste(p: ClackModule, ref: string | null, sqlPath: 
       '',
       clipboardOk
         ? 'I copied the migration SQL to your clipboard — just paste and click Run.'
-        : `Paste the contents of ${sqlPath} into the editor, then click Run.`,
+        : `Paste the contents of ${tmpPath} into the editor, then click Run.`,
       '',
       'One-time setup. Come back here once the query finishes.',
     ].join('\n')),
@@ -1545,6 +1683,9 @@ async function applyViaManualPaste(p: ClackModule, ref: string | null, sqlPath: 
   if (p.isCancel(applied) || !applied) {
     p.log.warn('Skipped. Dashboard will 404 on queries until the migration runs.');
   }
+
+  // Clean up tmp file — contains the bcrypt-hashable password in plaintext
+  try { require('fs').unlinkSync(tmpPath); } catch { /* best effort */ }
 }
 
 /** Build the .env contents from the collected wizard config. */

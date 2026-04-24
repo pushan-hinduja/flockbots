@@ -33,6 +33,10 @@ export async function runKgBuild(opts: KgBuildOptions = {}): Promise<boolean> {
     const proc = spawn('bash', [script, ...args], {
       cwd: home,
       env: process.env,
+      // Close stdin so the child `claude -p ...` doesn't sit in its
+      // 3-second stdin-wait ("Warning: no stdin data received in 3s…").
+      // We never pipe anything to the graph builder.
+      stdio: ['ignore', 'pipe', 'pipe'],
     });
 
     const updateFromChunk = (data: Buffer) => {

@@ -1,6 +1,6 @@
 {
   "name": "flockbots-webhook-relay",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "dependencies": {
     "@supabase/supabase-js": "^2.49.0"
   }

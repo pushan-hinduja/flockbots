@@ -6,7 +6,7 @@
 -- needs. The wizard (`flockbots init`) will open the Supabase SQL editor
 -- for you and copy this file to your clipboard.
 --
--- Idempotent — safe to re-run. Tracked in flockbots_migrations at 1.0.0.
+-- Idempotent — safe to re-run. Tracked in flockbots_migrations at 1.0.1.
 -- =============================================================================
 
 -- -----------------------------------------------------------------------------
@@ -18,37 +18,14 @@ CREATE TABLE IF NOT EXISTS flockbots_migrations (
 );
 
 -- -----------------------------------------------------------------------------
--- 1. Access allowlist + helper function
+-- 1. Core tables — coordinator writes with service role; dashboard reads
 -- -----------------------------------------------------------------------------
-CREATE TABLE IF NOT EXISTS flockbots_console_access (
-  user_id UUID PRIMARY KEY REFERENCES auth.users(id) ON DELETE CASCADE,
-  granted_by TEXT,
-  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-);
-
-ALTER TABLE flockbots_console_access ENABLE ROW LEVEL SECURITY;
-
-DROP POLICY IF EXISTS "Users can check own access" ON flockbots_console_access;
-CREATE POLICY "Users can check own access"
-  ON flockbots_console_access FOR SELECT
-  TO authenticated
-  USING (user_id = auth.uid());
-
-DROP POLICY IF EXISTS "Service role manages access" ON flockbots_console_access;
-CREATE POLICY "Service role manages access"
-  ON flockbots_console_access FOR ALL
-  TO service_role
-  USING (true);
-
-CREATE OR REPLACE FUNCTION has_flockbots_console_access()
-RETURNS BOOLEAN AS $$
-  SELECT EXISTS (
-    SELECT 1 FROM flockbots_console_access WHERE user_id = auth.uid()
-  );
-$$ LANGUAGE sql SECURITY DEFINER STABLE;
-
--- -----------------------------------------------------------------------------
--- 2. Core tables — coordinator writes with service role; dashboard reads
+-- Access model: this Supabase project is dedicated to one FlockBots install,
+-- so any row in auth.users = dashboard access. No separate allowlist table.
+-- If you ever want to gate access more tightly, re-introduce an allowlist
+-- table + policy here. **Important:** disable public email signups in your
+-- Supabase project (Authentication → Providers → Email → Enable Sign Ups: off)
+-- so only the admin user(s) you create via `flockbots init` can log in.
 -- -----------------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS flockbots_tasks (
   id TEXT PRIMARY KEY,
@@ -161,7 +138,7 @@ CREATE TABLE IF NOT EXISTS webhook_inbox (
 );
 
 -- -----------------------------------------------------------------------------
--- 3. Indexes
+-- 2. Indexes
 -- -----------------------------------------------------------------------------
 CREATE INDEX IF NOT EXISTS idx_flockbots_events_created
   ON flockbots_events(created_at DESC);
@@ -181,8 +158,9 @@ CREATE INDEX IF NOT EXISTS idx_webhook_inbox_unprocessed
   ON webhook_inbox(processed, created_at) WHERE processed = FALSE;
 
 -- -----------------------------------------------------------------------------
--- 4. RLS + policies
+-- 3. RLS + policies
 -- -----------------------------------------------------------------------------
+ALTER TABLE flockbots_migrations ENABLE ROW LEVEL SECURITY;
 ALTER TABLE flockbots_tasks ENABLE ROW LEVEL SECURITY;
 ALTER TABLE flockbots_events ENABLE ROW LEVEL SECURITY;
 ALTER TABLE flockbots_usage ENABLE ROW LEVEL SECURITY;
@@ -193,58 +171,59 @@ ALTER TABLE flockbots_sub_agents ENABLE ROW LEVEL SECURITY;
 ALTER TABLE flockbots_customizations ENABLE ROW LEVEL SECURITY;
 ALTER TABLE webhook_inbox ENABLE ROW LEVEL SECURITY;
 
--- Read policies (allowlisted authenticated users)
-DROP POLICY IF EXISTS "Allowlisted users can read tasks" ON flockbots_tasks;
-CREATE POLICY "Allowlisted users can read tasks"
+-- Read policies (any authenticated user — the Supabase project is dedicated
+-- to this FlockBots install, so auth.users membership = dashboard access)
+DROP POLICY IF EXISTS "Authenticated users can read tasks" ON flockbots_tasks;
+CREATE POLICY "Authenticated users can read tasks"
   ON flockbots_tasks FOR SELECT TO authenticated
-  USING (has_flockbots_console_access());
+  USING (true);
 
-DROP POLICY IF EXISTS "Allowlisted users can read events" ON flockbots_events;
-CREATE POLICY "Allowlisted users can read events"
+DROP POLICY IF EXISTS "Authenticated users can read events" ON flockbots_events;
+CREATE POLICY "Authenticated users can read events"
   ON flockbots_events FOR SELECT TO authenticated
-  USING (has_flockbots_console_access());
+  USING (true);
 
-DROP POLICY IF EXISTS "Allowlisted users can read usage" ON flockbots_usage;
-CREATE POLICY "Allowlisted users can read usage"
+DROP POLICY IF EXISTS "Authenticated users can read usage" ON flockbots_usage;
+CREATE POLICY "Authenticated users can read usage"
   ON flockbots_usage FOR SELECT TO authenticated
-  USING (has_flockbots_console_access());
+  USING (true);
 
-DROP POLICY IF EXISTS "Allowlisted users can read escalations" ON flockbots_escalations;
-CREATE POLICY "Allowlisted users can read escalations"
+DROP POLICY IF EXISTS "Authenticated users can read escalations" ON flockbots_escalations;
+CREATE POLICY "Authenticated users can read escalations"
   ON flockbots_escalations FOR SELECT TO authenticated
-  USING (has_flockbots_console_access());
+  USING (true);
 
-DROP POLICY IF EXISTS "Allowlisted users can read health" ON flockbots_system_health;
-CREATE POLICY "Allowlisted users can read health"
+DROP POLICY IF EXISTS "Authenticated users can read health" ON flockbots_system_health;
+CREATE POLICY "Authenticated users can read health"
   ON flockbots_system_health FOR SELECT TO authenticated
-  USING (has_flockbots_console_access());
+  USING (true);
 
-DROP POLICY IF EXISTS "Allowlisted users can read stream log" ON flockbots_stream_log;
-CREATE POLICY "Allowlisted users can read stream log"
+DROP POLICY IF EXISTS "Authenticated users can read stream log" ON flockbots_stream_log;
+CREATE POLICY "Authenticated users can read stream log"
   ON flockbots_stream_log FOR SELECT TO authenticated
-  USING (has_flockbots_console_access());
+  USING (true);
 
-DROP POLICY IF EXISTS "Console users read sub-agents" ON flockbots_sub_agents;
-CREATE POLICY "Console users read sub-agents"
+DROP POLICY IF EXISTS "Authenticated users read sub-agents" ON flockbots_sub_agents;
+CREATE POLICY "Authenticated users read sub-agents"
   ON flockbots_sub_agents FOR SELECT TO authenticated
-  USING (has_flockbots_console_access());
+  USING (true);
 
-DROP POLICY IF EXISTS "Console users read customizations" ON flockbots_customizations;
-CREATE POLICY "Console users read customizations"
+DROP POLICY IF EXISTS "Authenticated users read customizations" ON flockbots_customizations;
+CREATE POLICY "Authenticated users read customizations"
   ON flockbots_customizations FOR SELECT TO authenticated
-  USING (has_flockbots_console_access());
+  USING (true);
 
--- Customizations: allowlisted users can upsert/update (their own UI prefs)
-DROP POLICY IF EXISTS "Console users upsert customizations" ON flockbots_customizations;
-CREATE POLICY "Console users upsert customizations"
+-- Customizations: authenticated users can upsert/update (their own UI prefs)
+DROP POLICY IF EXISTS "Authenticated users upsert customizations" ON flockbots_customizations;
+CREATE POLICY "Authenticated users upsert customizations"
   ON flockbots_customizations FOR INSERT TO authenticated
-  WITH CHECK (has_flockbots_console_access());
+  WITH CHECK (true);
 
-DROP POLICY IF EXISTS "Console users update customizations" ON flockbots_customizations;
-CREATE POLICY "Console users update customizations"
+DROP POLICY IF EXISTS "Authenticated users update customizations" ON flockbots_customizations;
+CREATE POLICY "Authenticated users update customizations"
   ON flockbots_customizations FOR UPDATE TO authenticated
-  USING (has_flockbots_console_access())
-  WITH CHECK (has_flockbots_console_access());
+  USING (true)
+  WITH CHECK (true);
 
 -- Service role writes (coordinator uses service role key)
 DROP POLICY IF EXISTS "Service role can insert tasks" ON flockbots_tasks;
@@ -283,18 +262,18 @@ DROP POLICY IF EXISTS "Service role manages customizations" ON flockbots_customi
 CREATE POLICY "Service role manages customizations"
   ON flockbots_customizations FOR ALL TO service_role USING (true);
 
--- Webhook inbox: service role full access; allowlisted users can insert dashboard actions
+-- Webhook inbox: service role full access; authenticated users can insert dashboard actions
 DROP POLICY IF EXISTS "Service role can manage webhook inbox" ON webhook_inbox;
 CREATE POLICY "Service role can manage webhook inbox"
   ON webhook_inbox FOR ALL TO service_role USING (true);
 
-DROP POLICY IF EXISTS "Allowlisted users can insert dashboard actions" ON webhook_inbox;
-CREATE POLICY "Allowlisted users can insert dashboard actions"
+DROP POLICY IF EXISTS "Authenticated users can insert dashboard actions" ON webhook_inbox;
+CREATE POLICY "Authenticated users can insert dashboard actions"
   ON webhook_inbox FOR INSERT TO authenticated
-  WITH CHECK (has_flockbots_console_access() AND source = 'dashboard');
+  WITH CHECK (source = 'dashboard');
 
 -- -----------------------------------------------------------------------------
--- 5. Realtime publications (dashboard subscribes via Supabase realtime)
+-- 4. Realtime publications (dashboard subscribes via Supabase realtime)
 -- -----------------------------------------------------------------------------
 DO $$
 BEGIN
@@ -324,7 +303,7 @@ BEGIN
 END $$;
 
 -- -----------------------------------------------------------------------------
--- 6. Storage bucket for QA screenshots + videos
+-- 5. Storage bucket for QA screenshots + videos
 -- -----------------------------------------------------------------------------
 -- Private bucket. The coordinator (service role) uploads screenshots + short
 -- video clips from the QA agent and generates time-limited signed URLs to
@@ -341,7 +320,7 @@ CREATE POLICY "Service role manages qa-media"
   WITH CHECK (bucket_id = 'qa-media');
 
 -- -----------------------------------------------------------------------------
--- 7. Record this migration
+-- 6. Record this migration
 -- -----------------------------------------------------------------------------
-INSERT INTO flockbots_migrations (version) VALUES ('1.0.0')
+INSERT INTO flockbots_migrations (version) VALUES ('1.0.1')
   ON CONFLICT (version) DO NOTHING;
