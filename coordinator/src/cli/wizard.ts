@@ -8,6 +8,7 @@ import { runPrereqChecks } from './prereq';
 import { createGitHubApp, openBrowser } from './wizard-github';
 import { runKgBuild } from './kg';
 import { renderBanner, help } from './brand';
+import { ensureSkillsFromTemplate } from './skills-sync';
 
 /**
  * Partial configuration built up across wizard steps. Persisted to the
@@ -77,6 +78,12 @@ export async function runWizard(): Promise<void> {
   if (!process.env.FLOCKBOTS_HOME) {
     process.env.FLOCKBOTS_HOME = wizardHome();
   }
+
+  // Populate skills/ from skills-template/ on first run (copy-if-missing so
+  // re-runs don't clobber user edits). Silent — nothing to report to users
+  // unless it's a fresh install, and the intro will run right after anyway.
+  try { ensureSkillsFromTemplate(process.env.FLOCKBOTS_HOME as string); } catch { /* best effort */ }
+
   const p = await import('@clack/prompts');
 
   // Branded banner — pixel duck + FLOCKBOTS wordmark + tagline. Prints

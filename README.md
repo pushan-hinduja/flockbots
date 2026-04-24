@@ -356,7 +356,8 @@ The installer checks every one of these up-front and tells you what's missing.
 ├── coordinator/       Node process — pipeline, CLI, wizard, chat providers, rate-limiter, scheduler
 ├── dashboard/         React dashboard (Vercel-hosted if enabled) — office view, timeline, metrics
 ├── agents/prompts/    One markdown system prompt per agent role (PM, UX, Dev, Reviewer, QA, swarm variants)
-├── skills/            Customizable per-project knowledge agents load at session start (code, design, product, review)
+├── skills-template/   Shipped starter skills — copied into skills/ on first `flockbots init`; updates flow in via `flockbots upgrade`
+├── skills/            Your per-project knowledge agents load at session start (code, design, product, review). Gitignored — edit freely, upgrades won't touch it.
 ├── skills/kg/         Knowledge graph output from graphify (graph.json, graph.html, GRAPH_REPORT.md)
 ├── supabase/          Consolidated SQL migration — one-shot setup of dashboard tables + RLS
 ├── data/              SQLite task queue + event log (authoritative source of truth)

@@ -2,11 +2,14 @@ import { execSync } from 'child_process';
 import { existsSync } from 'fs';
 import { join } from 'path';
 import { homedir } from 'os';
+import { ensureSkillsFromTemplate } from './skills-sync';
 
 /**
  * `flockbots upgrade` — pulls latest from origin, rebuilds the coordinator,
  * and restarts via pm2 if it's running. Refuses to run with a dirty working
- * tree so user-edited skills/*.md don't get wiped by the git reset.
+ * tree so user-tracked files don't get wiped by the git reset. User-editable
+ * content (skills/) lives in a gitignored active directory that's populated
+ * from skills-template/ after each upgrade; edits there don't block pulls.
  */
 export async function runUpgrade(): Promise<void> {
   const p = await import('@clack/prompts');
@@ -38,10 +41,10 @@ export async function runUpgrade(): Promise<void> {
   }
 
   // Refuse to upgrade if the user has uncommitted local changes. `git reset
-  // --hard` would silently wipe them — and since skills/*.md and
-  // docs/templates/CLAUDE.md are tracked starter templates the user is
-  // expected to edit, this is a real data-loss risk. Let the user stash or
-  // commit, then re-run.
+  // --hard` would silently wipe them. As of v1.0.2 user-editable content
+  // (skills/) is gitignored, so this check should mostly only catch
+  // accidental edits to shipped files — but it's still the right default.
+  // Let the user stash or commit, then re-run.
   let dirty = '';
   try {
     dirty = execSync('git status --porcelain', { cwd: home, encoding: 'utf-8' }).trim();
@@ -89,6 +92,19 @@ export async function runUpgrade(): Promise<void> {
     return;
   }
   spin.stop('Built');
+
+  // Propagate new skill templates (if any shipped this release) into the
+  // user's active skills/ dir. Existing user-edited files are skipped.
+  try {
+    const { copied } = ensureSkillsFromTemplate(home);
+    if (copied.length > 0) {
+      p.log.info(`Added ${copied.length} new skill file${copied.length === 1 ? '' : 's'} from skills-template/:`);
+      for (const f of copied.slice(0, 10)) p.log.message(`  + skills/${f}`);
+      if (copied.length > 10) p.log.message(`  (+ ${copied.length - 10} more)`);
+    }
+  } catch (err: any) {
+    p.log.warn(`Skills sync skipped: ${err?.message || String(err)}`);
+  }
 
   // Try pm2 restart — silent failure if pm2 isn't running the process
   try {
