@@ -6,7 +6,7 @@
 -- needs. The wizard (`flockbots init`) will open the Supabase SQL editor
 -- for you and copy this file to your clipboard.
 --
--- Idempotent — safe to re-run. Tracked in flockbots_migrations at 1.0.2.
+-- Idempotent — safe to re-run. Tracked in flockbots_migrations at 1.0.3.
 -- =============================================================================
 
 -- -----------------------------------------------------------------------------
@@ -322,5 +322,5 @@ CREATE POLICY "Service role manages qa-media"
 -- -----------------------------------------------------------------------------
 -- 6. Record this migration
 -- -----------------------------------------------------------------------------
-INSERT INTO flockbots_migrations (version) VALUES ('1.0.2')
+INSERT INTO flockbots_migrations (version) VALUES ('1.0.3')
   ON CONFLICT (version) DO NOTHING;

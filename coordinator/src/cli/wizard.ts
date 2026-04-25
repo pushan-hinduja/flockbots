@@ -5,10 +5,18 @@ import { homedir } from 'os';
 import { randomBytes } from 'crypto';
 import simpleGit from 'simple-git';
 import { runPrereqChecks } from './prereq';
-import { createGitHubApp, openBrowser } from './wizard-github';
+import { createGitHubApp, openBrowser, type GitHubAppExisting } from './wizard-github';
 import { runKgBuild } from './kg';
 import { renderBanner, help } from './brand';
 import { ensureSkillsFromTemplate } from './skills-sync';
+import {
+  ALL_SECTIONS,
+  detectExistingConfig,
+  expandDependencies,
+  pickSectionsToReconfigure,
+  type ReconfigureSection,
+} from './reconfigure';
+import { updateState } from './state-file';
 
 /**
  * Partial configuration built up across wizard steps. Persisted to the
@@ -91,63 +99,96 @@ export async function runWizard(): Promise<void> {
   process.stdout.write(renderBanner() + '\n');
   p.intro('FlockBots setup');
 
-  // Warn early if this looks like a re-run on top of an existing setup.
-  // The wizard overwrites .env + .pem keys and will fail on duplicate
-  // GitHub App names — better to flag that before the user wastes 10min.
-  const existingEnv = join(process.env.FLOCKBOTS_HOME as string, '.env');
-  if (existsSync(existingEnv)) {
-    p.note(
-      help([
-        'An existing FlockBots setup was found at:',
-        `  ${existingEnv}`,
-        '',
-        'Re-running the wizard will:',
-        '  • OVERWRITE .env with new values',
-        '  • OVERWRITE ~/.flockbots/keys/*.pem with fresh keys',
-        '  • FAIL when creating GitHub Apps (the names "FlockBots Agent"',
-        '    and "FlockBots Reviewer" already exist on your account)',
-        '',
-        'Your SQLite task history + tasks/ + logs/ are preserved.',
-        '',
-        "To start completely fresh: exit, run `flockbots uninstall`,",
-        'delete the two GitHub Apps at github.com/settings/apps,',
-        'reinstall, then re-run `flockbots init`.',
-        '',
-        "For small tweaks: edit ~/.flockbots/.env directly instead of",
-        're-running the wizard.',
-      ].join('\n')),
-      'Existing setup detected'
-    );
+  const home = process.env.FLOCKBOTS_HOME as string;
+  const snapshot = detectExistingConfig(home);
 
-    const proceedAnyway = await p.confirm({
-      message: 'Overwrite existing setup and continue?',
-      initialValue: false,
+  // Mode selector: fresh install OR re-run. Fresh installs and users who
+  // explicitly pick "full setup" run the old behavior (all steps). Re-run
+  // users get a checklist so they only have to answer prompts for the
+  // sections they want to change.
+  let mode: 'fresh' | 'reconfigure' = 'fresh';
+  let sectionsToRun = new Set<ReconfigureSection>(ALL_SECTIONS);
+
+  if (snapshot.envExists) {
+    const choice = await p.select({
+      message: `Existing setup found at ${snapshot.envPath}. What do you want to do?`,
+      options: [
+        { value: 'reconfigure', label: 'Reconfigure specific sections', hint: 'recommended — edit just what you need' },
+        { value: 'fresh', label: 'Full setup from scratch', hint: 'overwrites everything' },
+        { value: 'cancel', label: 'Cancel' },
+      ],
+      initialValue: 'reconfigure',
     });
-    if (p.isCancel(proceedAnyway) || !proceedAnyway) {
-      p.cancel('Cancelled — nothing was changed.');
-      return;
+    if (p.isCancel(choice) || choice === 'cancel') {
+      return cancelAndExit(p, 'Setup cancelled. Re-run `flockbots init` anytime.');
+    }
+    mode = choice as 'fresh' | 'reconfigure';
+
+    if (mode === 'fresh') {
+      p.note(
+        help([
+          'Starting from scratch will:',
+          '  • OVERWRITE .env and ~/.flockbots/keys/*.pem',
+          '  • Try to create NEW GitHub Apps — the existing "FlockBots Agent"',
+          '    + "FlockBots Reviewer" apps on github.com will cause the',
+          '    creation step to fail until you delete them first.',
+          '',
+          'Your SQLite task history, tasks/, and logs/ are preserved.',
+          '',
+          'If you really want a clean slate:',
+          '  1. Run `flockbots uninstall`',
+          '  2. Delete the GitHub Apps at github.com/settings/apps',
+          '  3. Reinstall + re-run `flockbots init`',
+        ].join('\n')),
+        'Full setup confirmation'
+      );
+      const typed = await p.text({
+        message: 'Type "yes" to confirm and continue:',
+        validate: (v) => v.trim().toLowerCase() === 'yes' ? undefined : 'Type exactly "yes" to continue, or Ctrl-C to cancel',
+      });
+      if (p.isCancel(typed)) return cancelAndExit(p);
+    } else {
+      const picked = await pickSectionsToReconfigure(p, snapshot);
+      if (picked === null) return cancelAndExit(p);
+      if (picked.length === 0) {
+        p.cancel('No sections selected — nothing to reconfigure.');
+        return;
+      }
+      const { expanded, added } = expandDependencies(picked, snapshot.config);
+      if (added.length > 0) {
+        p.note(
+          `These depend on other sections that aren't configured yet — pulling them in:\n  ${added.join(', ')}`,
+          'Dependencies auto-added'
+        );
+      }
+      sectionsToRun = new Set(expanded);
     }
   }
 
-  p.note(
-    help([
-      'This wizard configures FlockBots on your machine.',
-      '',
-      'Estimated time:',
-      '  - ~10 min      (Telegram, no dashboard)',
-      '  - ~15-20 min   (Telegram + dashboard)',
-      '  - ~30-40 min   (WhatsApp + dashboard — WhatsApp Business Account required)',
-      '',
-      'You will need:',
-      '  - A GitHub account with a repository to work on',
-      '  - Either a Claude Max subscription or an Anthropic API key',
-      '  - Either a Telegram / Slack account, or a Meta Business account',
-    ].join('\n')),
-    'Welcome'
-  );
+  // Welcome note + time estimate — only shown for fresh installs and full-
+  // rewrite mode. Reconfigure mode skips this because the user has already
+  // committed to the picker selection.
+  if (mode === 'fresh') {
+    p.note(
+      help([
+        'This wizard configures FlockBots on your machine.',
+        '',
+        'Estimated time:',
+        '  - ~10 min      (Telegram, no dashboard)',
+        '  - ~15-20 min   (Telegram + dashboard)',
+        '  - ~30-40 min   (WhatsApp + dashboard — WhatsApp Business Account required)',
+        '',
+        'You will need:',
+        '  - A GitHub account with a repository to work on',
+        '  - Either a Claude Max subscription or an Anthropic API key',
+        '  - Either a Telegram / Slack account, or a Meta Business account',
+      ].join('\n')),
+      'Welcome'
+    );
 
-  const proceed = await p.confirm({ message: 'Ready to start?', initialValue: true });
-  if (p.isCancel(proceed) || !proceed) return cancelAndExit(p, 'Setup cancelled. Re-run `flockbots init` anytime.');
+    const proceed = await p.confirm({ message: 'Ready to start?', initialValue: true });
+    if (p.isCancel(proceed) || !proceed) return cancelAndExit(p, 'Setup cancelled. Re-run `flockbots init` anytime.');
+  }
 
   // ----- Prerequisites -------------------------------------------------------
   const spin = p.spinner();
@@ -167,113 +208,172 @@ export async function runWizard(): Promise<void> {
   }
 
   const config: Partial<WizardConfig> = {};
+  if (mode === 'reconfigure') {
+    // Pre-load everything we parsed from .env. Gated ask* calls below
+    // overwrite only the sections the user picked; everything else rides
+    // through untouched into the final buildEnvContent write.
+    Object.assign(config, snapshot.config);
+  }
 
-  // ----- Steps ---------------------------------------------------------------
-  const claude = await askClaudeAuth(p);
-  if (!claude) return cancelAndExit(p);
-  config.claudeAuth = claude.mode;
-  config.anthropicApiKey = claude.apiKey;
+  const wants = (s: ReconfigureSection) => sectionsToRun.has(s);
 
-  const repo = await askTargetRepo(p);
-  if (!repo) return cancelAndExit(p);
-  config.targetRepoPath = repo;
+  // ----- Claude auth ---------------------------------------------------------
+  if (wants('claude-auth')) {
+    const claude = await askClaudeAuth(p);
+    if (!claude) return cancelAndExit(p);
+    config.claudeAuth = claude.mode;
+    config.anthropicApiKey = claude.apiKey;
+  }
 
-  const chat = await askChatProvider(p);
-  if (!chat) return cancelAndExit(p);
-  Object.assign(config, chat);
+  // ----- Target repo (local path + GitHub owner/repo) ------------------------
+  // Bundled: both answer "which repo does FlockBots work on?". If user picks
+  // just target-repo in reconfigure mode, askGitHubTarget auto-detects from
+  // the new remote and the user just confirms.
+  if (wants('target-repo')) {
+    const repo = await askTargetRepo(p);
+    if (!repo) return cancelAndExit(p);
+    config.targetRepoPath = repo;
+  }
 
-  // WhatsApp needs a Vercel-hosted webhook relay that writes inbound
-  // messages to Supabase. Warn up front so the user isn't surprised when
-  // Supabase becomes non-optional a few steps later.
-  if (config.chatProvider === 'whatsapp') {
-    p.note(
-      help([
-        'WhatsApp routes inbound messages through a small Vercel function',
-        '(the "webhook-relay") that writes them to Supabase. The coordinator',
-        'polls Supabase for new messages every few seconds.',
-        '',
-        "Because of this, picking WhatsApp means:",
-        '  - Supabase is REQUIRED (we\'ll set it up in the next few steps)',
-        '  - We\'ll auto-deploy the webhook-relay to Vercel for you',
-        '  - You\'ll paste the resulting URL into Meta\'s webhook config',
-        '',
-        'Full walkthrough with screenshots: docs/setup/whatsapp.md',
-      ].join('\n')),
-      'Heads up — WhatsApp requires Supabase + Vercel'
-    );
-    const proceed = await p.confirm({
-      message: 'Continue with WhatsApp?',
-      initialValue: true,
-    });
-    if (p.isCancel(proceed) || !proceed) return cancelAndExit(p);
+  // ----- Chat provider -------------------------------------------------------
+  if (wants('chat-provider')) {
+    const chat = await askChatProvider(p);
+    if (!chat) return cancelAndExit(p);
+    Object.assign(config, chat);
+
+    // WhatsApp needs a Vercel-hosted webhook relay that writes inbound
+    // messages to Supabase. Warn up front so the user isn't surprised when
+    // Supabase becomes non-optional a few steps later.
+    if (config.chatProvider === 'whatsapp') {
+      p.note(
+        help([
+          'WhatsApp routes inbound messages through a small Vercel function',
+          '(the "webhook-relay") that writes them to Supabase. The coordinator',
+          'polls Supabase for new messages every few seconds.',
+          '',
+          "Because of this, picking WhatsApp means:",
+          '  - Supabase is REQUIRED (we\'ll set it up in the next few steps)',
+          '  - We\'ll auto-deploy the webhook-relay to Vercel for you',
+          '  - You\'ll paste the resulting URL into Meta\'s webhook config',
+          '',
+          'Full walkthrough with screenshots: docs/setup/whatsapp.md',
+        ].join('\n')),
+        'Heads up — WhatsApp requires Supabase + Vercel'
+      );
+      const proceed = await p.confirm({
+        message: 'Continue with WhatsApp?',
+        initialValue: true,
+      });
+      if (p.isCancel(proceed) || !proceed) return cancelAndExit(p);
+
+      // Reconfigure user picked chat-provider + WhatsApp but didn't pick
+      // Supabase, and there's no existing Supabase setup. Pull it in —
+      // WhatsApp without Supabase is a broken config.
+      if (!wants('supabase') && !config.supabaseUrl) {
+        p.log.info("Adding 'supabase' to this run — WhatsApp requires it.");
+        sectionsToRun.add('supabase');
+        sectionsToRun.add('dashboard-admin');
+      }
+    }
   }
 
   // ----- GitHub target repo (owner/repo) -------------------------------------
-  const targetRepo = await askGitHubTarget(p, config.targetRepoPath as string);
-  if (!targetRepo) return cancelAndExit(p);
-  config.githubOwner = targetRepo.owner;
-  config.githubRepo = targetRepo.repo;
+  if (wants('target-repo')) {
+    const targetRepo = await askGitHubTarget(p, config.targetRepoPath as string);
+    if (!targetRepo) return cancelAndExit(p);
+    config.githubOwner = targetRepo.owner;
+    config.githubRepo = targetRepo.repo;
+  }
 
   // ----- Branch strategy -----------------------------------------------------
-  const branches = await askBranches(p, config.targetRepoPath as string, targetRepo.owner, targetRepo.repo);
-  if (!branches) return cancelAndExit(p);
-  config.githubStagingBranch = branches.staging;
-  config.githubProdBranch = branches.prod;
+  if (wants('branches')) {
+    const branches = await askBranches(
+      p,
+      config.targetRepoPath as string,
+      config.githubOwner as string,
+      config.githubRepo as string,
+    );
+    if (!branches) return cancelAndExit(p);
+    config.githubStagingBranch = branches.staging;
+    config.githubProdBranch = branches.prod;
+  }
 
   // ----- GitHub Apps (x2: PR creator + reviewer) -----------------------------
-  const agentApp = await createGitHubApp(p, 'agent');
-  if (!agentApp) return cancelAndExit(p);
-  config.githubAppId = agentApp.appId;
-  config.githubAppInstallationId = agentApp.installationId;
-  config.githubAppPrivateKeyPath = agentApp.pemPath;
+  if (wants('github-apps')) {
+    const agentApp = await createGitHubApp(p, 'agent', { existing: existingGitHubApp(config, 'agent') });
+    if (!agentApp) return cancelAndExit(p);
+    config.githubAppId = agentApp.appId;
+    config.githubAppInstallationId = agentApp.installationId;
+    config.githubAppPrivateKeyPath = agentApp.pemPath;
 
-  const reviewerApp = await createGitHubApp(p, 'reviewer');
-  if (!reviewerApp) return cancelAndExit(p);
-  config.reviewerGithubAppId = reviewerApp.appId;
-  config.reviewerGithubAppInstallationId = reviewerApp.installationId;
-  config.reviewerGithubAppPrivateKeyPath = reviewerApp.pemPath;
+    const reviewerApp = await createGitHubApp(p, 'reviewer', { existing: existingGitHubApp(config, 'reviewer') });
+    if (!reviewerApp) return cancelAndExit(p);
+    config.reviewerGithubAppId = reviewerApp.appId;
+    config.reviewerGithubAppInstallationId = reviewerApp.installationId;
+    config.reviewerGithubAppPrivateKeyPath = reviewerApp.pemPath;
+  }
 
-  // ----- Optional integrations -----------------------------------------------
-  const linear = await askLinear(p);
-  if (linear === null) return cancelAndExit(p);
-  Object.assign(config, linear);
+  // ----- Linear (optional) ---------------------------------------------------
+  if (wants('linear')) {
+    const linear = await askLinear(p);
+    if (linear === null) return cancelAndExit(p);
+    Object.assign(config, linear);
+  }
 
-  const supabase = await askSupabase(p, { required: config.chatProvider === 'whatsapp' });
-  if (supabase === null) return cancelAndExit(p);
-  Object.assign(config, supabase);
+  // ----- Supabase (optional; required for WhatsApp) --------------------------
+  if (wants('supabase')) {
+    const supabase = await askSupabase(p, { required: config.chatProvider === 'whatsapp' });
+    if (supabase === null) return cancelAndExit(p);
+    Object.assign(config, supabase);
+  }
 
-  // QA needs Supabase Storage for screenshots + video clips. Skip the
-  // step entirely with a clear explanation when Supabase is off.
-  if (config.supabaseUrl) {
-    const qa = await askQA(p);
-    if (qa === null) return cancelAndExit(p);
-    Object.assign(config, qa);
-  } else {
-    p.note(
-      help([
-        "The QA agent uploads Playwright screenshots + short video clips",
-        "to a Supabase Storage bucket (qa-media), then sends them to your",
-        "chat provider as time-limited signed URLs. Since you skipped the",
-        "dashboard (Supabase) step, QA is unavailable on this install.",
-        '',
-        'You can add it later: re-run `flockbots init` and enable the',
-        'dashboard when prompted, then pick QA at the same step.',
-      ].join('\n')),
-      'QA agent unavailable (requires Supabase)'
-    );
-    config.qaEnabled = false;
+  // ----- Dashboard admin (requires Supabase) ---------------------------------
+  // Split out from askSupabase so reconfigure users can re-roll just the
+  // dashboard login without re-entering URLs + keys.
+  if (wants('dashboard-admin') && config.supabaseUrl) {
+    const admin = await askDashboardAdmin(p);
+    if (admin === null) return cancelAndExit(p);
+    Object.assign(config, admin);
+  }
+
+  // ----- QA ------------------------------------------------------------------
+  if (wants('qa')) {
+    if (config.supabaseUrl) {
+      const qa = await askQA(p);
+      if (qa === null) return cancelAndExit(p);
+      Object.assign(config, qa);
+    } else {
+      p.note(
+        help([
+          "The QA agent uploads Playwright screenshots + short video clips",
+          "to a Supabase Storage bucket (qa-media), then sends them to your",
+          "chat provider as time-limited signed URLs. Since you skipped the",
+          "dashboard (Supabase) step, QA is unavailable on this install.",
+          '',
+          'You can add it later: re-run `flockbots init` and enable the',
+          'dashboard when prompted, then pick QA at the same step.',
+        ].join('\n')),
+        'QA agent unavailable (requires Supabase)'
+      );
+      config.qaEnabled = false;
+    }
   }
 
   // ----- Summary + write -----------------------------------------------------
   const confirmed = await showSummary(p, config as WizardConfig);
   if (!confirmed) return cancelAndExit(p, 'No changes written — re-run `flockbots init` any time.');
 
-  await writeConfig(p, config as WizardConfig);
+  await writeConfig(p, config as WizardConfig, sectionsToRun);
 
-  // Optional knowledge-graph build. Offered AFTER writeConfig so the .env
-  // and keys are already persisted — even if the graph build fails or the
-  // user bails out, setup state is safe.
-  await offerKgBuild(p);
+  // Knowledge-graph build — only offered when the user explicitly picked
+  // it (fresh mode always does, reconfigure mode only if in sectionsToRun).
+  if (wants('knowledge-graph')) {
+    await offerKgBuild(p);
+  }
+
+  // Persistent state — we just rewrote the config successfully, so stamp
+  // state.json with the timestamp for the next reconfigure run.
+  try { updateState(home, { lastReconfiguredAt: new Date().toISOString() }); } catch { /* best effort */ }
 
   p.outro('FlockBots configured. Run `flockbots doctor` to verify, then start the coordinator.');
 }
@@ -853,9 +953,22 @@ async function askSupabase(p: ClackModule, opts: { required?: boolean } = {}): P
   });
   if (p.isCancel(anonKey)) return null;
 
-  // Admin login for the dashboard. Bootstrapped into auth.users by the
-  // Supabase migration so the user can log in immediately once Vercel
-  // deploys. Password held in memory only — never written to .env.
+  return {
+    supabaseUrl: url as string,
+    supabaseServiceRoleKey: serviceKey as string,
+    supabaseAnonKey: anonKey as string,
+  };
+}
+
+/**
+ * Prompt for the email + password the operator will log into the dashboard
+ * with. Bootstrapped into Supabase `auth.users` by the migration's DO block
+ * so the operator can log in as soon as Vercel deploys the dashboard.
+ *
+ * Password is held in memory only for this wizard run — never written to
+ * .env. Email is also *not* persisted to .env (it lives in auth.users).
+ */
+async function askDashboardAdmin(p: ClackModule): Promise<Partial<WizardConfig> | null> {
   p.note(
     help([
       'Pick the email + password you want to log into the dashboard with.',
@@ -880,9 +993,6 @@ async function askSupabase(p: ClackModule, opts: { required?: boolean } = {}): P
   if (p.isCancel(adminPassword)) return null;
 
   return {
-    supabaseUrl: url as string,
-    supabaseServiceRoleKey: serviceKey as string,
-    supabaseAnonKey: anonKey as string,
     dashboardAdminEmail: (adminEmail as string).trim(),
     dashboardAdminPassword: adminPassword as string,
   };
@@ -1138,6 +1248,25 @@ function wizardHome(): string {
   return process.env.FLOCKBOTS_HOME || join(homedir(), '.flockbots');
 }
 
+/**
+ * Build a `GitHubAppExisting` from the partial config we've pre-loaded
+ * out of .env on a reconfigure run. We deliberately DO NOT check that the
+ * .pem file exists on disk — `createGitHubApp` calls `verifyExistingApp`
+ * which surfaces a missing pem cleanly through the 3-option picker (hides
+ * "keep" so the user has to pick "create new" or "re-create"). Short-
+ * circuiting here would force the fresh-install path with the default
+ * name — which would then collide with the still-existing GitHub App.
+ */
+function existingGitHubApp(c: Partial<WizardConfig>, role: 'agent' | 'reviewer'): GitHubAppExisting | undefined {
+  const appId = role === 'agent' ? c.githubAppId : c.reviewerGithubAppId;
+  const installationId = role === 'agent' ? c.githubAppInstallationId : c.reviewerGithubAppInstallationId;
+  const pemPath = role === 'agent' ? c.githubAppPrivateKeyPath : c.reviewerGithubAppPrivateKeyPath;
+  if (appId && installationId && pemPath) {
+    return { appId, installationId, pemPath };
+  }
+  return undefined;
+}
+
 async function showSummary(p: ClackModule, c: WizardConfig): Promise<boolean> {
   const lines: string[] = [];
   const pad = (label: string) => (label + ':').padEnd(22);
@@ -1170,7 +1299,11 @@ async function showSummary(p: ClackModule, c: WizardConfig): Promise<boolean> {
   return !!ok;
 }
 
-async function writeConfig(p: ClackModule, c: WizardConfig): Promise<void> {
+async function writeConfig(
+  p: ClackModule,
+  c: WizardConfig,
+  touched: Set<ReconfigureSection>,
+): Promise<void> {
   const home = wizardHome();
   mkdirSync(home, { recursive: true });
   mkdirSync(join(home, 'keys'), { recursive: true });
@@ -1180,31 +1313,44 @@ async function writeConfig(p: ClackModule, c: WizardConfig): Promise<void> {
   p.log.success(`Wrote config → ${envPath}`);
   p.log.success(`Keys in → ${join(home, 'keys')}/`);
 
+  // Side-effect: re-apply Supabase migration only when supabase or
+  // dashboard-admin was touched this run. In reconfigure mode this avoids
+  // forcing the user through another PAT prompt when they only came here
+  // to change a Telegram token or similar. Vercel deploys live in the
+  // separate `flockbots dashboard deploy` / `flockbots webhook deploy`
+  // commands as of v1.0.3 — see the next-steps note for the full set.
   if (c.supabaseUrl) {
-    const admin = c.dashboardAdminEmail && c.dashboardAdminPassword
-      ? { email: c.dashboardAdminEmail, password: c.dashboardAdminPassword }
-      : undefined;
-    await applySupabaseMigration(p, c.supabaseUrl, home, admin);
-    await offerVercelDeploy(p, c.supabaseUrl, c.supabaseAnonKey || '');
-    if (c.chatProvider === 'whatsapp') {
-      await deployWebhookRelay(p, c.supabaseUrl, c.whatsappVerifyToken || '');
+    const supabaseTouched = touched.has('supabase') || touched.has('dashboard-admin');
+    if (supabaseTouched) {
+      const admin = c.dashboardAdminEmail && c.dashboardAdminPassword
+        ? { email: c.dashboardAdminEmail, password: c.dashboardAdminPassword }
+        : undefined;
+      await applySupabaseMigration(p, c.supabaseUrl, home, admin);
     }
   }
 
-  p.note(
-    [
-      `Config saved to ${envPath}`,
-      `Keys saved to ${join(home, 'keys')}/`,
-      '',
-      'Start FlockBots:',
-      `  cd ${home}`,
-      '  pm2 start ecosystem.config.js',
-      '  pm2 logs flockbots',
-      '',
-      `Then send a message to your ${c.chatProvider === 'telegram' ? 'Telegram bot' : 'WhatsApp number'} to kick off a task.`,
-    ].join('\n'),
-    'Next steps'
-  );
+  // Build the next-steps note. Different commands matter for different
+  // configs — only mention the ones the user actually needs.
+  const nextSteps: string[] = [
+    `Config saved to ${envPath}`,
+    `Keys saved to ${join(home, 'keys')}/`,
+    '',
+    'Start FlockBots:',
+    `  cd ${home}`,
+    '  pm2 start ecosystem.config.js',
+    '  pm2 logs flockbots',
+    '',
+    `Then send a message to your ${c.chatProvider === 'telegram' ? 'Telegram bot' : c.chatProvider === 'slack' ? 'Slack channel' : 'WhatsApp number'} to kick off a task.`,
+  ];
+
+  const deployCmds: string[] = [];
+  if (c.supabaseUrl) deployCmds.push('  flockbots dashboard deploy   # put the web dashboard on Vercel');
+  if (c.chatProvider === 'whatsapp') deployCmds.push('  flockbots webhook deploy     # required for WhatsApp inbound messages');
+  if (deployCmds.length > 0) {
+    nextSteps.push('', 'When you\'re ready, deploy with:', ...deployCmds);
+  }
+
+  p.note(nextSteps.join('\n'), 'Next steps');
 }
 
 /**
@@ -1414,244 +1560,11 @@ function buildBootstrapAdminSql(email: string, password: string): string {
   ].join('\n');
 }
 
-/**
- * After the Supabase schema is live, offer to deploy the dashboard to
- * Vercel. Uses Vercel's "Deploy Button" URL scheme which opens the import
- * page with the repo, root directory, and required env var names
- * pre-filled — user pastes the two env values, clicks Deploy, and gets a
- * live URL on a .vercel.app subdomain.
- */
-async function offerVercelDeploy(p: ClackModule, supabaseUrl: string, anonKey: string): Promise<void> {
-  p.note(
-    help([
-      'The dashboard is a Vite/React app that reads from your Supabase',
-      'project with row-level security. To view it at a real URL, deploy',
-      'it to Vercel — free tier works, and it connects directly to the',
-      'FlockBots repo so you get auto-deploys on every release.',
-      '',
-      'After deploy you can:',
-      '  - Use the auto-generated .vercel.app URL immediately, or',
-      '  - Add any custom domain you own under Settings → Domains',
-      '    (Vercel handles HTTPS certificates automatically).',
-    ].join('\n')),
-    'Deploy the dashboard to Vercel'
-  );
-
-  const mode = await p.select({
-    message: 'Deploy the dashboard now?',
-    options: [
-      { value: 'now',    label: 'Open Vercel with the import page pre-filled',    hint: 'recommended — ~2 min' },
-      { value: 'later',  label: 'Show me the commands so I can do it later' },
-      { value: 'skip',   label: "Skip — I don't want the web dashboard yet" },
-    ],
-    initialValue: 'now',
-  });
-  if (p.isCancel(mode)) return;
-
-  if (mode === 'skip') {
-    p.log.info("Skipped. You can deploy anytime — see `docs/architecture.md` or run `flockbots dashboard deploy` (coming in v1.1).");
-    return;
-  }
-
-  const importUrl = buildVercelImportUrl();
-
-  // Copy anon key to clipboard on macOS so user can paste quickly when
-  // Vercel prompts for env vars. Done up-front so both 'now' and 'later'
-  // flows benefit; also lets us keep the JWT out of the note body (a
-  // 200-char JWT blows past any terminal width and breaks the box).
-  const clipboarded = (process.platform === 'darwin' && anonKey)
-    ? (() => { try { execSync('pbcopy', { input: anonKey }); return true; } catch { return false; } })()
-    : false;
-  const anonHint = clipboarded
-    ? '(copied to your clipboard — Cmd-V when Vercel prompts)'
-    : anonKey
-      ? '(paste from your Supabase dashboard → Settings → API Keys)'
-      : '(paste from your Supabase dashboard → Settings → API Keys)';
-
-  if (mode === 'later') {
-    p.note(
-      help([
-        'When you\'re ready, open this link in a browser:',
-        '',
-        `  ${importUrl}`,
-        '',
-        'When Vercel asks for environment variables, paste:',
-        `  VITE_SUPABASE_URL       = ${supabaseUrl}`,
-        `  VITE_SUPABASE_ANON_KEY  ${anonHint}`,
-        '',
-        'After deploy, Settings → Domains → Add a custom domain.',
-      ].join('\n')),
-      'Vercel deploy — steps for later'
-    );
-    return;
-  }
-
-  // mode === 'now'
-  p.note(
-    help([
-      'Opening the Vercel import page in your browser. You will need to:',
-      '',
-      '  1. Sign in to Vercel (free tier is fine)',
-      '  2. Authorize GitHub access to the flockbots repo',
-      '  3. Paste these environment variables when prompted:',
-      '',
-      `       VITE_SUPABASE_URL       = ${supabaseUrl}`,
-      `       VITE_SUPABASE_ANON_KEY  ${anonHint}`,
-      '',
-      '  4. Click Deploy — you\'ll have a live URL in ~2 minutes.',
-      '',
-      'For a custom domain later: Vercel Settings → Domains → Add.',
-    ].join('\n')),
-    'Deploy in browser'
-  );
-
-  openBrowser(importUrl);
-
-  const done = await p.confirm({ message: 'Dashboard deployed?', initialValue: true });
-  if (p.isCancel(done) || !done) {
-    p.log.info("No worries — the import page is still open in your browser. You can finish anytime.");
-  }
-}
-
-/**
- * After Supabase is live, deploy the webhook-relay to Vercel — a small
- * edge function under webhook-relay/ that receives Meta webhook POSTs
- * and writes them to the Supabase webhook_inbox table. The coordinator
- * polls that table every few seconds to process new inbound messages.
- *
- * After deploy, prints the exact URL + verify token to paste into the
- * Meta app's webhook configuration.
- */
-async function deployWebhookRelay(p: ClackModule, supabaseUrl: string, verifyToken: string): Promise<void> {
-  p.note(
-    help([
-      'Deploying the FlockBots webhook-relay to Vercel — required for',
-      'WhatsApp inbound messages to reach the coordinator. Free Vercel',
-      'tier is plenty; this function processes maybe a few dozen requests',
-      'a day.',
-    ].join('\n')),
-    'Deploy the WhatsApp webhook-relay'
-  );
-
-  const mode = await p.select({
-    message: 'Deploy now?',
-    options: [
-      { value: 'now',   label: 'Open Vercel with the import page pre-filled', hint: 'recommended — ~2 min' },
-      { value: 'later', label: "Show me how, I'll do it later" },
-    ],
-    initialValue: 'now',
-  });
-  if (p.isCancel(mode)) return;
-
-  const importUrl = buildVercelRelayImportUrl();
-  const envLines = [
-    `  SUPABASE_URL              = ${supabaseUrl}`,
-    `  SUPABASE_SERVICE_ROLE_KEY = <your service_role key from earlier>`,
-    `  WHATSAPP_VERIFY_TOKEN     = ${verifyToken}`,
-  ].join('\n');
-
-  if (mode === 'later') {
-    p.note(
-      help([
-        'When you are ready:',
-        '',
-        `  1. Open: ${importUrl}`,
-        `  2. Paste environment variables when prompted:`,
-        envLines,
-        `  3. Click Deploy. Wait ~60 seconds.`,
-        `  4. Copy the URL Vercel gives you (like https://...vercel.app).`,
-        `  5. Your Meta webhook URL is: <that URL>/api/webhook`,
-        `  6. Verify token for Meta: ${verifyToken}`,
-        `  7. Full walkthrough: docs/setup/whatsapp.md`,
-      ].join('\n')),
-      'Webhook-relay — steps for later'
-    );
-    return;
-  }
-
-  // mode === 'now'
-  p.note(
-    help([
-      'Opening the Vercel import page in your browser.',
-      '',
-      'Paste these environment variables when Vercel prompts:',
-      '',
-      envLines,
-      '',
-      'Then click Deploy. Wait ~60 seconds for the build. Vercel will',
-      'show you a URL at the top of the project page when deploy is done.',
-    ].join('\n')),
-    'Deploy webhook-relay to Vercel'
-  );
-
-  openBrowser(importUrl);
-
-  const deployedUrl = await p.text({
-    message: 'Paste the Vercel deployment URL (e.g. https://flockbots-webhook-relay-xxx.vercel.app):',
-    validate: (v) => (/^https:\/\/.+\.vercel\.app\/?$/.test(v.trim()) ? undefined : 'Expected https://...vercel.app'),
-  });
-  if (p.isCancel(deployedUrl)) return;
-
-  const webhookUrl = (deployedUrl as string).trim().replace(/\/$/, '') + '/api/webhook';
-
-  // Copy verify token to clipboard so Meta paste is one Cmd-V.
-  if (process.platform === 'darwin' && verifyToken) {
-    try { execSync('pbcopy', { input: verifyToken }); } catch { /* best effort */ }
-  }
-
-  p.note(
-    help([
-      'Configure the webhook in your Meta app dashboard:',
-      '',
-      '  1. Go to https://developers.facebook.com/apps/',
-      '  2. Select your WhatsApp app',
-      '  3. WhatsApp → Configuration → Webhook → Edit',
-      '  4. Paste:',
-      `       Callback URL: ${webhookUrl}`,
-      `       Verify token: ${verifyToken}${process.platform === 'darwin' ? '   (already copied to clipboard)' : ''}`,
-      '  5. Click "Verify and save" — Meta sends a GET to your URL',
-      '  6. Click "Manage" on Webhook fields → subscribe to "messages"',
-      '',
-      'Full walkthrough with screenshots: docs/setup/whatsapp.md',
-    ].join('\n')),
-    'Point Meta at your webhook'
-  );
-
-  openBrowser('https://developers.facebook.com/apps/');
-
-  const done = await p.confirm({ message: 'Webhook registered + subscribed in Meta?', initialValue: true });
-  if (p.isCancel(done) || !done) {
-    p.log.warn('Skipped. Inbound WhatsApp messages will not reach the coordinator until the Meta webhook is configured.');
-  }
-}
-
-function buildVercelRelayImportUrl(): string {
-  const params = new URLSearchParams({
-    'repository-url': 'https://github.com/pushan-hinduja/flockbots',
-    'project-name':   'flockbots-webhook-relay',
-    'root-directory': 'webhook-relay',
-    'env':            'SUPABASE_URL,SUPABASE_SERVICE_ROLE_KEY,WHATSAPP_VERIFY_TOKEN',
-    'envDescription': 'Copy from your FlockBots .env (SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, WHATSAPP_VERIFY_TOKEN)',
-  });
-  return `https://vercel.com/new/clone?${params.toString()}`;
-}
-
-/**
- * Build Vercel's one-click "Deploy Button" URL for the flockbots dashboard.
- * Pre-fills the repo, root directory, framework preset, and the two env
- * var names Vercel will prompt for.
- */
-function buildVercelImportUrl(): string {
-  const params = new URLSearchParams({
-    'repository-url': 'https://github.com/pushan-hinduja/flockbots',
-    'project-name':   'flockbots-dashboard',
-    'root-directory': 'dashboard',
-    'env':            'VITE_SUPABASE_URL,VITE_SUPABASE_ANON_KEY',
-    'envDescription': 'Copy these from your Supabase project — Settings → API Keys → Legacy tab',
-    'envLink':        'https://supabase.com/dashboard',
-  });
-  return `https://vercel.com/new/clone?${params.toString()}`;
-}
+// Vercel deploy flows live in dashboard-deploy.ts and webhook-deploy.ts as
+// of v1.0.3 — the wizard prints a "Next steps" note pointing at those
+// commands instead of running the deploy inline. Decoupling means a re-
+// configure that doesn't touch Supabase/WhatsApp doesn't drag the user
+// through Vercel prompts they don't need.
 
 /** Paste-it-yourself fallback — copy SQL to clipboard on macOS, open SQL editor. */
 async function applyViaManualPaste(p: ClackModule, ref: string | null, sql: string, home: string): Promise<void> {

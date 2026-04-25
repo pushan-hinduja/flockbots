@@ -298,7 +298,7 @@ Send your bot a message or `flockbots task add "<description>"`.
 
 ## Setup options at a glance
 
-Everything the wizard will ask. *Optional* rows can be added later by re-running `flockbots init` or editing `~/.flockbots/.env`.
+Everything the wizard will ask. Any row can be changed later — re-run `flockbots init` and the wizard offers a **reconfigure picker** so you can edit just the sections you care about (see [Reconfiguring](#reconfiguring-an-existing-install) below).
 
 A few steps have **dependencies** on other steps — these are called out in the "Depends on" column. The wizard automatically enforces them (e.g. picking WhatsApp forces the dashboard step on; skipping the dashboard hides the QA step).
 
@@ -308,7 +308,7 @@ A few steps have **dependencies** on other steps — these are called out in the
 | **Target repo** | Yes | — | The codebase agents work on | *Existing path* if you already cloned; *clone URL* if you want the wizard to clone |
 | **GitHub owner + repo** | Yes (auto-detected) | Target repo | Where PRs go | Auto-read from `git remote get-url origin`; one tap to confirm |
 | **Branch strategy** | Yes | Target repo | Where FlockBots work merges | **Single branch** for simple repos; **staging → prod** if you have CI deploying from staging |
-| **GitHub Apps ×2** | Yes | GitHub repo | PR author + reviewer identities | Auto-created via manifest flow; click "Create" twice and pick which repo to install each on |
+| **GitHub Apps ×2** | Yes | GitHub repo | PR author + reviewer identities | Auto-created via manifest flow; click "Create" twice and pick which repo to install each on. **Custom names supported** — accept the default ("FlockBots Agent" / "FlockBots Reviewer") or override either at the prompt |
 | **Chat provider** | Yes | — | How you talk to FlockBots | **Telegram** (fastest, nothing extra required); Slack (no Supabase needed); **WhatsApp requires Supabase + Vercel** — the wizard will force those on if you pick it |
 | **Linear sync** | Optional | — | Pull task descriptions from Linear + write PR links, status, completion notes back onto tickets | Skip unless you already track work in Linear |
 | **Dashboard (Supabase)** | Optional | — | Live web UI + office view + task history + token usage + QA screenshot storage | **Recommended.** Also required for QA agent (screenshots) and WhatsApp (webhook-relay), so if you want either of those you'll need this |
@@ -326,6 +326,9 @@ flockbots doctor                 # health check — prereqs, config, knowledge g
 flockbots task add "<desc>"      # queue a task from the CLI
 flockbots upgrade                # pull latest, rebuild, restart via pm2
 flockbots kg build               # (re)build the knowledge graph
+flockbots dashboard deploy       # deploy the web dashboard to Vercel (one-click)
+flockbots webhook deploy         # deploy the WhatsApp webhook-relay to Vercel (one-click)
+flockbots init                   # re-run for the reconfigure picker (see below)
 flockbots uninstall              # clean removal — stops pm2, removes ~/.flockbots, lists externals to revoke
 ```
 
@@ -333,6 +336,43 @@ flockbots uninstall              # clean removal — stops pm2, removes ~/.flock
 <p align="center">
   <em>[ screenshot: pm2 logs — branded boot sequence + live pipeline events ]</em>
 </p>
+
+---
+
+## Reconfiguring an existing install
+
+Re-running `flockbots init` after a successful setup doesn't redo the whole wizard. It offers three choices:
+
+1. **Reconfigure specific sections** — a checklist of every wizard step (Claude auth, target repo, chat provider, GitHub Apps, branches, Linear, Supabase, dashboard admin, QA, knowledge graph). Tick the ones you want to change; everything else is preserved untouched.
+2. **Full setup from scratch** — overwrite `.env` and re-create GitHub Apps. Requires typing `yes` to confirm. Use this only when starting completely over.
+3. **Cancel** — exit without changes.
+
+The picker shows the **current value** for each row (`Chat provider — telegram`, `Supabase — https://xxxx.supabase.co`, `GitHub Apps — agent=12345, reviewer=67890`) so you can see what's in place before changing anything. A stale `.pem` file or missing key file is flagged inline.
+
+**Dependencies are auto-expanded.** Picking the QA agent without a configured Supabase project pulls Supabase in for you — and vice-versa for WhatsApp, which requires Supabase too.
+
+**Side-effects only run when their section was touched.** If you're just rotating a Telegram token, the wizard won't drag you through another Supabase migration prompt or Vercel deploy. Re-deploys live behind the dedicated `flockbots dashboard deploy` and `flockbots webhook deploy` commands so they're always available, never forced.
+
+### GitHub Apps — three options on reconfigure
+
+When you pick the GitHub Apps section in reconfigure mode, the wizard verifies your existing apps are still alive on GitHub (signs a JWT with the saved `.pem`, calls `GET /app` and `GET /app/installations/{id}`) and offers:
+
+1. **Use existing app — no changes** — keep your current setup. Default when verification passes.
+2. **Create a new app with a different name** — for keeping the old app installed while creating a fresh one alongside it (e.g. `FlockBots Agent v2`).
+3. **Re-create with the same name** — for users who've already deleted the old app at [github.com/settings/apps](https://github.com/settings/apps) and want a clean re-create with the original name.
+
+Verification failures (missing `.pem`, deleted app, revoked installation) automatically disable option 1 so you can't accidentally keep a broken app.
+
+### What gets persisted across runs
+
+`~/.flockbots/state.json` (created on first successful run, gitignored) tracks:
+
+- `lastReconfiguredAt` — ISO timestamp of the most recent successful `flockbots init`
+- `dashboardDeployUrl` — the live Vercel URL once `flockbots dashboard deploy` succeeds
+- `webhookRelayUrl` — the webhook-relay deploy URL (WhatsApp installs only)
+- `knowledgeGraphBuiltAt` — when the knowledge graph last built
+
+The file is purely informational — `.env` remains the source of truth for runtime config. Future versions of the wizard show these values in the reconfigure picker so you don't have to remember your own URLs.
 
 ---
 
@@ -363,7 +403,9 @@ The installer checks every one of these up-front and tells you what's missing.
 ├── data/              SQLite task queue + event log (authoritative source of truth)
 ├── tasks/             Per-task git worktrees + context packs + agent artifacts
 ├── logs/              pm2 logs
-└── keys/              GitHub App private keys (0600)
+├── keys/              GitHub App private keys (0600)
+├── .env               Runtime config — written by `flockbots init`, edited via reconfigure
+└── state.json        Cross-run scratchpad — deploy URLs, last-reconfigure timestamp (gitignored)
 ```
 
 SQLite is authoritative; Supabase is a downstream async mirror for the dashboard. Every artifact is on disk, every state change is logged, every agent session is a subprocess you can `strace` if you really want to. No hidden state.

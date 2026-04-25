@@ -1,6 +1,6 @@
 import { createServer, Server } from 'http';
 import { spawn } from 'child_process';
-import { mkdirSync, writeFileSync } from 'fs';
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'fs';
 import { join } from 'path';
 import { homedir } from 'os';
 import { randomBytes } from 'crypto';
@@ -15,6 +15,26 @@ export interface GitHubAppResult {
   name: string;
 }
 
+/**
+ * Identifying details of a previously-created GitHub App. Passed in by
+ * the wizard during reconfigure so `createGitHubApp` can offer to keep
+ * the existing app instead of forcing a re-create.
+ */
+export interface GitHubAppExisting {
+  appId: number;
+  installationId: number;
+  pemPath: string;
+}
+
+export interface CreateGitHubAppOptions {
+  /**
+   * If set, offers the 3-option reconfigure choice (use existing /
+   * create new with custom name / re-create after manual deletion)
+   * instead of going straight into the manifest flow.
+   */
+  existing?: GitHubAppExisting;
+}
+
 export type ClackModule = typeof import('@clack/prompts');
 
 // ---------------------------------------------------------------------------
@@ -22,21 +42,114 @@ export type ClackModule = typeof import('@clack/prompts');
 // ---------------------------------------------------------------------------
 
 /**
- * Walk the user through creating a GitHub App via GitHub's manifest flow.
- * Captures the app_id and private key automatically, then polls for the
- * installation_id once the user installs the app on a repo — no copy-paste
- * of IDs required.
+ * Walk the user through creating (or selecting) a GitHub App.
  *
- * Returns null on cancel or timeout.
+ * Three modes, depending on what comes in via `opts.existing`:
+ *   1. Fresh install (no `existing`) — prompt for name (default
+ *      "FlockBots Agent" / "FlockBots Reviewer"), then run the manifest
+ *      flow to create the app.
+ *   2. Reconfigure with verifiable existing app — show 3-option select:
+ *      keep / create new with custom name / re-create with default name.
+ *   3. Reconfigure with broken existing app — same 3-option select but
+ *      "keep" is disabled because the JWT call failed.
  */
 export async function createGitHubApp(
   p: ClackModule,
   role: 'agent' | 'reviewer',
-  suggestedName?: string
+  opts: CreateGitHubAppOptions = {},
 ): Promise<GitHubAppResult | null> {
   const label = role === 'agent' ? 'PR creator' : 'Reviewer';
-  const appName = suggestedName || (role === 'agent' ? 'FlockBots Agent' : 'FlockBots Reviewer');
+  const defaultName = role === 'agent' ? 'FlockBots Agent' : 'FlockBots Reviewer';
 
+  // ---- Reconfigure path: 3-option choice -----------------------------------
+  if (opts.existing) {
+    const existing = opts.existing;
+    const aliveSpin = p.spinner();
+    aliveSpin.start(`Checking the existing ${label} app on GitHub`);
+    const alive = await verifyExistingApp(existing.appId, existing.pemPath, existing.installationId);
+    if (alive.ok) {
+      aliveSpin.stop(`Existing app is alive: ${alive.name} (id=${existing.appId})`);
+    } else {
+      aliveSpin.stop(`Existing app is unreachable: ${alive.reason}`);
+    }
+
+    const choice = await p.select({
+      message: `${label} GitHub App:`,
+      options: [
+        ...(alive.ok
+          ? [{ value: 'keep' as const, label: 'Use existing app — no changes', hint: 'recommended' }]
+          : []),
+        { value: 'new' as const,      label: 'Create a new app with a different name', hint: 'old app keeps existing' },
+        { value: 'recreate' as const, label: 'Re-create with the same name', hint: "I've deleted the old app on github.com already" },
+      ],
+      initialValue: alive.ok ? 'keep' : 'new',
+    });
+    if (p.isCancel(choice)) return null;
+
+    if (choice === 'keep') {
+      return {
+        appId: existing.appId,
+        installationId: existing.installationId,
+        pemPath: existing.pemPath,
+        name: alive.ok ? alive.name : defaultName,
+      };
+    }
+
+    if (choice === 'new') {
+      const name = await askAppName(p, suggestVariantName(defaultName), `Pick a unique name for the new ${label.toLowerCase()} app:`);
+      if (name === null) return null;
+      return runManifestFlow(p, role, name, label);
+    }
+
+    // choice === 'recreate'
+    p.note(
+      help([
+        `Re-creating the ${label} app with name "${defaultName}".`,
+        '',
+        'GitHub App names are unique per account. This step only works',
+        'if you\'ve already deleted the old app at:',
+        '  https://github.com/settings/apps',
+        '',
+        'If you haven\'t deleted it yet, GitHub will reject the manifest',
+        'with a name conflict. In that case pick "Create a new app with',
+        'a different name" instead.',
+      ].join('\n')),
+      'Heads up'
+    );
+    const ok = await p.confirm({
+      message: `Have you deleted the old "${defaultName}" app on github.com?`,
+      initialValue: false,
+    });
+    if (p.isCancel(ok) || !ok) return null;
+    return runManifestFlow(p, role, defaultName, label);
+  }
+
+  // ---- Fresh path: optional custom name, then manifest flow ----------------
+  const name = await askAppName(
+    p,
+    defaultName,
+    `Name for the ${label.toLowerCase()} GitHub App (Enter to accept default):`,
+  );
+  if (name === null) return null;
+  return runManifestFlow(p, role, name, label);
+}
+
+/**
+ * Run GitHub's app manifest flow: stand up a tiny local callback server,
+ * pre-POST the manifest to GitHub via a /start auto-submit page, wait for
+ * the redirect-back code, exchange it for credentials, save the .pem, then
+ * poll for the installation ID once the user installs the app on a repo.
+ *
+ * Extracted from createGitHubApp's body in v1.0.3 so the reconfigure flow
+ * can call it after the 3-option select resolves to "create new" or
+ * "re-create".
+ */
+async function runManifestFlow(
+  p: ClackModule,
+  role: 'agent' | 'reviewer',
+  appName: string,
+  label: string,
+): Promise<GitHubAppResult | null> {
   p.note(
     help([
       `We'll create a GitHub App named "${appName}" — the ${label} identity.`,
@@ -47,7 +160,6 @@ export async function createGitHubApp(
     `GitHub App — ${label}`
   );
 
-  // Ask whether personal or org account
   const scope = await p.select({
     message: `Where should the "${appName}" app live?`,
     options: [
@@ -68,7 +180,6 @@ export async function createGitHubApp(
     org = o as string;
   }
 
-  // Find a free port for the callback server
   const port = await findFreePort(8765, 8785);
   if (!port) {
     p.log.error('Could not find a free port in 8765-8785. Close local services and retry.');
@@ -109,7 +220,6 @@ export async function createGitHubApp(
   }
   createSpin.stop('Callback received');
 
-  // Exchange the temporary code for the app's credentials
   const exchSpin = p.spinner();
   exchSpin.start('Fetching app credentials from GitHub');
   let app: ManifestConversionResult;
@@ -122,14 +232,12 @@ export async function createGitHubApp(
   }
   exchSpin.stop(`App created: ${app.name} (id=${app.id})`);
 
-  // Persist the private key
   const dir = keysDir();
   mkdirSync(dir, { recursive: true });
   const pemPath = join(dir, `${role}.pem`);
   writeFileSync(pemPath, app.pem, { mode: 0o600 });
   p.log.info(`Saved private key → ${pemPath}`);
 
-  // Ask user to install the app
   p.note(
     help([
       'Opening the install page in your browser.',
@@ -147,7 +255,6 @@ export async function createGitHubApp(
   if (p.isCancel(installReady) || !installReady) return null;
   openBrowser(`${app.html_url}/installations/new`);
 
-  // Poll for installation ID using the app's JWT
   const pollSpin = p.spinner();
   pollSpin.start('Waiting for you to install the app');
   const installationId = await pollForInstallation(app.id, app.pem, 5 * 60 * 1000);
@@ -158,6 +265,78 @@ export async function createGitHubApp(
   pollSpin.stop(`Installation ID: ${installationId}`);
 
   return { appId: app.id, installationId, pemPath, name: app.name };
+}
+
+/**
+ * Prompt for an app name; default = `defaultValue`. Returns the trimmed
+ * value, null on cancel.
+ */
+async function askAppName(p: ClackModule, defaultValue: string, message: string): Promise<string | null> {
+  const value = await p.text({
+    message,
+    placeholder: defaultValue,
+    initialValue: defaultValue,
+    validate: (v) => v.trim().length > 0 ? undefined : 'Required',
+  });
+  if (p.isCancel(value)) return null;
+  return (value as string).trim();
+}
+
+/**
+ * Pick a sensible default for "new app, different name" — appends a v2/v3
+ * suffix that's easy for the user to override.
+ */
+function suggestVariantName(defaultName: string): string {
+  return `${defaultName} v2`;
+}
+
+/**
+ * Verify that an existing GitHub App is reachable: the .pem file is on
+ * disk, signs JWTs successfully, GET /app returns 200, and the recorded
+ * installation still exists. Returns ok + name on success, or ok=false +
+ * a short reason string on any failure.
+ */
+async function verifyExistingApp(
+  appId: number,
+  pemPath: string,
+  installationId: number,
+): Promise<{ ok: true; name: string } | { ok: false; reason: string }> {
+  if (!existsSync(pemPath)) {
+    return { ok: false, reason: 'private key file is missing on disk' };
+  }
+  let privateKey: string;
+  try {
+    privateKey = readFileSync(pemPath, 'utf-8');
+  } catch (err: any) {
+    return { ok: false, reason: `cannot read .pem (${err.message})` };
+  }
+  try {
+    const auth = createAppAuth({ appId, privateKey });
+    const appAuth = await auth({ type: 'app' });
+
+    const appRes = await fetch('https://api.github.com/app', {
+      headers: {
+        Accept: 'application/vnd.github+json',
+        Authorization: `Bearer ${appAuth.token}`,
+        'X-GitHub-Api-Version': '2022-11-28',
+      },
+    });
+    if (!appRes.ok) return { ok: false, reason: `GET /app returned ${appRes.status}` };
+    const appJson = await appRes.json() as { name: string };
+
+    const instRes = await fetch(`https://api.github.com/app/installations/${installationId}`, {
+      headers: {
+        Accept: 'application/vnd.github+json',
+        Authorization: `Bearer ${appAuth.token}`,
+        'X-GitHub-Api-Version': '2022-11-28',
+      },
+    });
+    if (!instRes.ok) return { ok: false, reason: `installation ${installationId} returned ${instRes.status}` };
+
+    return { ok: true, name: appJson.name };
+  } catch (err: any) {
+    return { ok: false, reason: err.message || 'API call failed' };
+  }
 }
 
 // ---------------------------------------------------------------------------

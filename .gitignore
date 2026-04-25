@@ -8,6 +8,7 @@ tasks/
 .worktrees/
 .DS_Store
 .claude/
+.vite/
 /CLAUDE.md
 
 # Active per-install skills dir — populated from skills-template/ on first
@@ -15,3 +16,8 @@ tasks/
 # (graph.json, graph.html, cache/, GRAPH_REPORT.md, etc.) don't block
 # upgrades. The shipped defaults live in skills-template/ (tracked).
 skills/
+
+# Per-install scratchpad — deploy URLs, last-reconfigure time, kg build
+# time. Lives at ~/.flockbots/state.json on a real install; ignored here
+# so dogfooding from the source tree never commits one accidentally.
+state.json

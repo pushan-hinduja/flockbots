@@ -4,6 +4,8 @@ import { runUpgrade } from './upgrade';
 import { runTaskAdd } from './task';
 import { runKgCommand } from './kg';
 import { runUninstall } from './uninstall';
+import { runDashboardDeploy } from './dashboard-deploy';
+import { runWebhookDeploy } from './webhook-deploy';
 import { getVersion } from './version';
 import { TAGLINE, fg, COLORS, dim } from './brand';
 
@@ -26,6 +28,12 @@ async function main(): Promise<void> {
       break;
     case 'kg':
       await runKgCommand(args.slice(1));
+      break;
+    case 'dashboard':
+      await runDashboardCommand(args.slice(1));
+      break;
+    case 'webhook':
+      await runWebhookCommand(args.slice(1));
       break;
     case 'uninstall':
       await runUninstall();
@@ -60,6 +68,30 @@ async function runTaskCommand(args: string[]): Promise<void> {
   }
 }
 
+async function runDashboardCommand(args: string[]): Promise<void> {
+  const sub = args[0];
+  switch (sub) {
+    case 'deploy':
+      await runDashboardDeploy();
+      break;
+    default:
+      console.error(`Unknown dashboard subcommand: ${sub || '(none)'}\n\nUsage:\n  flockbots dashboard deploy`);
+      process.exit(1);
+  }
+}
+
+async function runWebhookCommand(args: string[]): Promise<void> {
+  const sub = args[0];
+  switch (sub) {
+    case 'deploy':
+      await runWebhookDeploy();
+      break;
+    default:
+      console.error(`Unknown webhook subcommand: ${sub || '(none)'}\n\nUsage:\n  flockbots webhook deploy`);
+      process.exit(1);
+  }
+}
+
 function printVersion(): void {
   console.log(`flockbots ${getVersion()}`);
 }
@@ -71,11 +103,14 @@ function printHelp(): void {
 Usage: flockbots <command>
 
 Commands:
-  init                        Run the interactive setup wizard
+  init                        Run the interactive setup wizard (or
+                              reconfigure individual sections on re-run)
   doctor                      Check prerequisites + configuration
   upgrade                     Pull latest, rebuild, restart via pm2
   task add "<description>"    Queue a task from the CLI
   kg build [--incremental]    Build the graphify knowledge graph
+  dashboard deploy            Deploy the web dashboard to Vercel
+  webhook deploy              Deploy the WhatsApp webhook-relay to Vercel
   uninstall                   Remove FlockBots from this machine
   version                     Print the version
   help                        Show this message

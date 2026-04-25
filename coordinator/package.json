@@ -1,6 +1,6 @@
 {
   "name": "flockbots-coordinator",
-  "version": "1.0.2",
+  "version": "1.0.3",
   "description": "FlockBots — multi-agent development coordinator",
   "main": "dist/coordinator/src/index.js",
   "scripts": {

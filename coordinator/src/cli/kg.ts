@@ -3,6 +3,7 @@ import { existsSync, statSync } from 'fs';
 import { join } from 'path';
 import { flockbotsHome } from '../paths';
 import { loadEnvFile } from './env';
+import { updateState } from './state-file';
 
 export interface KgBuildOptions {
   incremental?: boolean;
@@ -54,6 +55,7 @@ export async function runKgBuild(opts: KgBuildOptions = {}): Promise<boolean> {
     proc.on('exit', (code) => {
       if (code === 0) {
         spin.stop('Knowledge graph built');
+        try { updateState(home, { knowledgeGraphBuiltAt: new Date().toISOString() }); } catch { /* best effort */ }
         resolve(true);
       } else {
         spin.stop(`Build exited with code ${code}`);
