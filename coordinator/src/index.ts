@@ -1,6 +1,6 @@
 import cron from 'node-cron';
 import { db, initDatabase, setSyncFunction } from './queue';
-import { initSupabase, fullSync, syncToSupabase, isSupabaseEnabled } from './supabase-sync';
+import { initSupabase, fullSync, syncToSupabase, isSupabaseEnabled, upsertInstance, heartbeatInstance } from './supabase-sync';
 import { getBudgetEstimate, isPeakHours } from './rate-limiter';
 import { processNextTask } from './pipeline';
 import { initLinear, pollLinearIssues } from './linear-sync';
@@ -21,10 +21,21 @@ const TARGET_REPO_PATH = process.env.TARGET_REPO_PATH || process.cwd();
 async function startup(): Promise<void> {
   console.log(header('start'));
 
-  // 0. Ensure state directories exist
+  // 0. Validate this process knows which instance it represents — required
+  // for every multi-instance Supabase write. paths.ts also throws on missing
+  // INSTANCE_ID, but a clear early error beats a stack trace at first FS access.
+  if (!process.env.FLOCKBOTS_INSTANCE_ID) {
+    console.error(
+      'FLOCKBOTS_INSTANCE_ID is required. The coordinator must run inside a registered instance — ' +
+      'use `pm2 start ecosystem.config.js` (which sets it per app) or set the env var explicitly.'
+    );
+    process.exit(1);
+  }
+
+  // 1. Ensure state directories exist
   ensureStateDirs();
 
-  // 1. Initialize database
+  // 2. Initialize database
   initDatabase();
   console.log(progressLine('loading flock', null, 'OK'));
 
@@ -39,11 +50,17 @@ async function startup(): Promise<void> {
   await recoverStaleSessions();
   console.log('Stale session recovery complete');
 
-  // 2. Load rate limit calibration
+  // 3. Load rate limit calibration
   loadCalibration();
 
-  // 3. Initialize Supabase client (optional — dashboard requires it)
+  // 4. Initialize Supabase client (optional — dashboard requires it).
+  // Order matters: upsertInstance() must run BEFORE setSyncFunction() so the
+  // FK on every coordinator-written table is satisfied before any subsequent
+  // sync write tries to insert with this instance_id.
   initSupabase();
+  if (isSupabaseEnabled()) {
+    await upsertInstance();
+  }
   setSyncFunction(syncToSupabase as (type: string, data: Record<string, any>) => Promise<void>);
   console.log(progressLine('dashboard', isSupabaseEnabled() ? 'supabase connected' : 'cli-only mode', isSupabaseEnabled() ? 'OK' : 'SKIP'));
 
@@ -124,8 +141,12 @@ async function startup(): Promise<void> {
     checkSystemHealth().catch(err => console.error('Health monitor error:', err));
   });
 
-  // Lightweight heartbeat + budget sync — every 2 minutes
+  // Lightweight heartbeat + budget sync — every 2 minutes. last_seen_at on
+  // flockbots_instances is what the dashboard reads to mark each instance
+  // online/offline; the per-instance system_health rows give per-instance
+  // detail.
   setInterval(() => {
+    heartbeatInstance().catch(err => console.error('Instance heartbeat error:', err));
     syncToSupabase('health', {
       key: 'coordinator_heartbeat',
       value: JSON.stringify({ online: true, timestamp: new Date().toISOString() }),

@@ -1,4 +1,4 @@
-import { execSync } from 'child_process';
+import { execSync, spawnSync } from 'child_process';
 
 export interface PrereqCheck {
   name: string;
@@ -16,6 +16,54 @@ function check(cmd: string): string | null {
   } catch {
     return null;
   }
+}
+
+export function pm2Installed(): boolean {
+  return !!check('pm2 --version');
+}
+
+/**
+ * Interactive installer for pm2. Called at the end of `flockbots init` so
+ * the "Next steps" command (`pm2 start ecosystem.config.js`) actually runs.
+ * Returns true if pm2 is available afterwards.
+ *
+ * Failure handling: surfaces the actual npm error (often EACCES on system
+ * Node) and tells the user to retry with sudo. We don't run sudo ourselves
+ * — that would surprise users who manage globals via nvm / their own prefix.
+ */
+export async function offerPm2Install(
+  p: typeof import('@clack/prompts'),
+): Promise<boolean> {
+  if (pm2Installed()) return true;
+
+  const installNow = await p.confirm({
+    message: 'pm2 is required to run FlockBots but is not installed. Install it globally now?',
+    initialValue: true,
+  });
+  if (p.isCancel(installNow) || !installNow) {
+    p.log.info('Install later with: npm install -g pm2');
+    return false;
+  }
+
+  const spin = p.spinner();
+  spin.start('Installing pm2 globally (npm install -g pm2)');
+  const result = spawnSync('npm', ['install', '-g', 'pm2'], { encoding: 'utf-8' });
+  if (result.status === 0 && pm2Installed()) {
+    spin.stop('pm2 installed');
+    return true;
+  }
+  spin.stop('Install failed');
+
+  const errText = `${result.stderr || ''}\n${result.stdout || ''}`;
+  if (/EACCES|permission denied/i.test(errText)) {
+    p.log.error('Permission denied — your npm prefix needs sudo. Retry:');
+    p.log.message('  sudo npm install -g pm2');
+  } else {
+    const lines = errText.split('\n').filter(Boolean).slice(0, 5).join('\n');
+    p.log.error(lines || 'npm exited non-zero');
+    p.log.message('Retry: npm install -g pm2');
+  }
+  return false;
 }
 
 function parseMajor(version: string): number {
@@ -81,6 +129,15 @@ export function runPrereqChecks(): PrereqCheck[] {
     detail: claudeVer || 'not found',
     required: true,
     fix: 'Install from https://claude.com/code or run: curl -fsSL https://claude.ai/install.sh | bash',
+  });
+
+  const pm2Ver = check('pm2 --version');
+  checks.push({
+    name: 'pm2',
+    ok: !!pm2Ver,
+    detail: pm2Ver || 'not found',
+    required: true,
+    fix: 'Install: npm install -g pm2  (sudo may be needed depending on your npm prefix)',
   });
 
   return checks;

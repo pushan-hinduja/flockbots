@@ -1328,7 +1328,14 @@ async function uploadQAMedia(taskId: string, localPath: string): Promise<string 
       return null;
     }
 
-    const key = `${taskId}/${Date.now()}-${localPath.split('/').pop()}`;
+    // Prefix by instance so two instances generating the same 8-char taskId
+    // never overwrite each other's QA artifacts.
+    const inst = process.env.FLOCKBOTS_INSTANCE_ID;
+    if (!inst) {
+      logEvent(taskId, 'qa', 'media_skipped', 'FLOCKBOTS_INSTANCE_ID not set');
+      return null;
+    }
+    const key = `${inst}/${taskId}/${Date.now()}-${localPath.split('/').pop()}`;
     const buffer = readFileSync(fullPath);
     const contentType = localPath.endsWith('.webm') ? 'video/webm' : 'image/png';
 

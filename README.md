@@ -322,15 +322,19 @@ Total setup time: **~10 min** for the minimum viable flock (Telegram, no dashboa
 ## Day-to-day
 
 ```bash
-flockbots doctor                 # health check — prereqs, config, knowledge graph state
-flockbots task add "<desc>"      # queue a task from the CLI
-flockbots upgrade                # pull latest, rebuild, restart via pm2
-flockbots kg build               # (re)build the knowledge graph
+flockbots doctor                 # health check — prereqs + per-flock config (-i <slug> to filter)
+flockbots instances              # list configured flocks + pm2 status
+flockbots task add "<desc>"      # queue a task from the CLI (-i <slug> if you have multiple flocks)
+flockbots kg build               # (re)build the knowledge graph (-i <slug> picks the flock)
 flockbots dashboard deploy       # deploy the web dashboard to Vercel (one-click)
 flockbots webhook deploy         # deploy the WhatsApp webhook-relay to Vercel (one-click)
-flockbots init                   # re-run for the reconfigure picker (see below)
-flockbots uninstall              # clean removal — stops pm2, removes ~/.flockbots, lists externals to revoke
+flockbots upgrade                # pull latest, rebuild, restart every flock via pm2
+flockbots init                   # add a new flock or reconfigure an existing one (see below)
+flockbots remove                 # remove a single flock (pm2 + dir + Supabase archive)
+flockbots uninstall              # clean removal — stops every flock, removes ~/.flockbots, lists externals to revoke
 ```
+
+The `-i <slug>` flag is auto-resolved when you only have one flock. With two or more, every per-flock command requires it (or pick interactively at the prompt for `flockbots remove`).
 
 <!-- SCREENSHOT: pm2 logs showing the branded boot sequence + live pipeline activity -->
 <p align="center">
@@ -352,6 +356,8 @@ The picker shows the **current value** for each row (`Chat provider — telegram
 **Dependencies are auto-expanded.** Picking the QA agent without a configured Supabase project pulls Supabase in for you — and vice-versa for WhatsApp, which requires Supabase too.
 
 **Side-effects only run when their section was touched.** If you're just rotating a Telegram token, the wizard won't drag you through another Supabase migration prompt or Vercel deploy. Re-deploys live behind the dedicated `flockbots dashboard deploy` and `flockbots webhook deploy` commands so they're always available, never forced.
+
+**Shared values propagate across flocks.** If you have multiple flocks and edit a shared setting (Supabase URL, dashboard admin, WhatsApp verify token), the wizard updates every flock's `.env` in lockstep — diff-based, so a no-op edit doesn't ripple. With ≥2 flocks, the picker also shows a "Reconfigure shared settings" shortcut that edits Supabase + dashboard admin once and propagates everywhere.
 
 ### GitHub Apps — three options on reconfigure
 
@@ -376,6 +382,72 @@ The file is purely informational — `.env` remains the source of truth for runt
 
 ---
 
+## Managing multiple flocks
+
+One install, many repos. Each flock is its own coordinator process pointing at one target repo, sharing the dashboard, Supabase project, and dashboard login with every other flock on this machine.
+
+### Adding a second flock
+
+Re-run `flockbots init`. With at least one flock already configured, the picker offers a third option: **Add a new instance**. Walk through the wizard for the new repo. Three things you don't retype — they're auto-reused from your first flock:
+
+- **Supabase project** — every flock writes to the same project; the dashboard reads one URL.
+- **Dashboard login** — Supabase auth users are shared, so the email + password you set up the first time work for every flock.
+- **Webhook relay** (WhatsApp only) — one Vercel deployment, one verify token; the new flock just gets its own `/api/webhook/<slug>` path.
+
+Three things every flock gets its own of:
+
+- **Chat provider tokens** — Telegram bots, Slack apps, and WhatsApp numbers can't be reused safely across flocks (each long-poll / Socket Mode connection holds the token), so each flock has its own bot credentials.
+- **GitHub Apps** — by default a fresh PR + reviewer pair per flock, but the wizard offers to reuse an existing FlockBots Agent / Reviewer if you'd rather install one set across multiple repos.
+- **Target repo** — different code, different worktrees, different SQLite queue.
+
+### Running the flocks
+
+`pm2 start ecosystem.config.js` enumerates every flock under `~/.flockbots/instances/` and spins up `flockbots:<slug>` per process — one start command boots all of them. `flockbots upgrade` restarts every flock together.
+
+```bash
+pm2 logs flockbots:acme-app          # one flock
+pm2 logs /^flockbots:/               # all of them
+flockbots instances                  # status table — slug, target repo, provider, pm2 dot
+```
+
+Sample `flockbots instances` output:
+
+```
+slug                target              provider   status
+●  acme-app         acme-corp/web       telegram   online
+●  my-blog          me/blog             whatsapp   online
+○  experimental     me/scratch          telegram   stopped
+```
+
+### CLI flags for multi-flock
+
+When you have ≥2 flocks, every per-flock command needs `-i <slug>` (auto-resolved at N=1):
+
+```bash
+flockbots task add -i acme-app "Add a dark-mode toggle"
+flockbots kg build -i my-blog
+flockbots doctor -i acme-app
+flockbots remove -i experimental                # archive a flock
+```
+
+### The dashboard with multiple flocks
+
+The dashboard's top bar shows an **instance switcher**. Click it once to flip every panel — pipeline, events, usage, office view — to that flock. **Escalations stay cross-flock**: an "awaiting human" task pages you no matter which flock you're currently viewing, prefixed with the flock it came from. **Archived flocks** (after `flockbots remove`) are hidden from the switcher; their history stays in Supabase.
+
+### Removing a flock
+
+`flockbots remove [-i <slug>]` tears down a single flock without touching the others:
+
+1. Archives the flock in Supabase (`archived_at = now()`) — historical events stay; dashboard hides it.
+2. Stops + deletes the `flockbots:<slug>` pm2 process.
+3. Removes `~/.flockbots/instances/<slug>/`.
+4. Cleans `.worktrees/` inside that flock's target repo.
+5. Prints a revocation checklist (GitHub App, chat bot) hedged for app reuse — if another flock still uses the GitHub App, the checklist tells you to keep it.
+
+The confirm prompt requires you to **type the slug** to proceed — accidental Enter on a y/n is too easy for a destructive operation.
+
+---
+
 ## Requirements
 
 - **Node 20+**
@@ -393,22 +465,27 @@ The installer checks every one of these up-front and tells you what's missing.
 
 ```text
 ~/.flockbots/
-├── coordinator/       Node process — pipeline, CLI, wizard, chat providers, rate-limiter, scheduler
-├── dashboard/         React dashboard (Vercel-hosted if enabled) — office view, timeline, metrics
-├── agents/prompts/    One markdown system prompt per agent role (PM, UX, Dev, Reviewer, QA, swarm variants)
-├── skills-template/   Shipped starter skills — copied into skills/ on first `flockbots init`; updates flow in via `flockbots upgrade`
-├── skills/            Your per-project knowledge agents load at session start (code, design, product, review). Gitignored — edit freely, upgrades won't touch it.
-├── skills/kg/         Knowledge graph output from graphify (graph.json, graph.html, GRAPH_REPORT.md)
-├── supabase/          Consolidated SQL migration — one-shot setup of dashboard tables + RLS
-├── data/              SQLite task queue + event log (authoritative source of truth)
-├── tasks/             Per-task git worktrees + context packs + agent artifacts
-├── logs/              pm2 logs
-├── keys/              GitHub App private keys (0600)
-├── .env               Runtime config — written by `flockbots init`, edited via reconfigure
-└── state.json        Cross-run scratchpad — deploy URLs, last-reconfigure timestamp (gitignored)
+├── coordinator/             Node coordinator code (shared) — pipeline, CLI, wizard, chat providers, scheduler
+├── dashboard/               React dashboard source (shared) — Vercel-hosted if enabled
+├── webhook-relay/           WhatsApp webhook-relay source (shared) — Vercel-hosted if you use WhatsApp
+├── agents/prompts/          System prompts per agent role (shared) — PM, UX, Dev, Reviewer, QA, swarm variants
+├── skills-template/         Starter skills (shared seed) — copied into each flock's skills/ on first init
+├── supabase/                Consolidated SQL migration (shared) — one-shot setup of dashboard tables + RLS
+├── scripts/                 Utility scripts (shared) — knowledge-graph builder, etc.
+├── ecosystem.config.js      pm2 config — auto-discovers every flock under instances/
+├── state.json               Cross-run scratchpad — deploy URLs, last reconfigure (shared, gitignored)
+├── rate-limit-state.json    Shared Claude budget — all flocks share one OAuth session / API key
+└── instances/               One subdirectory per flock
+    └── <slug>/              e.g. acme-app, my-blog
+        ├── .env             Per-flock runtime config (target repo, chat tokens, GitHub Apps)
+        ├── data/            SQLite task queue + event log (authoritative for this flock)
+        ├── tasks/           Per-task git worktrees + agent artifacts
+        ├── logs/            pm2 logs for flockbots:<slug>
+        ├── keys/            GitHub App private keys (0600)
+        └── skills/          Per-flock knowledge — code/design/product skills + the kg graph
 ```
 
-SQLite is authoritative; Supabase is a downstream async mirror for the dashboard. Every artifact is on disk, every state change is logged, every agent session is a subprocess you can `strace` if you really want to. No hidden state.
+Each flock is its own coordinator process. Shared resources (dashboard, Supabase project, dashboard login, Claude rate-limit budget) live at the root; per-flock state (queue, worktrees, GitHub Apps, chat tokens, target repo) lives under `instances/<slug>/`. SQLite is authoritative; Supabase is a downstream async mirror for the dashboard, with every row keyed by `instance_id` so the switcher can scope panels per flock.
 
 Deeper walkthrough: [`docs/architecture.md`](docs/architecture.md).
 
@@ -416,7 +493,7 @@ Deeper walkthrough: [`docs/architecture.md`](docs/architecture.md).
 
 ## Roadmap
 
-- **Docker image** — `docker compose up` for users who'd rather not install Node / build tools. Planned for v1.1.
+- **Docker image** — `docker compose up` for users who'd rather not install Node / build tools.
 - **`flockbots start / stop / status / logs`** — friendlier CLI wrappers around pm2.
 - **Discord + Matrix chat providers** — third and fourth channel options.
 - **Windows native support** — WSL works today; native is a later consideration.

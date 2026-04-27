@@ -2,22 +2,27 @@ import { copyFileSync, existsSync, mkdirSync, readdirSync, statSync } from 'fs';
 import { dirname, join } from 'path';
 
 /**
- * Populate FLOCKBOTS_HOME/skills/ from FLOCKBOTS_HOME/skills-template/
- * by copying every file that doesn't already exist in the target. Files
- * already present in skills/ are LEFT UNTOUCHED so user customizations
- * are never clobbered.
+ * Copy every file from <srcHome>/skills-template/ into <destHome>/skills/
+ * that doesn't already exist there. Files already present are LEFT
+ * UNTOUCHED so user customizations are never clobbered.
  *
- * Called from both `flockbots init` (first-time setup) and `flockbots
- * upgrade` (so new template files shipped upstream propagate into the
- * user's active skills/ dir without overwriting their edits).
+ * Called from `flockbots init` (per-instance, on creation) and `flockbots
+ * upgrade` (iterates instances so new template files propagate into each
+ * one). Multi-instance: srcHome is the shared root (where skills-template
+ * is git-tracked), destHome is the per-instance dir. Single-arg usage
+ * (srcHome omitted) is preserved for callers that haven't been migrated
+ * yet — falls back to destHome for both, matching the v1.0 layout.
  *
  * The skills/ directory itself is gitignored — this is what frees users
  * to edit it without blocking upgrades. The shipping defaults live in
  * skills-template/, which IS tracked and updated by `git pull`.
  */
-export function ensureSkillsFromTemplate(home: string): { copied: string[]; skipped: string[] } {
-  const templateDir = join(home, 'skills-template');
-  const activeDir = join(home, 'skills');
+export function ensureSkillsFromTemplate(
+  destHome: string,
+  srcHome?: string,
+): { copied: string[]; skipped: string[] } {
+  const templateDir = join(srcHome || destHome, 'skills-template');
+  const activeDir = join(destHome, 'skills');
   const copied: string[] = [];
   const skipped: string[] = [];
 

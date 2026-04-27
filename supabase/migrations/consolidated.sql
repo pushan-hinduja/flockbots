@@ -1,12 +1,18 @@
 -- =============================================================================
--- FlockBots v1.0 — consolidated schema
+-- FlockBots v1.1 — consolidated schema
 -- =============================================================================
 -- Apply this once in your Supabase project's SQL editor to bootstrap every
 -- table, function, policy, index, and realtime publication the dashboard
 -- needs. The wizard (`flockbots init`) will open the Supabase SQL editor
 -- for you and copy this file to your clipboard.
 --
--- Idempotent — safe to re-run. Tracked in flockbots_migrations at 1.0.3.
+-- Idempotent — safe to re-run on a fresh project. Tracked in
+-- flockbots_migrations at 1.1.0.
+--
+-- Multi-instance: every coordinator row carries an `instance_id` foreign key
+-- into flockbots_instances. One Supabase project can host N FlockBots
+-- coordinators (each pointing at a different target repo) sharing the same
+-- dashboard.
 -- =============================================================================
 
 -- -----------------------------------------------------------------------------
@@ -18,17 +24,36 @@ CREATE TABLE IF NOT EXISTS flockbots_migrations (
 );
 
 -- -----------------------------------------------------------------------------
--- 1. Core tables — coordinator writes with service role; dashboard reads
+-- 1. Instance registry — every coordinator-written row points here
 -- -----------------------------------------------------------------------------
--- Access model: this Supabase project is dedicated to one FlockBots install,
--- so any row in auth.users = dashboard access. No separate allowlist table.
--- If you ever want to gate access more tightly, re-introduce an allowlist
--- table + policy here. **Important:** disable public email signups in your
--- Supabase project (Authentication → Providers → Email → Enable Sign Ups: off)
--- so only the admin user(s) you create via `flockbots init` can log in.
+-- Access model: this Supabase project is dedicated to one operator's flock,
+-- so any row in auth.users = dashboard access (across all instances). No
+-- separate allowlist table. **Important:** disable public email signups in
+-- your Supabase project (Authentication → Providers → Email → Enable Sign
+-- Ups: off) so only the admin user(s) you create via `flockbots init` can
+-- log in.
+-- -----------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS flockbots_instances (
+  id TEXT PRIMARY KEY,                       -- slug, e.g. "acme-app"
+  display_name TEXT,
+  target_repo TEXT NOT NULL,                 -- "owner/repo"
+  chat_provider TEXT,                        -- "telegram" | "slack" | "whatsapp"
+  registered_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  last_seen_at TIMESTAMPTZ,                  -- coordinator heartbeat
+  archived_at TIMESTAMPTZ
+);
+
+-- Active instances must point at unique repos; archived ones are exempt so a
+-- repo can be re-instanced after `flockbots remove`.
+CREATE UNIQUE INDEX IF NOT EXISTS idx_flockbots_instances_active_repo
+  ON flockbots_instances(target_repo) WHERE archived_at IS NULL;
+
+-- -----------------------------------------------------------------------------
+-- 2. Core tables — coordinator writes with service role; dashboard reads
 -- -----------------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS flockbots_tasks (
-  id TEXT PRIMARY KEY,
+  instance_id TEXT NOT NULL REFERENCES flockbots_instances(id),
+  id TEXT NOT NULL,
   title TEXT NOT NULL,
   description TEXT NOT NULL,
   source TEXT,
@@ -51,21 +76,25 @@ CREATE TABLE IF NOT EXISTS flockbots_tasks (
   qa_status TEXT,
   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
   updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-  completed_at TIMESTAMPTZ
+  completed_at TIMESTAMPTZ,
+  PRIMARY KEY (instance_id, id)
 );
 
 CREATE TABLE IF NOT EXISTS flockbots_events (
   id BIGSERIAL PRIMARY KEY,
-  task_id TEXT REFERENCES flockbots_tasks(id),
+  instance_id TEXT NOT NULL REFERENCES flockbots_instances(id),
+  task_id TEXT,
   agent TEXT,
   event_type TEXT NOT NULL,
   message TEXT,
   metadata JSONB,
-  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  FOREIGN KEY (instance_id, task_id) REFERENCES flockbots_tasks(instance_id, id)
 );
 
 CREATE TABLE IF NOT EXISTS flockbots_usage (
   id BIGSERIAL PRIMARY KEY,
+  instance_id TEXT NOT NULL REFERENCES flockbots_instances(id),
   task_id TEXT NOT NULL,
   agent TEXT NOT NULL,
   session_id TEXT,
@@ -77,25 +106,35 @@ CREATE TABLE IF NOT EXISTS flockbots_usage (
   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
+-- Escalations: id is the coordinator's local SQLite rowid (BIGINT, NOT
+-- BIGSERIAL). Composite PK with instance_id makes it globally unique
+-- without the coordinator having to round-trip a Supabase-assigned id back
+-- into local state — answer/dismiss writes can use the local id directly.
 CREATE TABLE IF NOT EXISTS flockbots_escalations (
-  id BIGSERIAL PRIMARY KEY,
+  instance_id TEXT NOT NULL REFERENCES flockbots_instances(id),
+  id BIGINT NOT NULL,
   task_id TEXT NOT NULL,
   question TEXT NOT NULL,
   context TEXT,
   status TEXT DEFAULT 'pending',
   answer TEXT,
   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-  answered_at TIMESTAMPTZ
+  answered_at TIMESTAMPTZ,
+  PRIMARY KEY (instance_id, id)
 );
 
+-- Per-instance health snapshots — each coordinator writes its own rows.
 CREATE TABLE IF NOT EXISTS flockbots_system_health (
-  key TEXT PRIMARY KEY,
+  instance_id TEXT NOT NULL REFERENCES flockbots_instances(id),
+  key TEXT NOT NULL,
   value JSONB NOT NULL,
-  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  PRIMARY KEY (instance_id, key)
 );
 
 CREATE TABLE IF NOT EXISTS flockbots_stream_log (
   id BIGSERIAL PRIMARY KEY,
+  instance_id TEXT NOT NULL REFERENCES flockbots_instances(id),
   task_id TEXT NOT NULL,
   agent TEXT NOT NULL,
   session_id TEXT NOT NULL,
@@ -106,6 +145,7 @@ CREATE TABLE IF NOT EXISTS flockbots_stream_log (
 -- Sub-agent spawn log — powers swarm visualization
 CREATE TABLE IF NOT EXISTS flockbots_sub_agents (
   id BIGSERIAL PRIMARY KEY,
+  instance_id TEXT NOT NULL REFERENCES flockbots_instances(id),
   task_id TEXT NOT NULL,
   parent_agent TEXT NOT NULL,
   session_id TEXT,
@@ -117,7 +157,9 @@ CREATE TABLE IF NOT EXISTS flockbots_sub_agents (
   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
--- Per-operator agent display overrides (sprite / name customizations)
+-- Per-operator agent display overrides (sprite / name customizations).
+-- Intentionally global — sprite choices apply to the agent type across all
+-- instances (the "researcher" duck looks the same regardless of repo).
 CREATE TABLE IF NOT EXISTS flockbots_customizations (
   agent_id TEXT PRIMARY KEY,
   name TEXT,
@@ -127,9 +169,12 @@ CREATE TABLE IF NOT EXISTS flockbots_customizations (
   updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
--- Webhook inbox — relay writes incoming chat messages here, coordinator polls
+-- Webhook inbox — relay writes incoming chat messages here, coordinator polls.
+-- Per-instance: WhatsApp relay routes by URL path (/api/webhook/<instance>),
+-- dashboard actions tag with the target instance's id.
 CREATE TABLE IF NOT EXISTS webhook_inbox (
   id BIGSERIAL PRIMARY KEY,
+  instance_id TEXT NOT NULL REFERENCES flockbots_instances(id),
   source TEXT NOT NULL DEFAULT 'whatsapp',
   sender TEXT,
   payload JSONB NOT NULL,
@@ -138,29 +183,30 @@ CREATE TABLE IF NOT EXISTS webhook_inbox (
 );
 
 -- -----------------------------------------------------------------------------
--- 2. Indexes
+-- 3. Indexes
 -- -----------------------------------------------------------------------------
-CREATE INDEX IF NOT EXISTS idx_flockbots_events_created
-  ON flockbots_events(created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_flockbots_events_instance_created
+  ON flockbots_events(instance_id, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_flockbots_stream_log_task_agent
-  ON flockbots_stream_log(task_id, agent, created_at);
-CREATE INDEX IF NOT EXISTS idx_flockbots_escalations_status
-  ON flockbots_escalations(status) WHERE status = 'pending';
+  ON flockbots_stream_log(instance_id, task_id, agent, created_at);
+CREATE INDEX IF NOT EXISTS idx_flockbots_escalations_pending
+  ON flockbots_escalations(instance_id, status) WHERE status = 'pending';
 CREATE INDEX IF NOT EXISTS idx_flockbots_tasks_status
-  ON flockbots_tasks(status);
+  ON flockbots_tasks(instance_id, status);
 CREATE INDEX IF NOT EXISTS idx_flockbots_tasks_parent
-  ON flockbots_tasks(parent_task_id) WHERE parent_task_id IS NOT NULL;
+  ON flockbots_tasks(instance_id, parent_task_id) WHERE parent_task_id IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_flockbots_sub_agents_task_id
-  ON flockbots_sub_agents(task_id, created_at);
+  ON flockbots_sub_agents(instance_id, task_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_flockbots_sub_agents_tool_use
-  ON flockbots_sub_agents(tool_use_id) WHERE tool_use_id IS NOT NULL;
+  ON flockbots_sub_agents(instance_id, tool_use_id) WHERE tool_use_id IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_webhook_inbox_unprocessed
-  ON webhook_inbox(processed, created_at) WHERE processed = FALSE;
+  ON webhook_inbox(instance_id, processed, created_at) WHERE processed = FALSE;
 
 -- -----------------------------------------------------------------------------
--- 3. RLS + policies
+-- 4. RLS + policies
 -- -----------------------------------------------------------------------------
 ALTER TABLE flockbots_migrations ENABLE ROW LEVEL SECURITY;
+ALTER TABLE flockbots_instances ENABLE ROW LEVEL SECURITY;
 ALTER TABLE flockbots_tasks ENABLE ROW LEVEL SECURITY;
 ALTER TABLE flockbots_events ENABLE ROW LEVEL SECURITY;
 ALTER TABLE flockbots_usage ENABLE ROW LEVEL SECURITY;
@@ -172,7 +218,12 @@ ALTER TABLE flockbots_customizations ENABLE ROW LEVEL SECURITY;
 ALTER TABLE webhook_inbox ENABLE ROW LEVEL SECURITY;
 
 -- Read policies (any authenticated user — the Supabase project is dedicated
--- to this FlockBots install, so auth.users membership = dashboard access)
+-- to this operator's flock, so auth.users membership = dashboard access)
+DROP POLICY IF EXISTS "Authenticated users read instances" ON flockbots_instances;
+CREATE POLICY "Authenticated users read instances"
+  ON flockbots_instances FOR SELECT TO authenticated
+  USING (true);
+
 DROP POLICY IF EXISTS "Authenticated users can read tasks" ON flockbots_tasks;
 CREATE POLICY "Authenticated users can read tasks"
   ON flockbots_tasks FOR SELECT TO authenticated
@@ -226,6 +277,10 @@ CREATE POLICY "Authenticated users update customizations"
   WITH CHECK (true);
 
 -- Service role writes (coordinator uses service role key)
+DROP POLICY IF EXISTS "Service role manages instances" ON flockbots_instances;
+CREATE POLICY "Service role manages instances"
+  ON flockbots_instances FOR ALL TO service_role USING (true);
+
 DROP POLICY IF EXISTS "Service role can insert tasks" ON flockbots_tasks;
 CREATE POLICY "Service role can insert tasks"
   ON flockbots_tasks FOR INSERT TO service_role WITH CHECK (true);
@@ -273,10 +328,13 @@ CREATE POLICY "Authenticated users can insert dashboard actions"
   WITH CHECK (source = 'dashboard');
 
 -- -----------------------------------------------------------------------------
--- 4. Realtime publications (dashboard subscribes via Supabase realtime)
+-- 5. Realtime publications (dashboard subscribes via Supabase realtime)
 -- -----------------------------------------------------------------------------
 DO $$
 BEGIN
+  PERFORM 1 FROM pg_publication_tables WHERE pubname = 'supabase_realtime' AND tablename = 'flockbots_instances';
+  IF NOT FOUND THEN ALTER PUBLICATION supabase_realtime ADD TABLE flockbots_instances; END IF;
+
   PERFORM 1 FROM pg_publication_tables WHERE pubname = 'supabase_realtime' AND tablename = 'flockbots_tasks';
   IF NOT FOUND THEN ALTER PUBLICATION supabase_realtime ADD TABLE flockbots_tasks; END IF;
 
@@ -303,7 +361,7 @@ BEGIN
 END $$;
 
 -- -----------------------------------------------------------------------------
--- 5. Storage bucket for QA screenshots + videos
+-- 6. Storage bucket for QA screenshots + videos
 -- -----------------------------------------------------------------------------
 -- Private bucket. The coordinator (service role) uploads screenshots + short
 -- video clips from the QA agent and generates time-limited signed URLs to
@@ -320,7 +378,7 @@ CREATE POLICY "Service role manages qa-media"
   WITH CHECK (bucket_id = 'qa-media');
 
 -- -----------------------------------------------------------------------------
--- 6. Record this migration
+-- 7. Record this migration
 -- -----------------------------------------------------------------------------
-INSERT INTO flockbots_migrations (version) VALUES ('1.0.3')
+INSERT INTO flockbots_migrations (version) VALUES ('1.1.0')
   ON CONFLICT (version) DO NOTHING;

@@ -1,34 +1,34 @@
 import { execSync } from 'child_process';
-import { existsSync } from 'fs';
 import { join } from 'path';
-import { homedir } from 'os';
-import { parseEnvFile } from './env-parser';
+import { flockbotsRoot, listInstanceSlugs } from '../paths';
+import { extractInstanceFlag, loadEnvFile } from './env';
 import { updateState } from './state-file';
 import { help } from './brand';
 
 type ClackModule = typeof import('@clack/prompts');
 
 /**
- * `flockbots webhook deploy` — extracted out of `flockbots init` in v1.0.3.
- *
- * Required only when CHAT_PROVIDER=whatsapp. Reads SUPABASE_URL,
- * SUPABASE_SERVICE_ROLE_KEY, and WHATSAPP_VERIFY_TOKEN from .env, opens the
- * Vercel import for the webhook-relay project, prompts the user to paste
- * the resulting deploy URL back so we can build the Meta webhook callback,
- * and stashes the URL in state.json.
+ * `flockbots webhook deploy` — required only when CHAT_PROVIDER=whatsapp.
+ * Reads SUPABASE_URL,
+ * SUPABASE_SERVICE_ROLE_KEY, and WHATSAPP_VERIFY_TOKEN from a configured
+ * instance's .env, opens the Vercel import for the webhook-relay project,
+ * prompts the user to paste the resulting deploy URL back so we can build
+ * the Meta webhook callback, and stashes the URL in state.json
+ * (root-level — the relay is shared across instances; routing by instance
+ * is handled via per-instance webhook URL paths).
  */
-export async function runWebhookDeploy(): Promise<void> {
-  const home = process.env.FLOCKBOTS_HOME || join(homedir(), '.flockbots');
-  const envPath = join(home, '.env');
-  if (!existsSync(envPath)) {
-    console.error(`No FlockBots config at ${envPath}. Run \`flockbots init\` first.`);
+export async function runWebhookDeploy(args: string[] = []): Promise<void> {
+  const { instanceId } = extractInstanceFlag(args);
+  const root = flockbotsRoot();
+  if (listInstanceSlugs().length === 0) {
+    console.error(`No FlockBots instances at ${join(root, 'instances')}. Run \`flockbots init\` first.`);
     process.exit(1);
   }
 
-  const env = parseEnvFile(envPath);
-  const supabaseUrl = env.SUPABASE_URL;
-  const verifyToken = env.WHATSAPP_VERIFY_TOKEN;
-  const provider = env.CHAT_PROVIDER;
+  loadEnvFile(instanceId);
+  const supabaseUrl = process.env.SUPABASE_URL;
+  const verifyToken = process.env.WHATSAPP_VERIFY_TOKEN;
+  const provider = process.env.CHAT_PROVIDER;
 
   if (provider !== 'whatsapp') {
     console.error(`This command is only relevant when CHAT_PROVIDER=whatsapp (current: ${provider || 'not set'}).`);
@@ -73,6 +73,12 @@ export async function runWebhookDeploy(): Promise<void> {
     `  WHATSAPP_VERIFY_TOKEN     = ${verifyToken}`,
   ].join('\n');
 
+  // Per-instance: each FlockBots instance has its own Meta webhook URL on
+  // the same relay so the right coordinator picks up its inbound messages.
+  // The slug is the segment after /api/webhook/.
+  const instanceSlug = process.env.FLOCKBOTS_INSTANCE_ID;
+  const slugSuffix = instanceSlug ? `/${instanceSlug}` : '';
+
   if (mode === 'later') {
     p.note(
       help([
@@ -83,9 +89,14 @@ export async function runWebhookDeploy(): Promise<void> {
         envLines,
         `  3. Click Deploy. Wait ~60 seconds.`,
         `  4. Copy the URL Vercel gives you (like https://...vercel.app).`,
-        `  5. Your Meta webhook URL is: <that URL>/api/webhook`,
+        `  5. Your Meta webhook URL for instance '${instanceSlug || '<slug>'}' is:`,
+        `       <that URL>/api/webhook${slugSuffix}`,
         `  6. Verify token for Meta: ${verifyToken}`,
         `  7. Full walkthrough: docs/setup/whatsapp.md`,
+        '',
+        '(Each instance has its own /api/webhook/<slug> path on the same relay —',
+        ' run `flockbots webhook deploy` once per WhatsApp instance to register',
+        ' the URL with Meta.)',
       ].join('\n')),
       'Webhook-relay — steps for later'
     );
@@ -119,7 +130,7 @@ export async function runWebhookDeploy(): Promise<void> {
   }
 
   const baseUrl = (deployedUrl as string).trim().replace(/\/$/, '');
-  const webhookUrl = baseUrl + '/api/webhook';
+  const webhookUrl = baseUrl + '/api/webhook' + slugSuffix;
 
   // Copy verify token so Meta paste is one Cmd-V.
   if (process.platform === 'darwin') {
@@ -147,8 +158,8 @@ export async function runWebhookDeploy(): Promise<void> {
   openBrowser('https://developers.facebook.com/apps/');
 
   try {
-    updateState(home, { webhookRelayUrl: baseUrl });
-    p.log.success(`Saved → ${join(home, 'state.json')}`);
+    updateState(root, { webhookRelayUrl: baseUrl });
+    p.log.success(`Saved → ${join(root, 'state.json')}`);
   } catch (err: any) {
     p.log.warn(`Could not write state.json: ${err.message}`);
   }

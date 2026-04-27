@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from 'react';
 import { supabase } from '../supabase';
+import { useInstance } from '../contexts/InstanceContext';
 
 interface StreamChunk {
   id: number;
@@ -15,6 +16,7 @@ const HISTORY_LIMIT = 200;
 const HISTORY_WINDOW_MS = 30 * 60 * 1000;
 
 export function useAgentStream(taskId: string, agentId: string) {
+  const { selectedInstance } = useInstance();
   const [chunks, setChunks] = useState<StreamChunk[]>([]);
   const [loaded, setLoaded] = useState(false);
   const [connected, setConnected] = useState(false);
@@ -23,6 +25,10 @@ export function useAgentStream(taskId: string, agentId: string) {
   useEffect(() => {
     setLoaded(false);
     setChunks([]);
+    if (!selectedInstance) {
+      setLoaded(true);
+      return;
+    }
     const since = new Date(Date.now() - HISTORY_WINDOW_MS).toISOString();
 
     // Fetch the most recent chunks DESC (cheap with an index), reverse to
@@ -31,6 +37,7 @@ export function useAgentStream(taskId: string, agentId: string) {
     // during agent thinking/tool phases.
     supabase.from('flockbots_stream_log')
       .select('id, chunk, created_at')
+      .eq('instance_id', selectedInstance)
       .eq('task_id', taskId)
       .eq('agent', agentId)
       .gte('created_at', since)
@@ -48,15 +55,17 @@ export function useAgentStream(taskId: string, agentId: string) {
         setLoaded(true);
       });
 
+    // Realtime filter accepts a single condition only — filter by task_id
+    // (already narrow), then check instance_id + agent_id client-side.
     const channel = supabase
-      .channel(`stream-${taskId}-${agentId}-${Math.random().toString(36).slice(2)}`)
+      .channel(`stream-${selectedInstance}-${taskId}-${agentId}-${Math.random().toString(36).slice(2)}`)
       .on('postgres_changes', {
         event: 'INSERT',
         schema: 'public',
         table: 'flockbots_stream_log',
         filter: `task_id=eq.${taskId}`,
       }, (payload: any) => {
-        if (payload.new.agent === agentId) {
+        if (payload.new.agent === agentId && payload.new.instance_id === selectedInstance) {
           setChunks(prev => {
             // Guard against dupes if realtime echoes a row we also fetched
             if (prev.some(c => c.id === payload.new.id)) return prev;
@@ -67,7 +76,7 @@ export function useAgentStream(taskId: string, agentId: string) {
       .subscribe();
 
     return () => { supabase.removeChannel(channel); };
-  }, [taskId, agentId]);
+  }, [taskId, agentId, selectedInstance]);
 
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: 'smooth' });

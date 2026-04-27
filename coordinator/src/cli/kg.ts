@@ -1,8 +1,8 @@
 import { spawn } from 'child_process';
 import { existsSync, statSync } from 'fs';
 import { join } from 'path';
-import { flockbotsHome } from '../paths';
-import { loadEnvFile } from './env';
+import { flockbotsRoot, flockbotsInstanceHome, skillsDir } from '../paths';
+import { extractInstanceFlag, loadEnvFile } from './env';
 import { updateState } from './state-file';
 
 export interface KgBuildOptions {
@@ -14,11 +14,17 @@ export interface KgBuildOptions {
  * progress through a clack spinner. Returns true on exit code 0, false
  * otherwise. The spinner's rotating message shows the last stdout line so a
  * 10-30 minute build isn't a silent wait.
+ *
+ * Per-instance: the build script lives at the shared root, but runs with
+ * cwd = the current instance's home so it produces a graph specific to
+ * that instance's TARGET_REPO_PATH. Graph and state are written into the
+ * instance dir.
  */
 export async function runKgBuild(opts: KgBuildOptions = {}): Promise<boolean> {
   const p = await import('@clack/prompts');
-  const home = flockbotsHome();
-  const script = join(home, 'scripts', 'build-knowledge-graph.sh');
+  const root = flockbotsRoot();
+  const instanceHome = flockbotsInstanceHome();
+  const script = join(root, 'scripts', 'build-knowledge-graph.sh');
 
   if (!existsSync(script)) {
     p.log.error(`Build script not found at ${script}`);
@@ -32,7 +38,7 @@ export async function runKgBuild(opts: KgBuildOptions = {}): Promise<boolean> {
 
   return new Promise<boolean>((resolve) => {
     const proc = spawn('bash', [script, ...args], {
-      cwd: home,
+      cwd: instanceHome,
       env: process.env,
       // Close stdin so the child `claude -p ...` doesn't sit in its
       // 3-second stdin-wait ("Warning: no stdin data received in 3s…").
@@ -55,7 +61,7 @@ export async function runKgBuild(opts: KgBuildOptions = {}): Promise<boolean> {
     proc.on('exit', (code) => {
       if (code === 0) {
         spin.stop('Knowledge graph built');
-        try { updateState(home, { knowledgeGraphBuiltAt: new Date().toISOString() }); } catch { /* best effort */ }
+        try { updateState(instanceHome, { knowledgeGraphBuiltAt: new Date().toISOString() }); } catch { /* best effort */ }
         resolve(true);
       } else {
         spin.stop(`Build exited with code ${code}`);
@@ -70,17 +76,18 @@ export async function runKgBuild(opts: KgBuildOptions = {}): Promise<boolean> {
   });
 }
 
-/** `flockbots kg build [--incremental]` entry point. */
+/** `flockbots kg build [--incremental] [-i <slug>]` entry point. */
 export async function runKgCommand(args: string[]): Promise<void> {
-  const sub = args[0];
+  const { instanceId, rest } = extractInstanceFlag(args);
+  const sub = rest[0];
   if (sub !== 'build') {
-    console.error('Usage: flockbots kg build [--incremental]');
+    console.error('Usage: flockbots kg build [--incremental] [-i <slug>]');
     process.exit(1);
   }
-  loadEnvFile();
+  loadEnvFile(instanceId);
   const p = await import('@clack/prompts');
   p.intro('Knowledge graph');
-  const incremental = args.includes('--incremental');
+  const incremental = rest.includes('--incremental');
   const ok = await runKgBuild({ incremental });
   if (!ok) {
     p.outro('Graph build failed — see output above.');
@@ -97,7 +104,7 @@ export interface KgState {
 }
 
 export function kgState(): KgState {
-  const graphPath = join(flockbotsHome(), 'skills', 'kg', 'graph.json');
+  const graphPath = join(skillsDir(), 'kg', 'graph.json');
   const graphExists = existsSync(graphPath);
   let graphAgeDays: number | null = null;
   if (graphExists) {

@@ -1,5 +1,6 @@
 import { useEffect, useState } from 'react';
 import { supabase } from '../supabase';
+import { useInstance } from '../contexts/InstanceContext';
 
 /**
  * A sub-agent clone that's currently "alive" — spawned by a parent agent via
@@ -24,9 +25,17 @@ export interface ActiveSubAgent {
  * historical spawns as "live" after page refresh.
  */
 export function useSubAgents(): ActiveSubAgent[] {
+  const { selectedInstance } = useInstance();
   const [active, setActive] = useState<Map<string, ActiveSubAgent>>(new Map());
 
   useEffect(() => {
+    if (!selectedInstance) {
+      setActive(new Map());
+      return;
+    }
+    // Reset when switching instances — spawns from a different instance
+    // don't belong on the current office floor.
+    setActive(new Map());
     const mountedAt = Date.now();
 
     const apply = (row: any) => {
@@ -56,18 +65,19 @@ export function useSubAgents(): ActiveSubAgent[] {
     // Unique channel name per hook instance — Supabase rejects re-subscribing
     // to the same channel name, which breaks when multiple components mount
     // the hook or when React StrictMode double-invokes effects.
-    const channelName = `agent-sub-agents-${Math.random().toString(36).slice(2)}`;
+    const channelName = `agent-sub-agents-${selectedInstance}-${Math.random().toString(36).slice(2)}`;
     const channel = supabase
       .channel(channelName)
       .on('postgres_changes', {
         event: 'INSERT',
         schema: 'public',
         table: 'flockbots_sub_agents',
+        filter: `instance_id=eq.${selectedInstance}`,
       }, (payload: any) => apply(payload.new))
       .subscribe();
 
     return () => { supabase.removeChannel(channel); };
-  }, []);
+  }, [selectedInstance]);
 
   return Array.from(active.values());
 }

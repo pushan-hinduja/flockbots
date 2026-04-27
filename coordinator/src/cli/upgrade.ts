@@ -1,21 +1,22 @@
 import { execSync } from 'child_process';
 import { existsSync } from 'fs';
 import { join } from 'path';
-import { homedir } from 'os';
+import { flockbotsRoot, instancesDir, listInstanceSlugs } from '../paths';
 import { ensureSkillsFromTemplate } from './skills-sync';
 
 /**
  * `flockbots upgrade` — pulls latest from origin, rebuilds the coordinator,
- * and restarts via pm2 if it's running. Refuses to run with a dirty working
- * tree so user-tracked files don't get wiped by the git reset. User-editable
- * content (skills/) lives in a gitignored active directory that's populated
- * from skills-template/ after each upgrade; edits there don't block pulls.
+ * and restarts via pm2 if any instances are running. Refuses to run with a
+ * dirty working tree so user-tracked files don't get wiped by the git
+ * reset. User-editable content (skills/) lives in a gitignored active
+ * directory that's populated from skills-template/ after each upgrade;
+ * edits there don't block pulls.
  */
 export async function runUpgrade(): Promise<void> {
   const p = await import('@clack/prompts');
   p.intro('FlockBots upgrade');
 
-  const home = process.env.FLOCKBOTS_HOME || join(homedir(), '.flockbots');
+  const home = flockbotsRoot();
   if (!existsSync(join(home, '.git'))) {
     p.cancel(`${home} is not a git checkout — can't self-upgrade. Reinstall with install.sh.`);
     return;
@@ -93,23 +94,37 @@ export async function runUpgrade(): Promise<void> {
   }
   spin.stop('Built');
 
-  // Propagate new skill templates (if any shipped this release) into the
-  // user's active skills/ dir. Existing user-edited files are skipped.
-  try {
-    const { copied } = ensureSkillsFromTemplate(home);
-    if (copied.length > 0) {
-      p.log.info(`Added ${copied.length} new skill file${copied.length === 1 ? '' : 's'} from skills-template/:`);
-      for (const f of copied.slice(0, 10)) p.log.message(`  + skills/${f}`);
-      if (copied.length > 10) p.log.message(`  (+ ${copied.length - 10} more)`);
+  // Propagate new skill templates (if any shipped this release) into each
+  // instance's active skills/ dir. Existing user-edited files are skipped.
+  // Skills are per-instance because some skills (kg) are target-repo-
+  // specific — the shared skills-template/ at root seeds each instance.
+  const slugs = listInstanceSlugs();
+  if (slugs.length === 0) {
+    p.log.info('No instances configured yet — run `flockbots init` to create one.');
+  } else {
+    let totalCopied = 0;
+    for (const slug of slugs) {
+      try {
+        const instanceHome = join(instancesDir(), slug);
+        const { copied } = ensureSkillsFromTemplate(instanceHome, home);
+        if (copied.length > 0) {
+          p.log.info(`[${slug}] added ${copied.length} new skill file${copied.length === 1 ? '' : 's'}:`);
+          for (const f of copied.slice(0, 10)) p.log.message(`  + skills/${f}`);
+          if (copied.length > 10) p.log.message(`  (+ ${copied.length - 10} more)`);
+          totalCopied += copied.length;
+        }
+      } catch (err: any) {
+        p.log.warn(`[${slug}] skills sync skipped: ${err?.message || String(err)}`);
+      }
     }
-  } catch (err: any) {
-    p.log.warn(`Skills sync skipped: ${err?.message || String(err)}`);
+    if (totalCopied === 0) p.log.info('Skills already up to date.');
   }
 
-  // Try pm2 restart — silent failure if pm2 isn't running the process
+  // Try pm2 restart — matches every flockbots:<slug> app via regex. Silent
+  // failure if pm2 isn't running anything.
   try {
-    execSync('pm2 restart flockbots', { stdio: 'ignore' });
-    p.log.success('pm2 restart flockbots — coordinator restarted');
+    execSync('pm2 restart /^flockbots:/', { stdio: 'ignore' });
+    p.log.success('pm2 restart /^flockbots:/ — coordinator(s) restarted');
   } catch {
     p.log.info('pm2 restart skipped (not running). Restart FlockBots manually.');
   }

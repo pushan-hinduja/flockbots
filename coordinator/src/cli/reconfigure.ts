@@ -26,6 +26,19 @@ export const ALL_SECTIONS = [
 export type ReconfigureSection = typeof ALL_SECTIONS[number];
 
 /**
+ * Sections whose values are shared across all instances. Editing one of
+ * these in any instance's reconfigure flow propagates the new values into
+ * every other instance's .env. Per-instance flows still display them so
+ * users can edit from anywhere; the wizard prompts a multi-instance
+ * confirmation before saving.
+ */
+const SHARED_SECTIONS = new Set<ReconfigureSection>(['supabase', 'dashboard-admin']);
+
+export function isSharedSection(s: ReconfigureSection): boolean {
+  return SHARED_SECTIONS.has(s);
+}
+
+/**
  * Snapshot of what's already installed — .env values, whether .pem files
  * still exist on disk, whether the knowledge graph has been built. Built
  * once at the top of the wizard and passed around so we never re-stat the
@@ -122,6 +135,7 @@ export function hydrateConfig(env: Record<string, string>): Partial<WizardConfig
 
   if (val(env.LINEAR_API_KEY)) c.linearApiKey = env.LINEAR_API_KEY;
   if (val(env.LINEAR_TEAM_ID)) c.linearTeamId = env.LINEAR_TEAM_ID;
+  if (val(env.LINEAR_PROJECT_ID)) c.linearProjectId = env.LINEAR_PROJECT_ID;
 
   if (val(env.SUPABASE_URL)) c.supabaseUrl = env.SUPABASE_URL;
   if (val(env.SUPABASE_SERVICE_ROLE_KEY)) c.supabaseServiceRoleKey = env.SUPABASE_SERVICE_ROLE_KEY;
@@ -158,6 +172,7 @@ export async function pickSectionsToReconfigure(
   const options = ALL_SECTIONS.map(s => ({
     value: s,
     label: sectionLabel(s, snap),
+    hint: isSharedSection(s) ? 'shared — affects all instances' : undefined,
   }));
 
   const picked = await p.multiselect({

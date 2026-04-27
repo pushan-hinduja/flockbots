@@ -32,8 +32,11 @@ const STAGE_LABELS: Record<string, string> = {
 // All stages a task can be reverted/retried to
 const REVERT_TARGETS = ['inbox', 'researching', 'design_pending', 'dev_ready'];
 
-async function sendAction(taskId: string, action: string, extra?: Record<string, string>) {
+async function sendAction(instanceId: string, taskId: string, action: string, extra?: Record<string, string>) {
+  // webhook_inbox has instance_id NOT NULL — the relevant coordinator polls
+  // by its own instance_id, so the action only fires on the right one.
   await supabase.from('webhook_inbox').insert({
+    instance_id: instanceId,
     source: 'dashboard',
     sender: null,
     payload: { action, task_id: taskId, ...extra },
@@ -82,7 +85,7 @@ function RetryMenu({ task, onClose }: { task: any; onClose: () => void }) {
             <button
               key={stage}
               onClick={() => {
-                sendAction(task.id, 'revert_stage', { target_status: stage });
+                sendAction(task.instance_id, task.id, 'revert_stage', { target_status: stage });
                 onClose();
               }}
               className={`w-full text-left px-2 py-1.5 text-xs hover:bg-secondary transition-colors flex items-center justify-between ${
@@ -162,7 +165,7 @@ function FailedCard({ task }: { task: any }) {
         </svg>
       </button>
       <button
-        onClick={() => sendAction(task.id, 'dismiss')}
+        onClick={() => sendAction(task.instance_id, task.id, 'dismiss')}
         className="p-1 rounded hover:bg-secondary text-muted-foreground hover:text-destructive transition-colors flex-shrink-0"
         title="Dismiss"
       >

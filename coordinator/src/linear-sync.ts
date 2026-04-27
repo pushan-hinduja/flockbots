@@ -19,6 +19,7 @@ export function initLinear(): void {
 }
 
 const LINEAR_TEAM_ID = process.env.LINEAR_TEAM_ID || '';
+const LINEAR_PROJECT_ID = process.env.LINEAR_PROJECT_ID || '';
 const AGENT_READY_LABEL = process.env.LINEAR_AGENT_READY_LABEL || 'agent-ready';
 
 export async function pollLinearIssues(): Promise<void> {
@@ -26,8 +27,16 @@ export async function pollLinearIssues(): Promise<void> {
 
   try {
     const team = await linearClient.team(LINEAR_TEAM_ID);
+    // Multi-instance: every instance under the same team uses a distinct
+    // project so issues don't leak across coordinator queues. If
+    // LINEAR_PROJECT_ID is unset (legacy / single-instance pre-1.1), the
+    // poll falls back to whole-team queries — same behavior as before.
+    const projectFilter = LINEAR_PROJECT_ID
+      ? { project: { id: { eq: LINEAR_PROJECT_ID } } }
+      : {};
     const issues = await team.issues({
       filter: {
+        ...projectFilter,
         labels: { name: { eq: AGENT_READY_LABEL } },
         state: { type: { nin: ['completed', 'canceled'] } },
       },
@@ -103,6 +112,7 @@ export async function createLinearIssue(
   try {
     const issue = await linearClient.createIssue({
       teamId: LINEAR_TEAM_ID,
+      projectId: LINEAR_PROJECT_ID || undefined,
       title,
       description,
       priority,

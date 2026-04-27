@@ -2,6 +2,7 @@ import { useEffect, useState } from 'react';
 import { supabase } from './supabase';
 import { Login } from './components/Login';
 import { MissionConsole } from './components/MissionConsole';
+import { InstanceProvider } from './contexts/InstanceContext';
 
 export default function App() {
   const [session, setSession] = useState<any>(null);
@@ -27,5 +28,9 @@ export default function App() {
   }
 
   if (!session) return <Login />;
-  return <MissionConsole />;
+  return (
+    <InstanceProvider>
+      <MissionConsole />
+    </InstanceProvider>
+  );
 }

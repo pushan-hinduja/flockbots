@@ -33,7 +33,7 @@ FlockBots runs on a user's machine and:
 - Makes authenticated HTTPS requests to GitHub (two GitHub Apps), Anthropic, Linear (optional), Supabase (optional), Telegram / Meta WhatsApp (one of the two)
 - Exposes a local HTTP server on port 3001 *only* when CHAT_PROVIDER=whatsapp and Supabase is disabled
 
-The GitHub Apps are scoped to the repos the user explicitly installs them on. Credentials live in `~/.flockbots/.env` (mode 0600) and `~/.flockbots/keys/*.pem` (mode 0600). The coordinator does not send your code to any third party — the Claude CLI does that, and only within the specific agent sessions the coordinator spawns.
+The GitHub Apps are scoped to the repos the user explicitly installs them on. Each flock keeps its own credentials at `~/.flockbots/instances/<slug>/.env` (mode 0600) and `~/.flockbots/instances/<slug>/keys/*.pem` (mode 0600); shared values (Supabase project, dashboard login) are duplicated across flock `.env` files but kept inside each flock's own 0600 directory. The coordinator does not send your code to any third party — the Claude CLI does that, and only within the specific agent sessions the coordinator spawns.
 
 ## Secrets hygiene
 

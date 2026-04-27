@@ -1,8 +1,7 @@
 import { execSync, spawnSync } from 'child_process';
-import { existsSync, rmSync } from 'fs';
+import { existsSync, readFileSync, rmSync } from 'fs';
 import { join } from 'path';
-import { homedir } from 'os';
-import { loadEnvFile } from './env';
+import { flockbotsRoot, instancesDir, listInstanceSlugs } from '../paths';
 
 const BIN_SYMLINK = '/usr/local/bin/flockbots';
 
@@ -16,11 +15,44 @@ function safeExec(cmd: string): boolean {
 }
 
 /**
+ * Read TARGET_REPO_PATH from every instance's .env so uninstall can clean
+ * .worktrees in each one. Inline to avoid loadEnvFile() (which expects to
+ * pick a single instance and would clobber process.env unhelpfully here).
+ */
+function collectTargetRepos(): string[] {
+  const repos = new Set<string>();
+  for (const slug of listInstanceSlugs()) {
+    const envPath = join(instancesDir(), slug, '.env');
+    if (!existsSync(envPath)) continue;
+    try {
+      const content = readFileSync(envPath, 'utf-8');
+      for (const rawLine of content.split('\n')) {
+        const line = rawLine.replace(/\r$/, '').trim();
+        const m = line.match(/^TARGET_REPO_PATH\s*=\s*(.+)$/);
+        if (m) {
+          let val = m[1].trim();
+          if (
+            (val.startsWith('"') && val.endsWith('"')) ||
+            (val.startsWith("'") && val.endsWith("'"))
+          ) {
+            val = val.slice(1, -1);
+          }
+          if (val) repos.add(val);
+        }
+      }
+    } catch {
+      // Skip unreadable .env files — we're tearing everything down anyway.
+    }
+  }
+  return Array.from(repos);
+}
+
+/**
  * `flockbots uninstall` — removes every local artifact FlockBots installed
- * (pm2 process, /usr/local/bin symlink, ~/.flockbots dir with its state,
- * target-repo worktrees) and prints a checklist of external services the
- * user has to revoke manually (GitHub Apps, chat bots, Supabase project,
- * Linear key). Requires explicit confirmation.
+ * (pm2 processes, /usr/local/bin symlink, ~/.flockbots dir with its state,
+ * each instance's target-repo worktrees) and prints a checklist of external
+ * services the user has to revoke manually (GitHub Apps, chat bots,
+ * Supabase project, Linear key). Requires explicit confirmation.
  *
  * Self-delete note: we remove ~/.flockbots/ while running from inside it.
  * On Unix, rmSync() unlinks the directory entries but Node's existing
@@ -29,19 +61,21 @@ function safeExec(cmd: string): boolean {
  */
 export async function runUninstall(): Promise<void> {
   const p = await import('@clack/prompts');
-  loadEnvFile();
 
-  const home = process.env.FLOCKBOTS_HOME || join(homedir(), '.flockbots');
-  const targetRepo = process.env.TARGET_REPO_PATH || '';
-  const worktreesDir = targetRepo ? join(targetRepo, '.worktrees') : '';
+  const home = flockbotsRoot();
+  const slugs = listInstanceSlugs();
+  const targetRepos = collectTargetRepos();
+  const worktreeDirs = targetRepos
+    .map((repo) => join(repo, '.worktrees'))
+    .filter((dir) => existsSync(dir));
 
   p.intro('FlockBots uninstall');
 
   const plan: string[] = ['This will remove from your machine:', ''];
-  plan.push('  • pm2 process "flockbots" (if running)');
+  plan.push(`  • pm2 processes flockbots:* (${slugs.length} instance${slugs.length === 1 ? '' : 's'})`);
   if (existsSync(BIN_SYMLINK)) plan.push(`  • ${BIN_SYMLINK}  (may prompt sudo)`);
   if (existsSync(home)) plan.push(`  • ${home}  (code + config + keys + state)`);
-  if (worktreesDir && existsSync(worktreesDir)) plan.push(`  • ${worktreesDir}  (agent worktrees)`);
+  for (const dir of worktreeDirs) plan.push(`  • ${dir}  (agent worktrees)`);
   plan.push('');
   plan.push('External services (GitHub Apps, chat bot, Supabase, Linear)');
   plan.push('are NOT affected — revoke them yourself after.');
@@ -53,9 +87,10 @@ export async function runUninstall(): Promise<void> {
     return;
   }
 
-  // 1. Stop pm2 process (silent failure if pm2 is absent / nothing running)
-  if (safeExec('pm2 stop flockbots')) p.log.success('stopped pm2 process');
-  safeExec('pm2 delete flockbots');
+  // 1. Stop pm2 processes — matches every flockbots:<slug> app via regex.
+  // Silent failure if pm2 is absent / nothing running.
+  if (safeExec('pm2 stop /^flockbots:/')) p.log.success('stopped pm2 processes');
+  safeExec('pm2 delete /^flockbots:/');
   safeExec('pm2 save');
 
   // 2. Remove the CLI symlink
@@ -73,13 +108,13 @@ export async function runUninstall(): Promise<void> {
     }
   }
 
-  // 3. Clean target-repo .worktrees
-  if (worktreesDir && existsSync(worktreesDir)) {
+  // 3. Clean .worktrees in every instance's target repo
+  for (const dir of worktreeDirs) {
     try {
-      rmSync(worktreesDir, { recursive: true, force: true });
-      p.log.success(`cleaned ${worktreesDir}`);
+      rmSync(dir, { recursive: true, force: true });
+      p.log.success(`cleaned ${dir}`);
     } catch (err: any) {
-      p.log.warn(`could not remove ${worktreesDir}: ${err.message}`);
+      p.log.warn(`could not remove ${dir}: ${err.message}`);
     }
   }
 

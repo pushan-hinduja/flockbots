@@ -115,11 +115,15 @@ export async function pollDashboardActions(): Promise<void> {
   const supabase = getSupabaseClient();
   if (!supabase) return;
 
+  const instanceId = process.env.FLOCKBOTS_INSTANCE_ID;
+  if (!instanceId) return;
+
   const { data: actions, error } = await supabase
     .from('webhook_inbox')
     .select('*')
     .eq('processed', false)
     .eq('source', 'dashboard')
+    .eq('instance_id', instanceId)
     .order('created_at', { ascending: true })
     .limit(10);
 

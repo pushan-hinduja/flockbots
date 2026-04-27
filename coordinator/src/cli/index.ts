@@ -3,7 +3,9 @@ import { runDoctor } from './doctor';
 import { runUpgrade } from './upgrade';
 import { runTaskAdd } from './task';
 import { runKgCommand } from './kg';
+import { runInstancesCommand } from './instances';
 import { runUninstall } from './uninstall';
+import { runRemove } from './remove';
 import { runDashboardDeploy } from './dashboard-deploy';
 import { runWebhookDeploy } from './webhook-deploy';
 import { getVersion } from './version';
@@ -18,7 +20,10 @@ async function main(): Promise<void> {
       await runWizard();
       break;
     case 'doctor':
-      await runDoctor();
+      await runDoctor(args.slice(1));
+      break;
+    case 'instances':
+      await runInstancesCommand(args.slice(1));
       break;
     case 'upgrade':
       await runUpgrade();
@@ -34,6 +39,9 @@ async function main(): Promise<void> {
       break;
     case 'webhook':
       await runWebhookCommand(args.slice(1));
+      break;
+    case 'remove':
+      await runRemove(args.slice(1));
       break;
     case 'uninstall':
       await runUninstall();
@@ -72,10 +80,10 @@ async function runDashboardCommand(args: string[]): Promise<void> {
   const sub = args[0];
   switch (sub) {
     case 'deploy':
-      await runDashboardDeploy();
+      await runDashboardDeploy(args.slice(1));
       break;
     default:
-      console.error(`Unknown dashboard subcommand: ${sub || '(none)'}\n\nUsage:\n  flockbots dashboard deploy`);
+      console.error(`Unknown dashboard subcommand: ${sub || '(none)'}\n\nUsage:\n  flockbots dashboard deploy [-i <slug>]`);
       process.exit(1);
   }
 }
@@ -84,10 +92,10 @@ async function runWebhookCommand(args: string[]): Promise<void> {
   const sub = args[0];
   switch (sub) {
     case 'deploy':
-      await runWebhookDeploy();
+      await runWebhookDeploy(args.slice(1));
       break;
     default:
-      console.error(`Unknown webhook subcommand: ${sub || '(none)'}\n\nUsage:\n  flockbots webhook deploy`);
+      console.error(`Unknown webhook subcommand: ${sub || '(none)'}\n\nUsage:\n  flockbots webhook deploy [-i <slug>]`);
       process.exit(1);
   }
 }
@@ -105,15 +113,21 @@ Usage: flockbots <command>
 Commands:
   init                        Run the interactive setup wizard (or
                               reconfigure individual sections on re-run)
-  doctor                      Check prerequisites + configuration
+  doctor [-i <slug>]          Check prerequisites + per-instance config
+  instances                   List configured instances + pm2 status
   upgrade                     Pull latest, rebuild, restart via pm2
   task add "<description>"    Queue a task from the CLI
   kg build [--incremental]    Build the graphify knowledge graph
   dashboard deploy            Deploy the web dashboard to Vercel
   webhook deploy              Deploy the WhatsApp webhook-relay to Vercel
+  remove                      Remove a single instance (pm2 + dir + Supabase)
   uninstall                   Remove FlockBots from this machine
   version                     Print the version
   help                        Show this message
+
+Most per-instance commands accept -i <slug> when you have more than one
+instance configured (task add, kg build, dashboard deploy, webhook deploy,
+remove). With a single instance, the slug is auto-picked.
 
 Run the coordinator with pm2 — the wizard prints the exact command
 after init finishes.

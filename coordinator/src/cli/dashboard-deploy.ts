@@ -1,33 +1,32 @@
 import { execSync } from 'child_process';
-import { existsSync } from 'fs';
 import { join } from 'path';
-import { homedir } from 'os';
-import { parseEnvFile } from './env-parser';
+import { flockbotsRoot, listInstanceSlugs } from '../paths';
+import { extractInstanceFlag, loadEnvFile } from './env';
 import { updateState } from './state-file';
 import { help } from './brand';
 
 type ClackModule = typeof import('@clack/prompts');
 
 /**
- * `flockbots dashboard deploy` — extracted out of `flockbots init` in v1.0.3.
- *
- * Reads SUPABASE_URL + SUPABASE_ANON_KEY from ~/.flockbots/.env, opens the
- * Vercel one-click import page with the right repo + env-var prompts pre-
- * filled, copies the anon key to the macOS clipboard, then asks the user
- * to paste the resulting deploy URL back so we can stash it in state.json
- * for next time.
+ * `flockbots dashboard deploy` — reads SUPABASE_URL + SUPABASE_ANON_KEY from
+ * a configured instance's .env
+ * (these values are shared across instances by design), opens the Vercel
+ * one-click import page with the right repo + env-var prompts pre-filled,
+ * copies the anon key to the macOS clipboard, then asks the user to paste
+ * the resulting deploy URL back so we can stash it in state.json
+ * (root-level, since the dashboard is shared across instances).
  */
-export async function runDashboardDeploy(): Promise<void> {
-  const home = process.env.FLOCKBOTS_HOME || join(homedir(), '.flockbots');
-  const envPath = join(home, '.env');
-  if (!existsSync(envPath)) {
-    console.error(`No FlockBots config at ${envPath}. Run \`flockbots init\` first.`);
+export async function runDashboardDeploy(args: string[] = []): Promise<void> {
+  const { instanceId } = extractInstanceFlag(args);
+  const root = flockbotsRoot();
+  if (listInstanceSlugs().length === 0) {
+    console.error(`No FlockBots instances at ${join(root, 'instances')}. Run \`flockbots init\` first.`);
     process.exit(1);
   }
 
-  const env = parseEnvFile(envPath);
-  const supabaseUrl = env.SUPABASE_URL;
-  const anonKey = env.SUPABASE_ANON_KEY;
+  loadEnvFile(instanceId);
+  const supabaseUrl = process.env.SUPABASE_URL;
+  const anonKey = process.env.SUPABASE_ANON_KEY;
 
   if (!supabaseUrl || !anonKey) {
     console.error('The dashboard requires a Supabase project. Re-run `flockbots init`,');
@@ -132,8 +131,8 @@ export async function runDashboardDeploy(): Promise<void> {
   const url = (deployedUrl as string).trim();
   if (url) {
     try {
-      updateState(home, { dashboardDeployUrl: url.replace(/\/$/, '') });
-      p.log.success(`Saved → ${join(home, 'state.json')}`);
+      updateState(root, { dashboardDeployUrl: url.replace(/\/$/, '') });
+      p.log.success(`Saved → ${join(root, 'state.json')}`);
     } catch (err: any) {
       p.log.warn(`Could not write state.json: ${err.message}`);
     }

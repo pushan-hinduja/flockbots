@@ -5,7 +5,7 @@ import { join } from 'path';
 import { homedir } from 'os';
 import { randomBytes } from 'crypto';
 import { createAppAuth } from '@octokit/auth-app';
-import { keysDir } from '../paths';
+import { keysDir, instancesDir, listInstanceSlugs } from '../paths';
 import { renderDuckSvg, help } from './brand';
 
 export interface GitHubAppResult {
@@ -33,6 +33,36 @@ export interface CreateGitHubAppOptions {
    * instead of going straight into the manifest flow.
    */
   existing?: GitHubAppExisting;
+  /**
+   * Sibling instances that already have this role's app configured.
+   * When non-empty AND `existing` is not set (i.e. fresh-install path
+   * for instance N>=2), the wizard offers "Reuse from existing instance"
+   * as the default option — same app, just install it on this repo.
+   */
+  reusableFromSiblings?: SiblingApp[];
+  /**
+   * The new instance's target repo. Required when `reusableFromSiblings`
+   * is non-empty so the wizard can verify the installation has access
+   * (and prompt the user to add the repo if not).
+   */
+  newRepo?: { owner: string; repo: string };
+  /**
+   * The new instance's home dir. Required when `reusableFromSiblings`
+   * is non-empty so the wizard can copy the .pem into <home>/keys/.
+   */
+  newInstanceHome?: string;
+}
+
+/**
+ * Snapshot of a sibling instance's GitHub App credentials, suitable for
+ * "reuse on this repo" flows. Populated by `findReusableApps()` from each
+ * sibling's .env.
+ */
+export interface SiblingApp {
+  slug: string;
+  appId: number;
+  installationId: number;
+  pemPath: string;
 }
 
 export type ClackModule = typeof import('@clack/prompts');
@@ -124,7 +154,32 @@ export async function createGitHubApp(
     return runManifestFlow(p, role, defaultName, label);
   }
 
-  // ---- Fresh path: optional custom name, then manifest flow ----------------
+  // ---- Fresh path: reuse-from-sibling (if available), or new manifest ------
+  const siblings = opts.reusableFromSiblings || [];
+  if (siblings.length > 0 && opts.newRepo && opts.newInstanceHome) {
+    const choice = await p.select({
+      message: `${label} GitHub App:`,
+      options: [
+        { value: 'reuse',       label: `Reuse ${label.toLowerCase()} app from another instance`, hint: 'recommended — install it on this repo too' },
+        { value: 'new-default', label: `Create new app with default name ("${defaultName}")` },
+        { value: 'new-custom',  label: 'Create new app with custom name' },
+      ],
+      initialValue: 'reuse',
+    });
+    if (p.isCancel(choice)) return null;
+
+    if (choice === 'reuse') {
+      return reuseGitHubApp(p, role, label, siblings, opts.newRepo, opts.newInstanceHome);
+    }
+    if (choice === 'new-custom') {
+      const name = await askAppName(p, suggestVariantName(defaultName), `Pick a unique name for the new ${label.toLowerCase()} app:`);
+      if (name === null) return null;
+      return runManifestFlow(p, role, name, label);
+    }
+    // 'new-default'
+    return runManifestFlow(p, role, defaultName, label);
+  }
+
   const name = await askAppName(
     p,
     defaultName,
@@ -135,14 +190,211 @@ export async function createGitHubApp(
 }
 
 /**
+ * Walk the user through reusing an existing GitHub App on a new repo.
+ * The app already has credentials + a .pem we can copy; the only thing
+ * that has to change on github.com is adding `<owner>/<repo>` to the
+ * installation's repository list. We check via the API and prompt the
+ * user to fix it via the settings page if missing.
+ */
+async function reuseGitHubApp(
+  p: ClackModule,
+  role: 'agent' | 'reviewer',
+  label: string,
+  siblings: SiblingApp[],
+  newRepo: { owner: string; repo: string },
+  newInstanceHome: string,
+): Promise<GitHubAppResult | null> {
+  // Pick which sibling to reuse from.
+  let source: SiblingApp;
+  if (siblings.length === 1) {
+    source = siblings[0];
+    p.log.info(`Reusing ${label} app from '${source.slug}' (id=${source.appId})`);
+  } else {
+    const choice = await p.select({
+      message: `Reuse ${label.toLowerCase()} app from which instance?`,
+      options: siblings.map((s) => ({ value: s.slug, label: `${s.slug}  (id=${s.appId})` })),
+      initialValue: siblings[0].slug,
+    });
+    if (p.isCancel(choice)) return null;
+    source = siblings.find((s) => s.slug === choice)!;
+  }
+
+  // JWT-check the app is alive on github.com.
+  const aliveSpin = p.spinner();
+  aliveSpin.start(`Verifying ${label} app on GitHub`);
+  const alive = await verifyExistingApp(source.appId, source.pemPath, source.installationId);
+  if (!alive.ok) {
+    aliveSpin.stop(`App is unreachable: ${alive.reason}`);
+    p.log.error(`Can't reuse — repair '${source.slug}' first or pick "Create new app" instead.`);
+    return null;
+  }
+  aliveSpin.stop(`App is alive: ${alive.name}`);
+
+  // Check whether the installation has access to the new repo.
+  const target = `${newRepo.owner}/${newRepo.repo}`;
+  let hasAccess = await installationHasRepo(source.appId, source.pemPath, source.installationId, newRepo.owner, newRepo.repo);
+
+  if (!hasAccess) {
+    p.note(
+      help([
+        `The ${label} app is currently only installed on its original repo.`,
+        `We need to add "${target}" to the installation before this instance can use it.`,
+        '',
+        '1. We\'ll open the GitHub App\'s install page in your browser.',
+        '2. Under "Repository access", click "Only select repositories",',
+        `   add "${newRepo.repo}", and click "Save".`,
+        '3. Come back here and confirm.',
+      ].join('\n')),
+      'Add new repo to installation'
+    );
+    openBrowser(`https://github.com/settings/installations/${source.installationId}`);
+
+    const confirmed = await p.confirm({
+      message: `Done — added "${target}" to the installation?`,
+      initialValue: true,
+    });
+    if (p.isCancel(confirmed) || !confirmed) return null;
+
+    const recheckSpin = p.spinner();
+    recheckSpin.start('Verifying access');
+    hasAccess = await installationHasRepo(source.appId, source.pemPath, source.installationId, newRepo.owner, newRepo.repo);
+    recheckSpin.stop(hasAccess ? 'Access confirmed' : 'Still no access');
+    if (!hasAccess) {
+      p.log.error(`Could not see "${target}" in the installation. Verify on github.com and re-run the wizard.`);
+      return null;
+    }
+  }
+
+  // Copy the .pem from the sibling instance into the new instance's keys/.
+  // Self-contained per-instance dirs are simpler to reason about than
+  // symlinks; rotation cost ("update both instances") is rare enough.
+  try {
+    const destKeysDir = join(newInstanceHome, 'keys');
+    mkdirSync(destKeysDir, { recursive: true });
+    const destPemPath = join(destKeysDir, `${role}.pem`);
+    const pemContent = readFileSync(source.pemPath);
+    writeFileSync(destPemPath, pemContent, { mode: 0o600 });
+    p.log.success(`Copied private key → ${destPemPath}`);
+
+    return {
+      appId: source.appId,
+      installationId: source.installationId,
+      pemPath: destPemPath,
+      name: alive.name,
+    };
+  } catch (err: any) {
+    p.log.error(`Could not copy private key: ${err.message}`);
+    return null;
+  }
+}
+
+/**
+ * Use the installation's access token to list the repositories it has
+ * access to. Returns true if owner/repo is present.
+ */
+async function installationHasRepo(
+  appId: number,
+  pemPath: string,
+  installationId: number,
+  owner: string,
+  repo: string,
+): Promise<boolean> {
+  try {
+    const privateKey = readFileSync(pemPath, 'utf-8');
+    const auth = createAppAuth({ appId, privateKey });
+    const instAuth = await auth({ type: 'installation', installationId });
+
+    const target = `${owner}/${repo}`.toLowerCase();
+    let page = 1;
+    while (true) {
+      const res = await fetch(`https://api.github.com/installation/repositories?per_page=100&page=${page}`, {
+        headers: {
+          Accept: 'application/vnd.github+json',
+          Authorization: `Bearer ${instAuth.token}`,
+          'X-GitHub-Api-Version': '2022-11-28',
+        },
+      });
+      if (!res.ok) return false;
+      const json = await res.json() as { repositories: Array<{ full_name: string }>; total_count: number };
+      if (json.repositories.some((r) => r.full_name.toLowerCase() === target)) return true;
+      if (json.repositories.length < 100) return false;
+      page += 1;
+      if (page > 10) return false; // sanity cap
+    }
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Scan sibling instances' .env for this role's GitHub App credentials.
+ * Returns the slugs whose app is fully configured, whose .pem still exists
+ * on disk, AND that pass a live JWT check against github.com. Pre-flight
+ * filtering means the picker only offers genuinely reusable apps —
+ * revoked, deleted, or unreachable apps don't appear as choices.
+ *
+ * Async because the JWT check is a network call. Runs N requests in
+ * parallel where N is the number of sibling candidates; for typical
+ * setups (1–3 instances) this is sub-second, and dead apps fail fast.
+ */
+export async function findReusableApps(
+  role: 'agent' | 'reviewer',
+  excludeSlug?: string,
+): Promise<SiblingApp[]> {
+  const idKey = role === 'agent' ? 'GITHUB_APP_ID' : 'REVIEWER_GITHUB_APP_ID';
+  const installKey = role === 'agent' ? 'GITHUB_APP_INSTALLATION_ID' : 'REVIEWER_GITHUB_APP_INSTALLATION_ID';
+  const pemKey = role === 'agent' ? 'GITHUB_APP_PRIVATE_KEY_PATH' : 'REVIEWER_GITHUB_APP_PRIVATE_KEY_PATH';
+
+  const candidates: SiblingApp[] = [];
+  for (const slug of listInstanceSlugs()) {
+    if (slug === excludeSlug) continue;
+    const envPath = join(instancesDir(), slug, '.env');
+    if (!existsSync(envPath)) continue;
+    try {
+      const content = readFileSync(envPath, 'utf-8');
+      const env: Record<string, string> = {};
+      for (const rawLine of content.split('\n')) {
+        const line = rawLine.replace(/\r$/, '').trim();
+        const m = line.match(/^([A-Z_]+)\s*=\s*(.*)$/);
+        if (!m) continue;
+        let val = m[2].trim();
+        if (
+          (val.startsWith('"') && val.endsWith('"')) ||
+          (val.startsWith("'") && val.endsWith("'"))
+        ) {
+          val = val.slice(1, -1);
+        }
+        env[m[1]] = val;
+      }
+      const appId = parseInt(env[idKey] || '', 10);
+      const installationId = parseInt(env[installKey] || '', 10);
+      const pemPath = env[pemKey] || '';
+      if (appId && installationId && pemPath && existsSync(pemPath)) {
+        candidates.push({ slug, appId, installationId, pemPath });
+      }
+    } catch {
+      // Skip unreadable .env
+    }
+  }
+
+  // Pre-flight JWT check in parallel. Apps that fail (revoked, deleted,
+  // network issue) drop out; the picker only shows live ones.
+  const results = await Promise.all(
+    candidates.map(async (c) => {
+      const alive = await verifyExistingApp(c.appId, c.pemPath, c.installationId);
+      return alive.ok ? c : null;
+    }),
+  );
+  return results.filter((c): c is SiblingApp => c !== null);
+}
+
+/**
  * Run GitHub's app manifest flow: stand up a tiny local callback server,
  * pre-POST the manifest to GitHub via a /start auto-submit page, wait for
  * the redirect-back code, exchange it for credentials, save the .pem, then
  * poll for the installation ID once the user installs the app on a repo.
  *
- * Extracted from createGitHubApp's body in v1.0.3 so the reconfigure flow
- * can call it after the 3-option select resolves to "create new" or
- * "re-create".
+ * Shared with the reconfigure flow's "create new" and "re-create" branches.
  */
 async function runManifestFlow(
   p: ClackModule,

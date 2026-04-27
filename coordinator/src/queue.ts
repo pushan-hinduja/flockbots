@@ -1,14 +1,11 @@
 import Database from 'better-sqlite3';
 import { existsSync, mkdirSync } from 'fs';
-import { dataDir, dbPath, migrateLegacyDb } from './paths';
+import { dataDir, dbPath } from './paths';
 
 // Ensure data directory exists before we attempt to open the DB
 if (!existsSync(dataDir())) {
   mkdirSync(dataDir(), { recursive: true });
 }
-
-// Rename legacy orchestrator.db → flockbots.db (no-op on fresh installs)
-migrateLegacyDb();
 
 export const db = new Database(dbPath());
 
@@ -237,15 +234,20 @@ export function createEscalation(taskId: string, question: string, context?: str
     `INSERT INTO escalations (task_id, question, context, created_at)
      VALUES (?, ?, ?, ?)`
   ).run(taskId, question, context || null, Date.now());
+  const escalationId = result.lastInsertRowid as number;
 
   if (syncFn) {
+    // Pass the local id so Supabase keys on (instance_id, id). Earlier code
+    // omitted id and relied on lockstep BIGSERIAL alignment with local
+    // SQLite — fragile in single-instance, broken in multi-instance.
     syncFn('escalation', {
+      id: escalationId,
       task_id: taskId, question, context, status: 'pending',
       created_at: new Date().toISOString(),
     }).catch((err: any) => console.error('Supabase sync (escalation) failed:', err.message));
   }
 
-  return result.lastInsertRowid as number;
+  return escalationId;
 }
 
 export function answerEscalation(escalationId: number, answer: string): void {

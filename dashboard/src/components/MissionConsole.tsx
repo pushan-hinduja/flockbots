@@ -11,6 +11,7 @@ import { AgentSpriteThumb } from './AgentSpriteThumb';
 import { AgentStreamModal } from './AgentStreamModal';
 import { AgentEditorModal } from './AgentEditorModal';
 import { Logo } from './Logo';
+import { InstanceSwitcher } from './InstanceSwitcher';
 import { useAgentCustomizations, resolveDashboardAgentId, type MergedAgent } from '../hooks/useAgentCustomizations';
 import './MissionConsole.css';
 
@@ -481,6 +482,8 @@ export function MissionConsole() {
             <Logo size={28} />
             <div><div className="mc-brand-name">FLOCKBOTS</div></div>
           </div>
+
+          <InstanceSwitcher />
 
           <div className="mc-uptime">
             <span className="label">HEARTBEAT</span>

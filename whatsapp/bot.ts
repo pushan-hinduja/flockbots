@@ -123,13 +123,17 @@ export class WhatsAppProvider implements ChatProvider {
       return;
     }
 
+    const instanceId = process.env.FLOCKBOTS_INSTANCE_ID;
+
     const poll = async () => {
       try {
+        if (!instanceId) return;
         const { data: messages, error } = await supabase
           .from('webhook_inbox')
           .select('*')
           .eq('processed', false)
           .eq('source', 'whatsapp')
+          .eq('instance_id', instanceId)
           .order('created_at', { ascending: true })
           .limit(10);
 

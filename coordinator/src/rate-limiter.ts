@@ -1,4 +1,7 @@
+import { existsSync, readFileSync, writeFileSync, renameSync } from 'fs';
+import { join } from 'path';
 import { db, logEvent } from './queue';
+import { flockbotsRoot } from './paths';
 
 /**
  * Rate limit handling and scheduling decisions.
@@ -92,7 +95,62 @@ function parseResumeTime(errorOutput: string): number | null {
   return null;
 }
 
+/**
+ * Path to the cross-instance rate-limit signal file. Lives at the shared
+ * root because Claude Max OAuth limits are account-level — when one
+ * coordinator hits a 429, every other instance on the same machine should
+ * pause too. Per-instance SQLite alone wouldn't propagate the signal.
+ */
+function sharedRateLimitPath(): string {
+  return join(flockbotsRoot(), 'rate-limit-state.json');
+}
+
+interface SharedRateLimitState {
+  resumeAt: number | null;
+  lastHitAt: string | null;
+  lastHitInstance: string | null;
+}
+
+function readSharedRateLimit(): number | null {
+  try {
+    const path = sharedRateLimitPath();
+    if (!existsSync(path)) return null;
+    const parsed = JSON.parse(readFileSync(path, 'utf-8')) as SharedRateLimitState;
+    if (!parsed || typeof parsed.resumeAt !== 'number') return null;
+    if (parsed.resumeAt <= Date.now()) return null;
+    return parsed.resumeAt;
+  } catch {
+    return null;
+  }
+}
+
+function writeSharedRateLimit(resumeAt: number): void {
+  try {
+    const path = sharedRateLimitPath();
+    const state: SharedRateLimitState = {
+      resumeAt,
+      lastHitAt: new Date().toISOString(),
+      lastHitInstance: process.env.FLOCKBOTS_INSTANCE_ID || null,
+    };
+    // Atomic: write to .tmp then rename so concurrent readers never see a
+    // partial JSON file.
+    const tmp = path + '.tmp';
+    writeFileSync(tmp, JSON.stringify(state, null, 2), { mode: 0o600 });
+    renameSync(tmp, path);
+  } catch (err: any) {
+    console.error('[rate-limiter] could not write shared rate-limit state:', err.message);
+  }
+}
+
 function getRateLimitResumeTime(): number | null {
+  // Cross-instance signal wins — if any coordinator on this machine hit a
+  // limit recently, all of them pause.
+  const shared = readSharedRateLimit();
+  if (shared) return shared;
+
+  // Fall back to this instance's local SQLite — this row also gets synced
+  // to Supabase by recordRateLimitHit() so the dashboard sees the per-
+  // instance audit trail.
   const row = db.prepare(
     'SELECT value FROM system_health WHERE key = ?'
   ).get('rate_limit_resume') as { value: string } | undefined;
@@ -155,6 +213,12 @@ export function recordRateLimitHit(taskId: string, errorOutput: string = ''): vo
   const source = parsed ? 'from error' : 'estimated';
   const resumeDate = new Date(resumeAt);
 
+  // Shared file first — sibling coordinators consult this on every check
+  // and pause immediately, so propagation is fast.
+  writeSharedRateLimit(resumeAt);
+
+  // Per-instance audit (also synced to Supabase via syncFn so the dashboard
+  // sees per-instance hit history).
   db.prepare(
     'INSERT OR REPLACE INTO system_health (key, value, updated_at) VALUES (?, ?, ?)'
   ).run('rate_limit_resume', String(resumeAt), Date.now());

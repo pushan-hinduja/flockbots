@@ -21,3 +21,13 @@ skills/
 # time. Lives at ~/.flockbots/state.json on a real install; ignored here
 # so dogfooding from the source tree never commits one accidentally.
 state.json
+
+# Cross-instance rate-limit signal (Claude Max OAuth limits are account-
+# level — coordinators write/read this so a 429 hit by one pauses the
+# whole flock). Lives at ~/.flockbots/rate-limit-state.json on a real
+# install; never belongs in git.
+rate-limit-state.json
+
+# Per-install instance directories — config, SQLite, keys, per-instance
+# state. Gitignored so dogfooding from the source tree never commits one.
+instances/
