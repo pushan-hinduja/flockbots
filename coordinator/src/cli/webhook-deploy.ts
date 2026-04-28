@@ -1,32 +1,44 @@
 import { execSync } from 'child_process';
+import { existsSync } from 'fs';
 import { join } from 'path';
 import { flockbotsRoot, listInstanceSlugs } from '../paths';
 import { extractInstanceFlag, loadEnvFile } from './env';
 import { updateState } from './state-file';
 import { help } from './brand';
-
-type ClackModule = typeof import('@clack/prompts');
+import {
+  ensureVercelCli,
+  ensureVercelLogin,
+  linkVercelProject,
+  setVercelEnv,
+  deployVercelProd,
+} from './vercel-cli';
 
 /**
  * `flockbots webhook deploy` — required only when CHAT_PROVIDER=whatsapp.
- * Reads SUPABASE_URL,
- * SUPABASE_SERVICE_ROLE_KEY, and WHATSAPP_VERIFY_TOKEN from a configured
- * instance's .env, opens the Vercel import for the webhook-relay project,
- * prompts the user to paste the resulting deploy URL back so we can build
- * the Meta webhook callback, and stashes the URL in state.json
- * (root-level — the relay is shared across instances; routing by instance
- * is handled via per-instance webhook URL paths).
+ *
+ * Same Vercel CLI flow as dashboard-deploy: link → set env vars → deploy.
+ * After the deploy, prints Meta webhook config instructions with the
+ * per-instance callback URL (`<base>/api/webhook/<slug>`) so the user
+ * knows what to paste into the Meta dashboard.
+ *
+ * Reads SUPABASE_URL + WHATSAPP_VERIFY_TOKEN from the named instance's
+ * .env (or the first slug if -i isn't given). The slug also drives the
+ * webhook URL path — each WhatsApp instance has its own /api/webhook/<slug>
+ * path on the same shared relay deployment.
  */
 export async function runWebhookDeploy(args: string[] = []): Promise<void> {
   const { instanceId } = extractInstanceFlag(args);
   const root = flockbotsRoot();
-  if (listInstanceSlugs().length === 0) {
+  const slugs = listInstanceSlugs();
+  if (slugs.length === 0) {
     console.error(`No FlockBots instances at ${join(root, 'instances')}. Run \`flockbots init\` first.`);
     process.exit(1);
   }
 
-  loadEnvFile(instanceId);
+  const slug = instanceId || slugs[0];
+  loadEnvFile(slug);
   const supabaseUrl = process.env.SUPABASE_URL;
+  const serviceKey = process.env.SUPABASE_SERVICE_ROLE_KEY;
   const verifyToken = process.env.WHATSAPP_VERIFY_TOKEN;
   const provider = process.env.CHAT_PROVIDER;
 
@@ -34,9 +46,16 @@ export async function runWebhookDeploy(args: string[] = []): Promise<void> {
     console.error(`This command is only relevant when CHAT_PROVIDER=whatsapp (current: ${provider || 'not set'}).`);
     process.exit(1);
   }
-  if (!supabaseUrl || !verifyToken) {
-    console.error('The webhook-relay needs SUPABASE_URL and WHATSAPP_VERIFY_TOKEN in .env. Re-run');
-    console.error('`flockbots init` and pick "Reconfigure" → Supabase + Chat provider.');
+  if (!supabaseUrl || !serviceKey || !verifyToken) {
+    console.error('The webhook-relay needs SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, and WHATSAPP_VERIFY_TOKEN');
+    console.error('in .env. Re-run `flockbots init` and reconfigure Supabase + Chat provider sections.');
+    process.exit(1);
+  }
+
+  const relayDir = join(root, 'webhook-relay');
+  if (!existsSync(relayDir)) {
+    console.error(`Webhook-relay source not found at ${relayDir}.`);
+    console.error('Run `flockbots upgrade` to pull the relay into your install dir.');
     process.exit(1);
   }
 
@@ -45,94 +64,55 @@ export async function runWebhookDeploy(args: string[] = []): Promise<void> {
 
   p.note(
     help([
-      'Deploys the webhook-relay to Vercel — required for WhatsApp inbound',
-      'messages to reach the coordinator. The free Vercel tier is plenty;',
-      'this function processes maybe a few dozen requests a day.',
+      'Deploys the WhatsApp webhook-relay to Vercel via `vercel` CLI:',
+      '',
+      '  1. Pre-warm the Vercel CLI (first run ~30s, cached after)',
+      '  2. Sign in to Vercel if needed (one-time browser flow)',
+      '  3. Link this relay dir to a Vercel project',
+      '  4. Push Supabase + verify token as production env vars',
+      '  5. Deploy to production',
+      '  6. Print the Meta webhook callback URL for this flock',
+      '',
+      'The relay is shared across every WhatsApp flock on this install —',
+      `each flock gets its own /api/webhook/<slug> path on the same deploy.`,
     ].join('\n')),
-    'About'
+    'About',
   );
 
-  const mode = await p.select({
-    message: 'How do you want to deploy?',
-    options: [
-      { value: 'now',   label: 'Open Vercel with the import page pre-filled', hint: 'recommended — ~2 min' },
-      { value: 'later', label: "Show me how, I'll do it later" },
-      { value: 'cancel', label: 'Cancel' },
-    ],
-    initialValue: 'now',
-  });
-  if (p.isCancel(mode) || mode === 'cancel') {
-    p.cancel('Cancelled.');
+  if (!(await ensureVercelCli(p))) { p.outro('Cancelled — Vercel CLI not available.'); return; }
+  if (!(await ensureVercelLogin(p))) { p.outro('Cancelled — sign in to Vercel and re-run.'); return; }
+  if (!(await linkVercelProject(p, relayDir, 'flockbots-webhook-relay'))) {
+    p.outro('Cancelled — project link did not complete.');
     return;
   }
 
-  const importUrl = buildVercelRelayImportUrl();
-  const envLines = [
-    `  SUPABASE_URL              = ${supabaseUrl}`,
-    `  SUPABASE_SERVICE_ROLE_KEY = <your service_role key from .env>`,
-    `  WHATSAPP_VERIFY_TOKEN     = ${verifyToken}`,
-  ].join('\n');
+  const envSpin = p.spinner();
+  envSpin.start('Setting SUPABASE_URL on Vercel');
+  const okUrl = await setVercelEnv(relayDir, 'SUPABASE_URL', supabaseUrl);
+  envSpin.message('Setting SUPABASE_SERVICE_ROLE_KEY on Vercel');
+  const okSrv = await setVercelEnv(relayDir, 'SUPABASE_SERVICE_ROLE_KEY', serviceKey);
+  envSpin.message('Setting WHATSAPP_VERIFY_TOKEN on Vercel');
+  const okTok = await setVercelEnv(relayDir, 'WHATSAPP_VERIFY_TOKEN', verifyToken);
+  if (!okUrl || !okSrv || !okTok) {
+    envSpin.stop('Env var setup failed');
+    p.outro('Cancelled — could not set env vars on Vercel.');
+    return;
+  }
+  envSpin.stop('Env vars set');
 
-  // Per-instance: each FlockBots instance has its own Meta webhook URL on
-  // the same relay so the right coordinator picks up its inbound messages.
-  // The slug is the segment after /api/webhook/.
-  const instanceSlug = process.env.FLOCKBOTS_INSTANCE_ID;
-  const slugSuffix = instanceSlug ? `/${instanceSlug}` : '';
-
-  if (mode === 'later') {
-    p.note(
-      help([
-        'When you are ready:',
-        '',
-        `  1. Open: ${importUrl}`,
-        `  2. Paste environment variables when prompted:`,
-        envLines,
-        `  3. Click Deploy. Wait ~60 seconds.`,
-        `  4. Copy the URL Vercel gives you (like https://...vercel.app).`,
-        `  5. Your Meta webhook URL for instance '${instanceSlug || '<slug>'}' is:`,
-        `       <that URL>/api/webhook${slugSuffix}`,
-        `  6. Verify token for Meta: ${verifyToken}`,
-        `  7. Full walkthrough: docs/setup/whatsapp.md`,
-        '',
-        '(Each instance has its own /api/webhook/<slug> path on the same relay —',
-        ' run `flockbots webhook deploy` once per WhatsApp instance to register',
-        ' the URL with Meta.)',
-      ].join('\n')),
-      'Webhook-relay — steps for later'
-    );
-    p.outro('Run `flockbots webhook deploy` again any time.');
+  const deployedUrl = await deployVercelProd(p, relayDir);
+  if (deployedUrl === null) {
+    p.outro('Deploy failed — see output above. Re-run `flockbots webhook deploy` to retry.');
     return;
   }
 
-  p.note(
-    help([
-      'Opening the Vercel import page in your browser.',
-      '',
-      'Paste these environment variables when Vercel prompts:',
-      '',
-      envLines,
-      '',
-      'Then click Deploy. Wait ~60 seconds for the build. Vercel will',
-      'show you a URL at the top of the project page when deploy is done.',
-    ].join('\n')),
-    'Deploy webhook-relay to Vercel'
-  );
+  // The deploy URL Vercel prints is for the project root. The Meta callback
+  // URL appends /api/webhook/<slug> for this flock.
+  const baseUrl = deployedUrl ? deployedUrl.replace(/\/$/, '') : '';
+  const slugSuffix = slug ? `/${slug}` : '';
+  const webhookUrl = baseUrl ? `${baseUrl}/api/webhook${slugSuffix}` : `<deploy-url>/api/webhook${slugSuffix}`;
 
-  openBrowser(importUrl);
-
-  const deployedUrl = await p.text({
-    message: 'Paste the Vercel deployment URL (e.g. https://flockbots-webhook-relay-xxx.vercel.app):',
-    validate: (v) => (/^https:\/\/.+\.vercel\.app\/?$/.test(v.trim()) ? undefined : 'Expected https://...vercel.app'),
-  });
-  if (p.isCancel(deployedUrl)) {
-    p.cancel('Cancelled.');
-    return;
-  }
-
-  const baseUrl = (deployedUrl as string).trim().replace(/\/$/, '');
-  const webhookUrl = baseUrl + '/api/webhook' + slugSuffix;
-
-  // Copy verify token so Meta paste is one Cmd-V.
+  // Copy verify token to clipboard on macOS so Meta paste is one Cmd-V.
   if (process.platform === 'darwin') {
     try { execSync('pbcopy', { input: verifyToken }); } catch { /* best effort */ }
   }
@@ -141,27 +121,27 @@ export async function runWebhookDeploy(args: string[] = []): Promise<void> {
     help([
       'Configure the webhook in your Meta app dashboard:',
       '',
-      '  1. Go to https://developers.facebook.com/apps/',
+      '  1. https://developers.facebook.com/apps/',
       '  2. Select your WhatsApp app',
-      '  3. WhatsApp → Configuration → Webhook → Edit',
+      '  3. WhatsApp > Configuration > Webhook > Edit',
       '  4. Paste:',
       `       Callback URL: ${webhookUrl}`,
       `       Verify token: ${verifyToken}${process.platform === 'darwin' ? '   (already copied to clipboard)' : ''}`,
       '  5. Click "Verify and save" — Meta sends a GET to your URL',
-      '  6. Click "Manage" on Webhook fields → subscribe to "messages"',
+      '  6. Click "Manage" on Webhook fields > subscribe to "messages"',
       '',
       'Full walkthrough with screenshots: docs/setup/whatsapp.md',
     ].join('\n')),
-    'Point Meta at your webhook'
+    'Point Meta at your webhook',
   );
 
-  openBrowser('https://developers.facebook.com/apps/');
-
-  try {
-    updateState(root, { webhookRelayUrl: baseUrl });
-    p.log.success(`Saved → ${join(root, 'state.json')}`);
-  } catch (err: any) {
-    p.log.warn(`Could not write state.json: ${err.message}`);
+  if (baseUrl) {
+    try {
+      updateState(root, { webhookRelayUrl: baseUrl });
+      p.log.success(`Saved → ${join(root, 'state.json')}`);
+    } catch (err: any) {
+      p.log.warn(`Could not write state.json: ${err.message}`);
+    }
   }
 
   const done = await p.confirm({ message: 'Webhook registered + subscribed in Meta?', initialValue: true });
@@ -170,22 +150,4 @@ export async function runWebhookDeploy(args: string[] = []): Promise<void> {
   }
 
   p.outro('Webhook deploy complete.');
-}
-
-function buildVercelRelayImportUrl(): string {
-  const params = new URLSearchParams({
-    'repository-url': 'https://github.com/pushan-hinduja/flockbots',
-    'project-name':   'flockbots-webhook-relay',
-    'root-directory': 'webhook-relay',
-    'env':            'SUPABASE_URL,SUPABASE_SERVICE_ROLE_KEY,WHATSAPP_VERIFY_TOKEN',
-    'envDescription': 'Copy from your FlockBots .env (SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, WHATSAPP_VERIFY_TOKEN)',
-  });
-  return `https://vercel.com/new/clone?${params.toString()}`;
-}
-
-function openBrowser(url: string): void {
-  const cmd = process.platform === 'darwin' ? `open ${JSON.stringify(url)}`
-            : process.platform === 'win32'  ? `start "" ${JSON.stringify(url)}`
-            :                                  `xdg-open ${JSON.stringify(url)}`;
-  try { execSync(cmd, { stdio: 'ignore' }); } catch { /* user can paste the URL */ }
 }

@@ -131,6 +131,15 @@ The wizard propagates changes diff-based: when reconfigure changes a shared key,
 
 The webhook-relay is **one Vercel deployment** shared across instances. Each instance gets its own URL path: `/api/webhook/<slug>`. The relay validates the slug against `[a-z0-9-]{2,32}`, stamps `instance_id=<slug>` on every `webhook_inbox` insert, and the matching coordinator polls for its rows. Adding a WhatsApp instance means: (1) wizard prints a slug-specific URL, (2) operator pastes it into Meta's webhook config for that WhatsApp number. No relay redeploy needed per instance.
 
+### Vercel deployment model
+
+Both `flockbots dashboard deploy` and `flockbots webhook deploy` are wrappers around the `vercel` CLI (via `npx --yes vercel`), running against `~/.flockbots/dashboard/` and `~/.flockbots/webhook-relay/` respectively. We picked CLI-against-local-source over the older "import from public repo" model for two reasons:
+
+1. **Decoupled upgrade cadence.** Importing the public `pushan-hinduja/flockbots` repo would auto-deploy every push to `flockbots/main` straight to user dashboards — a footgun for breaking releases (v1.0 → v1.1 schema changes would silently break existing dashboards). Local-source means the user controls when their dashboard advances, via `flockbots upgrade`.
+2. **Lockstep upgrades.** `flockbots upgrade` pulls coordinator + dashboard + relay source in one git operation, then redeploys any linked Vercel projects (`isVercelLinked()` checks for `.vercel/project.json` in each subdir). Dashboard schema reads always match coordinator schema writes — no drift window.
+
+Auth is browser-based on first run (`vercel login`); the token is shared across every flock on the machine. `VERCEL_TOKEN` env var bypasses the prompt for headless / CI use. Project name conflicts within a Vercel scope are handled by `vercel link`'s built-in "Link to existing project?" prompt, surfaced via a wizard note before the interactive step.
+
 ## Why two GitHub Apps?
 
 The coordinator makes PRs *and* reviews them. With one app, the PR author and the reviewer would be the same GitHub identity — PRs would show "AI Agent approved their own PR" which is terrible signal. Two apps gives you two identities:

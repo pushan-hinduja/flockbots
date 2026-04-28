@@ -1,8 +1,9 @@
-import { execSync } from 'child_process';
+import { execSync, spawn } from 'child_process';
 import { existsSync } from 'fs';
 import { join } from 'path';
 import { flockbotsRoot, instancesDir, listInstanceSlugs } from '../paths';
 import { ensureSkillsFromTemplate } from './skills-sync';
+import { isVercelLinked } from './vercel-cli';
 
 /**
  * `flockbots upgrade` — pulls latest from origin, rebuilds the coordinator,
@@ -127,6 +128,30 @@ export async function runUpgrade(): Promise<void> {
     p.log.success('pm2 restart /^flockbots:/ — coordinator(s) restarted');
   } catch {
     p.log.info('pm2 restart skipped (not running). Restart FlockBots manually.');
+  }
+
+  // Redeploy linked Vercel projects so dashboard + relay advance in lockstep
+  // with the coordinator. Only fires if the user already linked them via
+  // `flockbots dashboard deploy` / `flockbots webhook deploy`. Best effort —
+  // a Vercel hiccup shouldn't block the local upgrade.
+  for (const subdir of ['dashboard', 'webhook-relay']) {
+    const dir = join(home, subdir);
+    if (existsSync(dir) && isVercelLinked(dir)) {
+      const spin = p.spinner();
+      spin.start(`Redeploying ${subdir} to Vercel`);
+      const ok = await new Promise<boolean>((resolve) => {
+        const proc = spawn('npx', ['--yes', 'vercel', '--prod', '--yes'], {
+          cwd: dir, stdio: ['ignore', 'pipe', 'pipe'],
+        });
+        let out = '';
+        proc.stdout?.on('data', (c: Buffer) => { out += c.toString('utf-8'); });
+        proc.stderr?.on('data', (c: Buffer) => { out += c.toString('utf-8'); });
+        proc.on('exit', (code) => resolve(code === 0));
+        proc.on('error', () => resolve(false));
+      });
+      if (ok) spin.stop(`${subdir} redeployed`);
+      else spin.stop(`${subdir} redeploy failed — re-run \`flockbots ${subdir === 'dashboard' ? 'dashboard' : 'webhook'} deploy\` to retry`);
+    }
   }
 
   p.outro('Upgrade complete.');

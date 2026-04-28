@@ -326,8 +326,8 @@ flockbots doctor                 # health check — prereqs + per-flock config (
 flockbots instances              # list configured flocks + pm2 status
 flockbots task add "<desc>"      # queue a task from the CLI (-i <slug> if you have multiple flocks)
 flockbots kg build               # (re)build the knowledge graph (-i <slug> picks the flock)
-flockbots dashboard deploy       # deploy the web dashboard to Vercel (one-click)
-flockbots webhook deploy         # deploy the WhatsApp webhook-relay to Vercel (one-click)
+flockbots dashboard deploy       # deploy the web dashboard to Vercel via `vercel` CLI
+flockbots webhook deploy         # deploy the WhatsApp webhook-relay to Vercel via `vercel` CLI
 flockbots upgrade                # pull latest, rebuild, restart every flock via pm2
 flockbots init                   # add a new flock or reconfigure an existing one (see below)
 flockbots remove                 # remove a single flock (pm2 + dir + Supabase archive)
@@ -379,6 +379,22 @@ Verification failures (missing `.pem`, deleted app, revoked installation) automa
 - `knowledgeGraphBuiltAt` — when the knowledge graph last built
 
 The file is purely informational — `.env` remains the source of truth for runtime config. Future versions of the wizard show these values in the reconfigure picker so you don't have to remember your own URLs.
+
+---
+
+## Vercel deploys (dashboard + webhook-relay)
+
+`flockbots dashboard deploy` and `flockbots webhook deploy` both run through the **`vercel` CLI** against the local source tree at `~/.flockbots/dashboard/` and `~/.flockbots/webhook-relay/`. The flow:
+
+1. **Pre-warm the Vercel CLI** via `npx --yes vercel` — first run downloads the CLI (~30s), cached after.
+2. **Sign in to Vercel** — one-time browser flow (`vercel login`). Auth token persists at `~/Library/Application Support/com.vercel.cli/auth.json` (macOS) and survives uninstalls; subsequent flocks on the same machine skip this step.
+3. **Link the project** — Vercel CLI's `vercel link` asks for a scope (personal or team) and a project name, defaulting to `flockbots-dashboard` / `flockbots-webhook-relay`. If a matching project already exists in your scope (e.g. you re-installed FlockBots), you're offered "Link to existing project" so you redeploy to the same URL instead of creating a duplicate.
+4. **Push env vars** — production-scope `VITE_SUPABASE_URL`, `VITE_SUPABASE_ANON_KEY` (dashboard) or `SUPABASE_URL`, `SUPABASE_SERVICE_ROLE_KEY`, `WHATSAPP_VERIFY_TOKEN` (relay). Idempotent — re-runs overwrite any prior value.
+5. **Deploy** — `vercel --prod` builds + ships. Output URL is captured into `~/.flockbots/state.json`.
+
+Subsequent `flockbots dashboard deploy` runs skip steps 1-3 (already cached / linked) and go straight to env-update + deploy. **`flockbots upgrade` automatically redeploys** any linked Vercel project after pulling new source — so your dashboard, relay, and coordinator advance in lockstep instead of drifting apart.
+
+For headless contexts (CI, automation), set `VERCEL_TOKEN` and the login step is skipped.
 
 ---
 
