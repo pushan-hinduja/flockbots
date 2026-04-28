@@ -2,9 +2,8 @@
 
 > A flock of specialized AI agents that ships production code for you — from a chat message on your phone to a QA-verified deploy.
 
-<!-- SCREENSHOT: hero — dashboard office view with agents at their desks -->
 <p align="center">
-  <em>[ screenshot: the dashboard office view ]</em>
+  <img src="docs/images/dashboard-full.png" alt="FlockBots dashboard — full view with agents at their desks, pipeline, activity feed, and metrics" />
 </p>
 
 ```bash
@@ -110,6 +109,8 @@ Runs after merge. Tests the *deployed* code, not the diff.
 - On failure: auto-creates a fix-it task with the screenshot + failure details, puts it back at the top of the queue for Dev to address.
 - **Requires Supabase** — screenshots + video clips land in the `qa-media` Storage bucket. If you skip the dashboard/Supabase step during `flockbots init`, QA is unavailable and the wizard skips the step entirely.
 
+> **You bring the deploy, QA brings the test.** The QA agent visits whatever URL you set as `STAGING_BASE_URL` during `flockbots init` — it doesn't deploy anything itself. You need an auto-deploy hooked up to your staging branch so a fresh build is live by the time QA opens the browser. **Vercel is the recommended setup**: connect Vercel to your GitHub repo, point the production deployment at your `main`/`prod` branch and a preview/production deployment at your `staging` branch (in two-branch mode), and Vercel ships every merge automatically. Then `STAGING_BASE_URL=https://your-app-staging.vercel.app` and QA always tests the post-merge build for *that* branch — never the wrong environment. Without a working auto-deploy at the URL you configured, QA times out waiting for the deploy and fails the verification.
+
 ### Coordinator — the orchestrator
 
 Not a Claude agent — a plain Node process. The glue that makes the flock work as a team.
@@ -123,12 +124,13 @@ Not a Claude agent — a plain Node process. The glue that makes the flock work 
 - **Health monitor** — watches disk space, stale worktrees, orphaned processes.
 - **Heartbeat** to Supabase (when enabled) so the dashboard knows if the flock is online.
 
-<!-- SCREENSHOT: office view close-up, agents at desks -->
 <p align="center">
-  <em>[ screenshot: the live office view — each agent visualized at their desk ]</em>
+  <img src="docs/images/office.png" alt="The pixel-art office view with the customize-agent modal open" />
 </p>
 
 The dashboard renders all of this as an **office view** — a live pixel-art visualization where each agent sits at their desk. You can watch them think, write, review, and hand off work in real time. The whole flock in one glance.
+
+**Customize each agent.** Click any agent in the office (or their name in the roster) to open the editor — rename them, swap body / hair / suit sprite rows, save. Names and appearance persist per-user in Supabase, so different operators looking at the same dashboard can keep their own roster theme without stepping on each other.
 
 ---
 
@@ -224,11 +226,10 @@ Three chat providers ship in the box. Pick whatever fits your workflow.
 |---------|-----------|----------|
 | **Telegram** | ~2 min via [@BotFather](https://t.me/BotFather) | Solo operators who want the fastest path |
 | **Slack** | ~5 min (Socket Mode workspace app) | Teams where FlockBots lives in a shared channel |
-| **WhatsApp** | ~30–40 min (WhatsApp Business Account required) | Advanced — best for the full phone-to-prod flow above |
+| **WhatsApp** | ~30–40 min (WhatsApp Business Account required) | Best for users who prefer WhatsApp as their primary communication tool |
 
-<!-- SCREENSHOT: telegram conversation with the bot -->
 <p align="center">
-  <em>[ screenshot: chatting with FlockBots on Telegram ]</em>
+  <img src="docs/images/agent-chat.png" alt="Chatting with FlockBots on Telegram — natural-language commands routed by Claude Haiku" />
 </p>
 
 ### Natural language, not slash commands
@@ -259,7 +260,7 @@ FlockBots connects to a handful of external services. Only the first three are r
 |---------|------|-----------|-------|
 | **Anthropic Claude** | Runs every agent session (PM, UX, Dev, Reviewer, QA, chat router) | Yes | Use your **Claude Max/Pro via OAuth** (recommended — no per-token cost) or an Anthropic API key |
 | **GitHub** | Hosts your target codebase; two apps handle PR authorship + reviewer identity | Yes | Two GitHub Apps auto-created by the wizard via the manifest flow (~30 seconds each) |
-| **Telegram / Slack / WhatsApp** | Chat interface — how you talk to the flock | Yes (pick one) | Telegram fastest to set up; WhatsApp unlocks the full phone-to-prod flow — see [`docs/setup/whatsapp.md`](docs/setup/whatsapp.md) for the full Meta + webhook-relay walkthrough |
+| **Telegram / Slack / WhatsApp** | Chat interface — how you talk to the flock | Yes (pick one) | Telegram fastest to set up; WhatsApp is best for users who prefer it as their primary communication tool — see [`docs/setup/whatsapp.md`](docs/setup/whatsapp.md) for the full Meta + webhook-relay walkthrough |
 | **Vercel** | Auto-deploy on merge to staging and prod | **Recommended** | Connect your GitHub branches to Vercel — every merge ships automatically, so QA can test the actual deployed URL and `/deploy` from chat becomes a real one-tap prod release |
 | **Supabase** | Powers the live web dashboard: task history, token usage, office view, QA screenshot hosting | Optional | Free tier works. Skip if you're CLI-only |
 | **Linear** | **Two-way sync** — pulls labeled Linear issues into the task queue as triggers, and the coordinator writes back: PR links, stage transitions, completion notes, failure reasons enriched onto the ticket as comments. Your Linear board becomes a live view of everything the flock is doing | Optional | Skip unless you already track work there |
@@ -281,9 +282,8 @@ Then run the wizard:
 flockbots init
 ```
 
-<!-- SCREENSHOT: the wizard intro with pixel duck + FLOCKBOTS wordmark -->
 <p align="center">
-  <em>[ screenshot: flockbots init wizard ]</em>
+  <img src="docs/images/wizard.png" alt="The flockbots init wizard — pixel duck mascot + FLOCKBOTS wordmark" />
 </p>
 
 Start the coordinator:
@@ -335,11 +335,6 @@ flockbots uninstall              # clean removal — stops every flock, removes 
 ```
 
 The `-i <slug>` flag is auto-resolved when you only have one flock. With two or more, every per-flock command requires it (or pick interactively at the prompt for `flockbots remove`).
-
-<!-- SCREENSHOT: pm2 logs showing the branded boot sequence + live pipeline activity -->
-<p align="center">
-  <em>[ screenshot: pm2 logs — branded boot sequence + live pipeline events ]</em>
-</p>
 
 ---
 
