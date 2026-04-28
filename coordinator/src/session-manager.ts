@@ -6,7 +6,7 @@ import { randomUUID } from 'crypto';
 import { db, logEvent, logUsage, getPrNumber, getLastSessionId } from './queue';
 import { recordRateLimitHit } from './rate-limiter';
 import { syncToSupabase } from './supabase-sync';
-import { flockbotsHome, tasksDir } from './paths';
+import { flockbotsHome, flockbotsRoot, tasksDir } from './paths';
 
 // Locate the graphify binary once at module load. graphify is installed via
 // `pip install --user graphifyy` and lands in a Python-version-specific bin
@@ -60,6 +60,11 @@ export function isSessionRunning(taskId: string): { running: boolean; agent?: st
 }
 
 const PROJECT_ROOT = flockbotsHome();
+// Shared resources (agent prompts, mcp-configs, scripts) live at the
+// flock root, NOT inside this instance's home. v1.1 split flockbotsHome()
+// (per-instance) from flockbotsRoot() (shared); using PROJECT_ROOT for
+// shared paths is the v1.0 muscle memory that v1.1 has to break.
+const SHARED_ROOT = flockbotsRoot();
 const TASKS_DIR = tasksDir();
 const TARGET_REPO_PATH = process.env.TARGET_REPO_PATH || '';
 
@@ -265,7 +270,7 @@ export async function runAgent(config: AgentConfig): Promise<SessionResult> {
 
   // 2. Load and interpolate system prompt
   const systemPromptTemplate = readFileSync(
-    join(PROJECT_ROOT, 'agents', 'prompts', promptFileName), 'utf-8'
+    join(SHARED_ROOT, 'agents', 'prompts', promptFileName), 'utf-8'
   );
   const systemPrompt = systemPromptTemplate
     .replaceAll('{TASK_ID}', config.taskId)

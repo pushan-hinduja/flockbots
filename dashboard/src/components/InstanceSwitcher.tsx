@@ -1,12 +1,18 @@
+import { useState } from 'react';
 import { useInstance, isInstanceOnline } from '../contexts/InstanceContext';
 
 /**
  * Top-bar dropdown listing every non-archived instance. Selection drives
  * which instance the data hooks read (tasks, events, usage, sub-agents).
  * Cross-instance views (escalations, instance roster) are not affected.
+ *
+ * Custom menu (button + absolute-positioned <ul>) so the open list can
+ * match the chrome's dark theme instead of the native <select>'s macOS
+ * popover.
  */
 export function InstanceSwitcher() {
   const { instances, selectedInstance, setSelectedInstance, loaded } = useInstance();
+  const [open, setOpen] = useState(false);
 
   if (!loaded) {
     return <span className="mc-instance-loading">…</span>;
@@ -23,13 +29,15 @@ export function InstanceSwitcher() {
     const inst = instances[0];
     const online = isInstanceOnline(inst);
     return (
-      <span
-        className={`mc-instance-pill ${online ? 'online' : 'offline'}`}
-        title={`${inst.target_repo} — ${online ? 'online' : 'offline'}`}
-      >
-        <span className="dot" />
-        {inst.display_name || inst.id}
-      </span>
+      <div className="mc-instance-wrap">
+        <span
+          className={`mc-instance-pill ${online ? 'online' : 'offline'}`}
+          title={`${inst.target_repo} — ${online ? 'online' : 'offline'}`}
+        >
+          <span className="dot" />
+          {inst.display_name || inst.id}
+        </span>
+      </div>
     );
   }
 
@@ -37,22 +45,47 @@ export function InstanceSwitcher() {
   const online = current ? isInstanceOnline(current) : false;
 
   return (
-    <label className={`mc-instance-pill ${online ? 'online' : 'offline'}`} title={current?.target_repo || ''}>
-      <span className="dot" />
-      <select
-        className="mc-instance-select"
-        value={selectedInstance || ''}
-        onChange={(e) => setSelectedInstance(e.target.value)}
+    <div className="mc-instance-wrap">
+      <button
+        type="button"
+        className={`mc-instance-pill ${online ? 'online' : 'offline'}`}
+        title={current?.target_repo || ''}
+        aria-expanded={open}
+        aria-haspopup="listbox"
+        onClick={() => setOpen((v) => !v)}
       >
-        {instances.map((inst) => {
-          const isOnline = isInstanceOnline(inst);
-          return (
-            <option key={inst.id} value={inst.id}>
-              {(inst.display_name || inst.id) + (isOnline ? '' : ' · offline')}
-            </option>
-          );
-        })}
-      </select>
-    </label>
+        <span className="dot" />
+        {current?.display_name || current?.id || '—'}
+        <span className="caret">▾</span>
+      </button>
+      {open && (
+        <>
+          <div className="mc-instance-backdrop" onClick={() => setOpen(false)} />
+          <ul className="mc-instance-menu" role="listbox">
+            {instances.map((inst) => {
+              const isOnline = isInstanceOnline(inst);
+              const isSelected = inst.id === selectedInstance;
+              return (
+                <li
+                  key={inst.id}
+                  className={`${isOnline ? '' : 'offline'} ${isSelected ? 'selected' : ''}`}
+                  role="option"
+                  aria-selected={isSelected}
+                  title={inst.target_repo}
+                  onClick={() => {
+                    setSelectedInstance(inst.id);
+                    setOpen(false);
+                  }}
+                >
+                  <span className="dot" />
+                  <span>{inst.display_name || inst.id}</span>
+                  {isSelected && <span className="check">✓</span>}
+                </li>
+              );
+            })}
+          </ul>
+        </>
+      )}
+    </div>
   );
 }

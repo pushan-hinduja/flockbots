@@ -15,7 +15,7 @@ import { notifyOperator } from './notifier';
 import { updateLinearIssue, createLinearIssue, enrichLinearIssue } from './linear-sync';
 import { validatePmOutput, validateUxOutput, validateDevOutput, validateReviewerOutput, validateQAOutput, buildValidationRetryPrompt } from './output-validator';
 import { rebaseOnStaging } from './worktree-manager';
-import { flockbotsHome, tasksDir } from './paths';
+import { flockbotsHome, flockbotsRoot, tasksDir } from './paths';
 
 const TARGET_REPO_PATH = process.env.TARGET_REPO_PATH || '';
 const TASKS_DIR = tasksDir();
@@ -1110,7 +1110,8 @@ ${review}${priorReviews}`,
  * to one upgrade per task via ctx.qa.escalated_already.
  */
 async function runQAStage(task: Task): Promise<void> {
-  const PROJECT_ROOT = flockbotsHome();
+  // mcp-configs are shared resources at the flock root, not per-instance.
+  const SHARED_ROOT = flockbotsRoot();
   const ctx = readJSON(join(TASKS_DIR, task.id, 'context.json'));
   const qaBlock = ctx?.qa || {};
 
@@ -1157,7 +1158,7 @@ async function runQAStage(task: Task): Promise<void> {
     } catch {}
   }
 
-  const mcpConfigPath = join(PROJECT_ROOT, 'agents', 'mcp-configs', 'qa.json');
+  const mcpConfigPath = join(SHARED_ROOT, 'agents', 'mcp-configs', 'qa.json');
 
   // Build qa context for the prompt
   const qaContext = [
@@ -1366,15 +1367,18 @@ async function uploadQAMedia(taskId: string, localPath: string): Promise<string 
 async function runPostMergeKnowledgeUpdate(task: Task): Promise<void> {
   if (!canRunAgent('claude-sonnet-4-6', 'XS')) return; // Skip if budget is tight
 
-  const PROJECT_ROOT = flockbotsHome();
+  // The script lives at the shared root; cwd must be the per-instance home
+  // so the script's .env lookup finds this flock's TARGET_REPO_PATH.
+  const SHARED_ROOT = flockbotsRoot();
+  const INSTANCE_HOME = flockbotsHome();
 
   // Fire off an incremental graphify rebuild in the background so the next
   // task's agents get a fresh graph. Runs as its own claude -p session via the
   // build script; we don't await it — pipeline continues immediately.
   try {
     const { spawn } = await import('child_process');
-    const kgProc = spawn('bash', [join(PROJECT_ROOT, 'scripts/build-knowledge-graph.sh'), 'incremental'], {
-      cwd: PROJECT_ROOT,
+    const kgProc = spawn('bash', [join(SHARED_ROOT, 'scripts/build-knowledge-graph.sh'), 'incremental'], {
+      cwd: INSTANCE_HOME,
       detached: true,
       stdio: 'ignore',
       env: { ...process.env },

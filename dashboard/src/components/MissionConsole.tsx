@@ -483,8 +483,6 @@ export function MissionConsole() {
             <div><div className="mc-brand-name">FLOCKBOTS</div></div>
           </div>
 
-          <InstanceSwitcher />
-
           <div className="mc-uptime">
             <span className="label">HEARTBEAT</span>
             <div className="mc-uptime-bar">
@@ -494,6 +492,8 @@ export function MissionConsole() {
               {heartbeatAgeMs == null ? '—' : heartbeatText}
             </span>
           </div>
+
+          <InstanceSwitcher />
 
           <div className={`mc-chrome-status ${systemStatus.status}`}>
             <span className="dot" />

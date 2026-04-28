@@ -6,15 +6,13 @@ import { syncToSupabase } from './supabase-sync';
 let linearClient: LinearClient | null = null;
 
 export function initLinear(): void {
+  // Silent on opt-out. index.ts prints the canonical startup line
+  // (`linear · not configured · SKIP`) via progressLine — duplicating it
+  // here at warn level just littered pm2's error log when the user
+  // chose not to enable Linear.
   const apiKey = process.env.LINEAR_API_KEY;
-  if (!apiKey) {
-    console.warn('Linear API key not configured — sync disabled');
-    return;
-  }
-  if (!process.env.LINEAR_TEAM_ID) {
-    console.warn('LINEAR_TEAM_ID not set — Linear sync disabled');
-    return;
-  }
+  if (!apiKey) return;
+  if (!process.env.LINEAR_TEAM_ID) return;
   linearClient = new LinearClient({ apiKey });
 }
 
