@@ -26,6 +26,13 @@ export async function createWorktree(taskId: string): Promise<string> {
   await git.raw(['worktree', 'prune']).catch(() => {});
   try { await git.branch(['-D', branchName]); } catch {}
 
+  // Bootstrap empty repo: a brand-new GitHub repo has no branches at all,
+  // so `git fetch origin <staging>` fails with "couldn't find remote ref".
+  // Detect that case and seed origin/<staging> with an initial commit so
+  // the rest of the pipeline can proceed normally. Idempotent — only fires
+  // when the remote actually has zero branches.
+  await ensureRemoteStagingExists(git, taskId);
+
   // Fetch latest staging without checking it out (avoids mutating main repo HEAD)
   await git.fetch('origin', GITHUB_STAGING_BRANCH);
 
@@ -34,6 +41,58 @@ export async function createWorktree(taskId: string): Promise<string> {
 
   logEvent(taskId, 'system', 'worktree_created', `Worktree at ${worktreePath}, branch ${branchName}`);
   return worktreePath;
+}
+
+/**
+ * Make sure `origin/<staging>` exists. If the remote has zero branches
+ * (brand-new GitHub repo, no commits) we create an initial empty commit
+ * locally and push it as the staging branch so subsequent worktrees can
+ * branch from it. If the remote has SOME branches but not staging, we
+ * push our local HEAD as staging.
+ *
+ * No-op when origin/<staging> already exists (the common path).
+ */
+async function ensureRemoteStagingExists(git: SimpleGit, taskId: string): Promise<void> {
+  const stagingRef = await git.raw(['ls-remote', '--heads', 'origin', GITHUB_STAGING_BRANCH]).catch(() => '');
+  if (stagingRef.trim().length > 0) return; // staging already exists on remote
+
+  // Check whether the remote is COMPLETELY empty (no branches at all)
+  // vs has-branches-but-no-staging. Different recovery paths.
+  const allRefs = await git.raw(['ls-remote', '--heads', 'origin']).catch(() => '');
+  const isEmptyRemote = allRefs.trim().length === 0;
+
+  // Make sure we have at least one local commit. A fresh `git clone` of an
+  // empty repo leaves no HEAD; without a commit we have nothing to push.
+  let hasLocalCommit = true;
+  try {
+    await git.raw(['rev-parse', 'HEAD']);
+  } catch {
+    hasLocalCommit = false;
+  }
+  if (!hasLocalCommit) {
+    // Configure committer if needed (for fresh clones with no user.name)
+    try { await git.raw(['config', 'user.email', 'flockbots@example.com']); } catch {}
+    try { await git.raw(['config', 'user.name', 'FlockBots']); } catch {}
+    await git.raw(['commit', '--allow-empty', '-m', 'Initial commit (FlockBots)']);
+    logEvent(taskId, 'system', 'repo_bootstrapped', 'Created initial empty commit on a fresh repo.');
+  }
+
+  // Push HEAD as origin/<staging>. -u sets upstream so future fetches
+  // and rebases find the right ref.
+  try {
+    await git.raw(['push', '-u', 'origin', `HEAD:refs/heads/${GITHUB_STAGING_BRANCH}`]);
+    logEvent(
+      taskId,
+      'system',
+      'remote_staging_seeded',
+      `Pushed HEAD to origin/${GITHUB_STAGING_BRANCH} (was ${isEmptyRemote ? 'empty repo' : 'missing staging branch'}).`,
+    );
+  } catch (err: any) {
+    throw new Error(
+      `Failed to seed origin/${GITHUB_STAGING_BRANCH}: ${err.message}. ` +
+      `Verify the FlockBots Agent GitHub App has push access to your target repo.`,
+    );
+  }
 }
 
 export async function cleanupWorktree(taskId: string): Promise<void> {

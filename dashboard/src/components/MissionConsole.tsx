@@ -437,6 +437,11 @@ export function MissionConsole() {
       (t.qa_status === 'passed' || t.qa_status === 'skipped')
       && ['merged', 'qa_done'].includes(t.status)
     ).length;
+    // QA verified the merge but found regressions. Excludes awaiting_human
+    // (that's its own bucket below — operator has to triage).
+    const failed = tasks.filter((t: any) =>
+      t.qa_status === 'failed' && t.status !== 'awaiting_human'
+    ).length;
     // Tasks that escalated mid-QA — status is awaiting_human but previous_status
     // was a qa_* stage. Surfaced here so the merged bar accounts for them.
     const awaitingHuman = tasks.filter((t: any) => {
@@ -446,7 +451,7 @@ export function MissionConsole() {
         return prev.startsWith('qa_');
       } catch { return false; }
     }).length;
-    return { awaiting, inQA, passed, awaitingHuman, total: awaiting + inQA + passed + awaitingHuman };
+    return { awaiting, inQA, passed, failed, awaitingHuman, total: awaiting + inQA + passed + failed + awaitingHuman };
   }, [tasks]);
 
   // ----- Selected stage detail -----
@@ -814,7 +819,7 @@ function HeatRow({ label, cells }: { label: string; cells: number[] }) {
 }
 
 interface SelectedMeta { stage: typeof PIPELINE_STAGES[number]; count: number; thru: number; barPct: number }
-interface MergedBreakdown { awaiting: number; inQA: number; passed: number; awaitingHuman: number; total: number }
+interface MergedBreakdown { awaiting: number; inQA: number; passed: number; failed: number; awaitingHuman: number; total: number }
 
 // QA segment colors — referenced in the SVG bar, breakdown swatches, kanban
 // dots, and overflow-modal tags. Solid hex so they render identically
@@ -823,6 +828,7 @@ const QA_COLORS = {
   awaiting:      '#ffffff',  // pure white: queued for QA, not started
   inQA:          '#5B8DEF',  // ink blue: actively verifying
   passed:        '#34945C',  // green: shipped-ready (or QA not required)
+  failed:        '#e06a6a',  // red: QA caught a regression, merge needs revert / fix
   awaitingHuman: '#ffb86b',  // orange (matches --warn / escalation banner): stuck in QA, needs human
 };
 
@@ -861,10 +867,12 @@ function PipelineFlow({
             <g key={s.id}>
               <rect x={x - 22} y={y} width={44} height={h} fill="var(--bg-2)" stroke={isSelected ? 'var(--accent)' : 'var(--line-2)'} />
               {isMerged && mergedBreakdown.total > 0 ? (
-                // Stack bottom→top: passed (green) → inQA (blue) → awaiting QA (white) → awaiting human (orange).
+                // Stack bottom→top: passed (green) → failed (red) → inQA (blue) → awaiting QA (white) → awaiting human (orange).
+                // Both terminal QA outcomes (passed, failed) sit at the bottom of the stack; in-flight states above them.
                 // Heights are proportional to each bucket's share of the stage total.
                 (() => {
                   const passedH = fillH * (mergedBreakdown.passed / mergedBreakdown.total);
+                  const failedH = fillH * (mergedBreakdown.failed / mergedBreakdown.total);
                   const inQAH = fillH * (mergedBreakdown.inQA / mergedBreakdown.total);
                   const awaitingH = fillH * (mergedBreakdown.awaiting / mergedBreakdown.total);
                   const awaitingHumanH = fillH * (mergedBreakdown.awaitingHuman / mergedBreakdown.total);
@@ -874,14 +882,17 @@ function PipelineFlow({
                       {passedH > 0 && (
                         <rect x={x - 22} y={baseY - passedH} width={44} height={passedH} fill={QA_COLORS.passed} opacity={isSelected ? 1 : 0.75} />
                       )}
+                      {failedH > 0 && (
+                        <rect x={x - 22} y={baseY - passedH - failedH} width={44} height={failedH} fill={QA_COLORS.failed} opacity={isSelected ? 1 : 0.75} />
+                      )}
                       {inQAH > 0 && (
-                        <rect x={x - 22} y={baseY - passedH - inQAH} width={44} height={inQAH} fill={QA_COLORS.inQA} opacity={isSelected ? 1 : 0.75} />
+                        <rect x={x - 22} y={baseY - passedH - failedH - inQAH} width={44} height={inQAH} fill={QA_COLORS.inQA} opacity={isSelected ? 1 : 0.75} />
                       )}
                       {awaitingH > 0 && (
-                        <rect x={x - 22} y={baseY - passedH - inQAH - awaitingH} width={44} height={awaitingH} fill={QA_COLORS.awaiting} opacity={isSelected ? 1 : 0.75} />
+                        <rect x={x - 22} y={baseY - passedH - failedH - inQAH - awaitingH} width={44} height={awaitingH} fill={QA_COLORS.awaiting} opacity={isSelected ? 1 : 0.75} />
                       )}
                       {awaitingHumanH > 0 && (
-                        <rect x={x - 22} y={baseY - passedH - inQAH - awaitingH - awaitingHumanH} width={44} height={awaitingHumanH} fill={QA_COLORS.awaitingHuman} opacity={isSelected ? 1 : 0.75} />
+                        <rect x={x - 22} y={baseY - passedH - failedH - inQAH - awaitingH - awaitingHumanH} width={44} height={awaitingHumanH} fill={QA_COLORS.awaitingHuman} opacity={isSelected ? 1 : 0.75} />
                       )}
                     </>
                   );
@@ -947,6 +958,11 @@ function PipelineFlow({
               <span className="sw" style={{ background: QA_COLORS.passed }} />
               <span>QA PASSED</span>
               <span className="n">{mergedBreakdown.passed}</span>
+            </div>
+            <div className="mc-pipe-selected-row">
+              <span className="sw" style={{ background: QA_COLORS.failed }} />
+              <span>QA FAILED</span>
+              <span className="n">{mergedBreakdown.failed}</span>
             </div>
             <div className="mc-pipe-selected-row">
               <span className="sw" style={{ background: QA_COLORS.awaitingHuman }} />

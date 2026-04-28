@@ -203,6 +203,78 @@ function computeInitialSpawnTiles(): Vec2[] {
   return tiles;
 }
 
+/**
+ * Snap existing characters to positions consistent with the current
+ * active/waiting sets, *without* the walk-to-desk animation. Used when
+ * the office state is stale relative to the underlying task data —
+ * specifically:
+ *
+ *   - Hard refresh / first data arrival: useTaskPipeline emits an
+ *     intermediate (tasksLoaded=true, tasks=[]) state before the fetch
+ *     resolves, so the initial state was created with an empty active
+ *     set and every agent is at a random idle spawn.
+ *   - Instance switch: engine state carries over from the previous
+ *     instance, but the new instance's active agents should appear at
+ *     their desks immediately, not walk over from wherever the old
+ *     instance left them.
+ *
+ * Idle agents are left in place (so they don't teleport mid-wander).
+ * Stale WORK/WAIT states are dropped to IDLE so the live loop picks
+ * them up naturally.
+ */
+export function snapAgentsToInitialPositions(
+  state: EngineState,
+  activeAgents: Set<string>,
+  waitingAgents: Set<string>,
+): void {
+  const takenWaitSpots = new Set<number>();
+
+  for (const [id, ch] of state.characters) {
+    const isActive = activeAgents.has(id);
+    const isWaiting = waitingAgents.has(id);
+    const deskPos = DESK_POSITIONS[id];
+
+    if (isActive && deskPos) {
+      ch.x = deskPos.x;
+      ch.y = deskPos.y;
+      ch.state = CharState.WORK;
+      ch.dir = WORK_DIRECTIONS[id] ?? Direction.UP;
+      ch.path = [];
+      ch.pathIdx = 0;
+      ch.animFrame = 0;
+      ch.animTimer = 0;
+      ch.blockedTimer = 0;
+      ch.idleSpot = -1;
+      ch.waitSpotIdx = -1;
+    } else if (isWaiting) {
+      const waitSpotIdx = pickUnclaimedWaitSpot(takenWaitSpots);
+      const ws = WAIT_SPOTS[waitSpotIdx];
+      ch.x = ws.x;
+      ch.y = ws.y;
+      ch.state = CharState.WAIT;
+      ch.dir = Direction.DOWN;
+      ch.path = [];
+      ch.pathIdx = 0;
+      ch.animFrame = 0;
+      ch.animTimer = 0;
+      ch.blockedTimer = 0;
+      ch.idleSpot = -1;
+      ch.waitSpotIdx = waitSpotIdx;
+    } else if (ch.state === CharState.WORK || ch.state === CharState.WAIT) {
+      // Stale work/wait state from the previous instance — drop to idle
+      // in place. The live loop will start a wander when idleTimer expires.
+      ch.state = CharState.IDLE;
+      ch.idleTimer = 0;
+      ch.path = [];
+      ch.pathIdx = 0;
+      ch.animFrame = 0;
+      ch.animTimer = 0;
+      ch.waitSpotIdx = -1;
+      ch.idleSpot = -1;
+    }
+  }
+}
+
 export function createInitialState(
   activeAgents?: Set<string>,
   waitingAgents?: Set<string>,
@@ -497,6 +569,26 @@ function pathTo(from: Vec2, to: Vec2): Vec2[] {
   return findPath(from.x, from.y, to.x, to.y, TILE_GRID, TILE_SIZE);
 }
 
+/** Path that routes around the tiles other walking/idling agents currently
+ *  occupy. Used by the corridor-collision recovery in update(): when an
+ *  agent's next step is blocked by a peer, we replan toward the same
+ *  destination treating peers as walls so the agent goes around instead
+ *  of standing still until the peer moves. Seated/waiting agents are
+ *  excluded from blockers — they stay inside furniture footprints, so
+ *  routing around them isn't necessary (and would over-restrict the grid). */
+function pathToAvoidingAgents(from: Vec2, to: Vec2, self: Character, characters: Map<string, Character>): Vec2[] {
+  const blocked = new Set<string>();
+  for (const other of characters.values()) {
+    if (other.id === self.id) continue;
+    if (other.state === CharState.WORK) continue;
+    if (other.state === CharState.WAIT) continue;
+    const col = Math.floor(other.x / TILE_SIZE);
+    const row = Math.floor(other.y / TILE_SIZE);
+    blocked.add(`${col},${row}`);
+  }
+  return findPath(from.x, from.y, to.x, to.y, TILE_GRID, TILE_SIZE, blocked);
+}
+
 function isNearTarget(from: Vec2, to: Vec2): boolean {
   return Math.abs(from.x - to.x) < TILE_SIZE && Math.abs(from.y - to.y) < TILE_SIZE;
 }
@@ -609,10 +701,26 @@ export function updateCharacters(
         continue;
       }
 
-      // Don't step into another agent's personal space. If we'd collide, hold
+      // Don't step into another agent's personal space. On first detection
+      // try to route AROUND the blocker toward the same destination — if a
+      // detour exists, take it immediately. If no detour exists, hold
       // position; if we've been blocked for a while, give up and re-pick a
       // wander target so two walkers don't stand deadlocked in a corridor.
       if (isPathBlockedByAgent(ch, target, characters)) {
+        if (ch.blockedTimer === 0 && ch.path.length > 0) {
+          // First tick blocked: try to find an alternate route to the
+          // destination that goes around the blocker. Same target tile,
+          // same final goal, just a different sequence of moves.
+          const finalDest = ch.path[ch.path.length - 1];
+          const detour = pathToAvoidingAgents(ch, finalDest, ch, characters);
+          if (detour.length > 0) {
+            ch.path = detour;
+            ch.pathIdx = 0;
+            ch.blockedTimer = 0;
+            continue;
+          }
+          // No detour available — fall through to wait.
+        }
         ch.blockedTimer += dt;
         ch.animFrame = 0;
         if (ch.blockedTimer > 2.0) {

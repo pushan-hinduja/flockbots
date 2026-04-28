@@ -968,6 +968,18 @@ button.mc-instance-pill:hover { color: var(--accent); }
   opacity: 1;
   transform: translateY(0);
 }
+/* Top card in a kanban column: flip the tooltip BELOW the dot so it
+ * doesn't clip against the column header. The col-body has
+ * overflow:hidden (needed so cards don't spill past the column height),
+ * and the default upward tooltip on the first card hits that clip. */
+.mc-kanban-col-body > .mc-kanban-card:first-child .mc-qa-dot[data-label]:not([data-label=""])::after {
+  bottom: auto;
+  top: calc(100% + 6px);
+  transform: translateY(-2px);
+}
+.mc-kanban-col-body > .mc-kanban-card:first-child .mc-qa-dot[data-label]:not([data-label=""]):hover::after {
+  transform: translateY(0);
+}
 
 /* Roster */
 .mc-roster {

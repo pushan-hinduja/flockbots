@@ -2,8 +2,9 @@ import { useRef, useEffect, useState } from 'react';
 import type { SystemStatus } from '../hooks/useSystemStatus';
 import { useSubAgents } from '../hooks/useSubAgents';
 import { useAgentCustomizations } from '../hooks/useAgentCustomizations';
+import { useInstance } from '../contexts/InstanceContext';
 import { loadAllSprites } from '../office/sprites';
-import { createInitialState, startGameLoop, updateCharacters, render, isCharacterOccludedByWall, type EngineState } from '../office/engine';
+import { createInitialState, snapAgentsToInitialPositions, startGameLoop, updateCharacters, render, isCharacterOccludedByWall, type EngineState } from '../office/engine';
 import { CANVAS_W, CANVAS_H, DESK_POSITIONS } from '../office/layout';
 import { CharState } from '../office/types';
 
@@ -91,7 +92,6 @@ export function PixelOffice({ tasks, tasksLoaded, systemStatus, onAgentClick, ba
   statusRef.current = systemStatus;
   const tagRefs = useRef<Record<string, HTMLDivElement | null>>({});
   const [loaded, setLoaded] = useState(false);
-  const initRef = useRef(false);
 
   // Active sub-agents (swarm visualization). Render as small pills next to
   // the parent's desk using CSS absolute positioning — no engine integration
@@ -123,23 +123,53 @@ export function PixelOffice({ tasks, tasksLoaded, systemStatus, onAgentClick, ba
   }, [AGENTS, loaded]);
 
 
-  // Initialize engine once tasks have loaded so active agents start at their desks
+  // Initialize engine once tasks have loaded so active agents start at their
+  // desks. Two cases also force a snap-to-initial-positions on existing
+  // state without re-creating it:
+  //   1. Hard refresh race — useTaskPipeline emits (tasksLoaded=true, tasks=[])
+  //      briefly before the fetch resolves, so the very first init may run
+  //      with an empty active set. When real data arrives, we snap.
+  //   2. Instance switch — engine state carries over from the previous
+  //      instance; the new active agents need to appear at their desks
+  //      immediately, not walk over from the old positions.
+  // Live transitions (a task starts mid-session in the SAME instance with
+  // populated data) bypass this and flow through the game loop's normal
+  // walk-to-desk animation.
+  const { selectedInstance } = useInstance();
+  const lastSnapKeyRef = useRef<string>('');
   useEffect(() => {
-    if (!tasksLoaded || initRef.current) return;
-    initRef.current = true;
+    if (!tasksLoaded) return;
 
     const { active, waiting } = getAgentSets(tasks);
-    const state = createInitialState(active, waiting);
-    stateRef.current = state;
+    const dataPresent = active.size > 0 || waiting.size > 0;
 
-    loadAllSprites().then((sprites) => {
-      state.sprites = sprites;
-      setLoaded(true);
-    }).catch(err => {
-      console.error('Failed to load sprites:', err);
-      setLoaded(true); // Still show with fallback colors
-    });
-  }, [tasksLoaded, tasks]);
+    if (!stateRef.current) {
+      // First-ever init for this mount.
+      const state = createInitialState(active, waiting);
+      stateRef.current = state;
+      lastSnapKeyRef.current = `${selectedInstance}|${dataPresent ? 'data' : 'empty'}`;
+
+      loadAllSprites().then((sprites) => {
+        state.sprites = sprites;
+        setLoaded(true);
+      }).catch(err => {
+        console.error('Failed to load sprites:', err);
+        setLoaded(true); // Still show with fallback colors
+      });
+      return;
+    }
+
+    // We already have engine state — snap on instance switch or first-data
+    // arrival, leave alone otherwise so live transitions still animate.
+    const [prevInstance, prevDataMarker] = lastSnapKeyRef.current.split('|');
+    const instanceChanged = prevInstance !== String(selectedInstance);
+    const firstDataForInstance = prevDataMarker === 'empty' && dataPresent;
+
+    if (instanceChanged || firstDataForInstance) {
+      snapAgentsToInitialPositions(stateRef.current, active, waiting);
+      lastSnapKeyRef.current = `${selectedInstance}|${dataPresent ? 'data' : 'empty'}`;
+    }
+  }, [tasksLoaded, tasks, selectedInstance]);
 
   // Game loop
   useEffect(() => {

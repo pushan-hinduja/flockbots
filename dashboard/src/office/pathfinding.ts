@@ -1,11 +1,20 @@
 import type { Vec2, TileType } from './types';
 import { FURNITURE_BLOCKED, SEAT_TILES } from './layout';
 
+/**
+ * BFS pathfinder over the office grid.
+ *
+ * `extraBlocked` lets callers temporarily mark additional tiles (e.g.
+ * tiles currently occupied by other agents) as obstacles so the planner
+ * can find a detour around a blocking peer instead of walking into them.
+ * Pass an empty set or omit for the static-grid case.
+ */
 export function findPath(
   startX: number, startY: number,
   endX: number, endY: number,
   grid: TileType[][],
-  tileSize: number
+  tileSize: number,
+  extraBlocked?: Set<string>
 ): Vec2[] {
   const cols = grid[0].length;
   const rows = grid.length;
@@ -25,6 +34,13 @@ export function findPath(
   const key = (c: number, r: number) => `${c},${r}`;
   const targetKey = key(ec, er);
   const targetIsSeat = SEAT_TILES.has(targetKey);
+  // Caller may have included the destination in extraBlocked when the
+  // destination is itself an agent's tile — that's fine for the start
+  // case (agents stand on blocked seat tiles), but for routing AROUND
+  // peers we never want to filter the destination out.
+  const blockingAgents = extraBlocked && extraBlocked.size > 0
+    ? new Set([...extraBlocked].filter((k) => k !== targetKey))
+    : null;
 
   visited.add(key(sc, sr));
   queue.push({ col: sc, row: sr, path: [] });
@@ -43,6 +59,7 @@ export function findPath(
       if (visited.has(k)) continue;
       if (grid[nr][nc] === 1) continue; // Wall
       if (FURNITURE_BLOCKED.has(k) && !(targetIsSeat && k === targetKey)) continue; // Furniture
+      if (blockingAgents && blockingAgents.has(k)) continue; // Other agent
 
       visited.add(k);
       const newPath = [...current.path, { col: nc, row: nr }];
