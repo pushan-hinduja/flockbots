@@ -76,21 +76,23 @@ export async function pickInstanceFlow(p: ClackModule): Promise<InstancePickerRe
 }
 
 /**
- * Prompt for a slug for a new instance. Defaults from `owner-repo` (or
- * whatever the caller provides). Validates [a-z0-9-]{2,32}, no leading/
- * trailing hyphen, uniqueness against existing slugs.
+ * Prompt for a slug for a new instance. Defaults to `flock-N` where N is
+ * the next free integer — short, friendly, and avoids leaking the GitHub
+ * owner/repo into a path users see often. The `defaultFrom` arg is kept
+ * for callers that want to override (currently unused). Validates
+ * [a-z0-9-]{2,32}, no leading/trailing hyphen, uniqueness.
  */
 export async function askNewInstanceSlug(
   p: ClackModule,
   defaultFrom?: string,
 ): Promise<string | null> {
   const existing = new Set(listInstanceSlugs());
-  const initialValue = defaultFrom ? slugify(defaultFrom) : '';
+  const initialValue = defaultFrom ? slugify(defaultFrom) : nextFlockSlug(existing);
 
   const slug = await p.text({
     message: 'Slug for this instance (lowercase letters, digits, hyphens; 2–32 chars):',
     initialValue,
-    placeholder: 'e.g. acme-app',
+    placeholder: 'e.g. flock-1',
     validate: (v) => {
       const t = v.trim();
       if (!t) return 'Required';
@@ -102,6 +104,17 @@ export async function askNewInstanceSlug(
   });
   if (p.isCancel(slug)) return null;
   return (slug as string).trim();
+}
+
+/**
+ * Pick the next free `flock-N` — counts from existing.size + 1, but
+ * iterates if a removed-and-re-added slug leaves a hole (e.g. flock-2
+ * exists but flock-1 was removed).
+ */
+function nextFlockSlug(existing: Set<string>): string {
+  let n = existing.size + 1;
+  while (existing.has(`flock-${n}`)) n += 1;
+  return `flock-${n}`;
 }
 
 /**

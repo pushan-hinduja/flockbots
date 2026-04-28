@@ -19,12 +19,17 @@ type ClackModule = typeof import('@clack/prompts');
 export async function runDashboardDeploy(args: string[] = []): Promise<void> {
   const { instanceId } = extractInstanceFlag(args);
   const root = flockbotsRoot();
-  if (listInstanceSlugs().length === 0) {
+  const slugs = listInstanceSlugs();
+  if (slugs.length === 0) {
     console.error(`No FlockBots instances at ${join(root, 'instances')}. Run \`flockbots init\` first.`);
     process.exit(1);
   }
 
-  loadEnvFile(instanceId);
+  // SUPABASE_URL + SUPABASE_ANON_KEY are shared across every instance by
+  // design (one dashboard reads one project), so any instance's .env works.
+  // Default to the first slug when -i isn't given to spare multi-flock users
+  // a redundant flag.
+  loadEnvFile(instanceId || slugs[0]);
   const supabaseUrl = process.env.SUPABASE_URL;
   const anonKey = process.env.SUPABASE_ANON_KEY;
 
@@ -147,7 +152,7 @@ function buildVercelImportUrl(): string {
     'project-name':   'flockbots-dashboard',
     'root-directory': 'dashboard',
     'env':            'VITE_SUPABASE_URL,VITE_SUPABASE_ANON_KEY',
-    'envDescription': 'Copy these from your Supabase project — Settings → API Keys → Legacy tab',
+    'envDescription': 'Copy these from your Supabase project (Settings -> API Keys -> Legacy tab)',
     'envLink':        'https://supabase.com/dashboard',
   });
   return `https://vercel.com/new/clone?${params.toString()}`;

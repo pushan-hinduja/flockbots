@@ -320,12 +320,9 @@ export async function runWizard(): Promise<void> {
       );
       return cancelAndExit(p);
     }
-    const slug = await askNewInstanceSlug(
-      p,
-      config.githubOwner && config.githubRepo
-        ? `${config.githubOwner}-${config.githubRepo}`
-        : undefined,
-    );
+    // Default to flock-N — owner/repo can leak into shell paths and pm2 app
+    // names that users see daily; a short slug keeps those tidy.
+    const slug = await askNewInstanceSlug(p);
     if (!slug) return cancelAndExit(p);
     instanceSlug = slug;
     instanceHome = join(instancesDir(), slug);
@@ -1729,18 +1726,28 @@ async function writeConfig(
   }
 
   // Side-effect: re-apply Supabase migration only when supabase or
-  // dashboard-admin was touched this run. In reconfigure mode this avoids
-  // forcing the user through another PAT prompt when they only came here
-  // to change a Telegram token or similar. Vercel deploys live in the
-  // separate `flockbots dashboard deploy` / `flockbots webhook deploy`
-  // commands as of v1.0.3 — see the next-steps note for the full set.
+  // dashboard-admin was touched this run AND no sibling already runs
+  // against the same Supabase URL. Two skip cases:
+  //   1. Reconfigure that didn't touch Supabase (e.g., rotating a Telegram
+  //      token) — sectionsToRun won't include 'supabase'.
+  //   2. Adding instance N>=2 — Supabase + dashboard-admin sections process
+  //      via silent reuse from the first instance, so they're "touched" in
+  //      bookkeeping even though the user never saw a prompt. Migration was
+  //      applied during that first instance's setup; running it again would
+  //      ask the user to paste it for nothing.
   if (c.supabaseUrl) {
     const supabaseTouched = touched.has('supabase') || touched.has('dashboard-admin');
-    if (supabaseTouched) {
+    const siblingWithSameSupabase = readSiblingSupabaseValues(instanceSlug);
+    const alreadyAppliedBySibling = siblingWithSameSupabase?.url === c.supabaseUrl;
+    if (supabaseTouched && !alreadyAppliedBySibling) {
       const admin = c.dashboardAdminEmail && c.dashboardAdminPassword
         ? { email: c.dashboardAdminEmail, password: c.dashboardAdminPassword }
         : undefined;
       await applySupabaseMigration(p, c.supabaseUrl, root, admin);
+    } else if (supabaseTouched && alreadyAppliedBySibling) {
+      p.log.info(
+        `Supabase schema already applied during instance '${siblingWithSameSupabase!.fromSlug}' setup — skipping.`
+      );
     }
   }
 

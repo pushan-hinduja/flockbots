@@ -27,10 +27,19 @@ UPDATE_FLAG=""
 if [ "$MODE" = "incremental" ]; then UPDATE_FLAG=" --update"; fi
 
 # Resolve the install root from the script's own location so `.env` is found
-# regardless of which directory the user invoked the script from.
+# regardless of which directory the user invoked the script from. As of v1.1
+# the per-instance .env lives at <root>/instances/<slug>/.env — caller must
+# export FLOCKBOTS_INSTANCE_ID before invoking this script (the wizard +
+# `flockbots kg build` both do). FLOCKBOTS_HOME may also be set explicitly;
+# fall back to the script's parent dir for the dev/source-tree case.
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-RESOLVED_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
-ENV_FILE="$RESOLVED_ROOT/.env"
+RESOLVED_ROOT="${FLOCKBOTS_HOME:-$(cd "$SCRIPT_DIR/.." && pwd)}"
+if [ -n "$FLOCKBOTS_INSTANCE_ID" ]; then
+  ENV_FILE="$RESOLVED_ROOT/instances/$FLOCKBOTS_INSTANCE_ID/.env"
+else
+  # Legacy single-instance path (v1.0.x). v1.1 callers always set the id.
+  ENV_FILE="$RESOLVED_ROOT/.env"
+fi
 
 # Parse .env manually — safer than `source` which can fail on quoted values
 # or unusual syntax. Skip blank lines and comments. Strip surrounding quotes
