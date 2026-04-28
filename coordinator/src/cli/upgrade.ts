@@ -5,6 +5,34 @@ import { flockbotsRoot, instancesDir, listInstanceSlugs } from '../paths';
 import { ensureSkillsFromTemplate } from './skills-sync';
 import { isVercelLinked } from './vercel-cli';
 
+/** Run a command async with a Promise — lets the caller's spinner animate. */
+function runAsync(
+  cmd: string,
+  args: string[],
+  opts: { cwd?: string; timeoutMs?: number } = {},
+): Promise<{ code: number | null; output: string }> {
+  return new Promise((resolve) => {
+    const proc = spawn(cmd, args, {
+      cwd: opts.cwd,
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    let output = '';
+    proc.stdout?.on('data', (c: Buffer) => { output += c.toString('utf-8'); });
+    proc.stderr?.on('data', (c: Buffer) => { output += c.toString('utf-8'); });
+    const timer = opts.timeoutMs
+      ? setTimeout(() => proc.kill('SIGTERM'), opts.timeoutMs)
+      : null;
+    proc.on('exit', (code) => {
+      if (timer) clearTimeout(timer);
+      resolve({ code, output });
+    });
+    proc.on('error', (err) => {
+      if (timer) clearTimeout(timer);
+      resolve({ code: 1, output: output + '\n' + err.message });
+    });
+  });
+}
+
 /**
  * `flockbots upgrade` — pulls latest from origin, rebuilds the coordinator,
  * and restarts via pm2 if any instances are running. Refuses to run with a
@@ -24,17 +52,16 @@ export async function runUpgrade(): Promise<void> {
   }
 
   const spin = p.spinner();
-  spin.start('Fetching latest');
-  try {
-    execSync('git fetch --depth 1 origin', { cwd: home, stdio: 'ignore' });
-  } catch (err: any) {
+  spin.start('Fetching latest from origin');
+  const fetched = await runAsync('git', ['fetch', '--depth', '1', 'origin'], { cwd: home, timeoutMs: 60_000 });
+  if (fetched.code !== 0) {
     spin.stop('Fetch failed');
-    p.log.error(err.message);
+    p.log.error(fetched.output.split('\n').slice(-5).join('\n') || 'git fetch returned non-zero');
     return;
   }
-  spin.stop('Fetched');
+  spin.stop('Fetched latest from origin');
 
-  // Detect current branch
+  // Detect current branch (fast — execSync is fine here, no spinner active)
   let branch = 'main';
   try {
     branch = execSync('git rev-parse --abbrev-ref HEAD', { cwd: home, encoding: 'utf-8' }).trim() || 'main';
@@ -47,14 +74,16 @@ export async function runUpgrade(): Promise<void> {
   // (skills/) is gitignored, so this check should mostly only catch
   // accidental edits to shipped files — but it's still the right default.
   // Let the user stash or commit, then re-run.
+  spin.start('Checking for local changes');
   let dirty = '';
   try {
     dirty = execSync('git status --porcelain', { cwd: home, encoding: 'utf-8' }).trim();
   } catch {
-    // If `git status` itself fails we don't have a safe picture; bail out.
-    p.log.error('Could not read git status — aborting upgrade to avoid data loss.');
+    spin.stop('Could not read git status');
+    p.log.error('Aborting upgrade to avoid data loss.');
     return;
   }
+  spin.stop('Working tree checked');
   if (dirty) {
     p.log.error('Uncommitted local changes detected — upgrade would overwrite them:');
     p.log.message(dirty.split('\n').map(l => '  ' + l).join('\n'));
@@ -65,35 +94,32 @@ export async function runUpgrade(): Promise<void> {
     return;
   }
 
-  spin.start(`Resetting to origin/${branch}`);
-  try {
-    execSync(`git reset --hard origin/${branch}`, { cwd: home, stdio: 'ignore' });
-  } catch (err: any) {
+  spin.start(`Resetting source to origin/${branch}`);
+  const reset = await runAsync('git', ['reset', '--hard', `origin/${branch}`], { cwd: home, timeoutMs: 30_000 });
+  if (reset.code !== 0) {
     spin.stop('Reset failed');
-    p.log.error(err.message);
+    p.log.error(reset.output.split('\n').slice(-5).join('\n') || 'git reset returned non-zero');
     return;
   }
   spin.stop('Source updated');
 
-  spin.start('Installing coordinator dependencies');
-  try {
-    execSync('npm ci --silent', { cwd: join(home, 'coordinator'), stdio: 'ignore' });
-  } catch (err: any) {
+  spin.start('Installing coordinator dependencies (npm ci)');
+  const npmCi = await runAsync('npm', ['ci', '--silent'], { cwd: join(home, 'coordinator'), timeoutMs: 180_000 });
+  if (npmCi.code !== 0) {
     spin.stop('npm ci failed');
-    p.log.error(err.message);
+    p.log.error(npmCi.output.split('\n').slice(-10).join('\n') || 'npm ci returned non-zero');
     return;
   }
   spin.stop('Dependencies installed');
 
-  spin.start('Building coordinator');
-  try {
-    execSync('npm run build --silent', { cwd: join(home, 'coordinator'), stdio: 'ignore' });
-  } catch (err: any) {
+  spin.start('Building coordinator (tsc)');
+  const build = await runAsync('npm', ['run', 'build', '--silent'], { cwd: join(home, 'coordinator'), timeoutMs: 120_000 });
+  if (build.code !== 0) {
     spin.stop('Build failed');
-    p.log.error(err.message);
+    p.log.error(build.output.split('\n').slice(-10).join('\n') || 'tsc returned non-zero');
     return;
   }
-  spin.stop('Built');
+  spin.stop('Coordinator built');
 
   // Propagate new skill templates (if any shipped this release) into each
   // instance's active skills/ dir. Existing user-edited files are skipped.
@@ -103,31 +129,34 @@ export async function runUpgrade(): Promise<void> {
   if (slugs.length === 0) {
     p.log.info('No instances configured yet — run `flockbots init` to create one.');
   } else {
+    spin.start(`Syncing skill templates across ${slugs.length} flock${slugs.length === 1 ? '' : 's'}`);
     let totalCopied = 0;
+    const updates: string[] = [];
     for (const slug of slugs) {
       try {
+        spin.message(`Syncing skills for ${slug}`);
         const instanceHome = join(instancesDir(), slug);
         const { copied } = ensureSkillsFromTemplate(instanceHome, home);
         if (copied.length > 0) {
-          p.log.info(`[${slug}] added ${copied.length} new skill file${copied.length === 1 ? '' : 's'}:`);
-          for (const f of copied.slice(0, 10)) p.log.message(`  + skills/${f}`);
-          if (copied.length > 10) p.log.message(`  (+ ${copied.length - 10} more)`);
+          updates.push(`[${slug}] added ${copied.length} new skill file${copied.length === 1 ? '' : 's'}`);
           totalCopied += copied.length;
         }
       } catch (err: any) {
-        p.log.warn(`[${slug}] skills sync skipped: ${err?.message || String(err)}`);
+        updates.push(`[${slug}] skills sync skipped: ${err?.message || String(err)}`);
       }
     }
-    if (totalCopied === 0) p.log.info('Skills already up to date.');
+    spin.stop(totalCopied === 0 ? 'Skills already up to date' : `Synced ${totalCopied} new skill file${totalCopied === 1 ? '' : 's'}`);
+    for (const line of updates) p.log.info(line);
   }
 
-  // Try pm2 restart — matches every flockbots:<slug> app via regex. Silent
-  // failure if pm2 isn't running anything.
-  try {
-    execSync('pm2 restart /^flockbots:/', { stdio: 'ignore' });
-    p.log.success('pm2 restart /^flockbots:/ — coordinator(s) restarted');
-  } catch {
-    p.log.info('pm2 restart skipped (not running). Restart FlockBots manually.');
+  // Try pm2 restart — matches every flockbots:<slug> app via regex.
+  spin.start('Restarting pm2 processes');
+  const pm2 = await runAsync('pm2', ['restart', '/^flockbots:/'], { timeoutMs: 30_000 });
+  if (pm2.code === 0) {
+    spin.stop('pm2 processes restarted');
+  } else {
+    spin.stop('pm2 restart skipped (daemon not running)');
+    p.log.info('Start FlockBots manually with `pm2 start ecosystem.config.js`.');
   }
 
   // Redeploy linked Vercel projects so dashboard + relay advance in lockstep
@@ -137,20 +166,17 @@ export async function runUpgrade(): Promise<void> {
   for (const subdir of ['dashboard', 'webhook-relay']) {
     const dir = join(home, subdir);
     if (existsSync(dir) && isVercelLinked(dir)) {
-      const spin = p.spinner();
-      spin.start(`Redeploying ${subdir} to Vercel`);
-      const ok = await new Promise<boolean>((resolve) => {
-        const proc = spawn('npx', ['--yes', 'vercel', '--prod', '--yes'], {
-          cwd: dir, stdio: ['ignore', 'pipe', 'pipe'],
-        });
-        let out = '';
-        proc.stdout?.on('data', (c: Buffer) => { out += c.toString('utf-8'); });
-        proc.stderr?.on('data', (c: Buffer) => { out += c.toString('utf-8'); });
-        proc.on('exit', (code) => resolve(code === 0));
-        proc.on('error', () => resolve(false));
+      const vercelSpin = p.spinner();
+      vercelSpin.start(`Redeploying ${subdir} to Vercel`);
+      const result = await runAsync('npx', ['--yes', 'vercel', '--prod', '--yes'], {
+        cwd: dir,
+        timeoutMs: 300_000,
       });
-      if (ok) spin.stop(`${subdir} redeployed`);
-      else spin.stop(`${subdir} redeploy failed — re-run \`flockbots ${subdir === 'dashboard' ? 'dashboard' : 'webhook'} deploy\` to retry`);
+      if (result.code === 0) {
+        vercelSpin.stop(`${subdir} redeployed`);
+      } else {
+        vercelSpin.stop(`${subdir} redeploy failed — re-run \`flockbots ${subdir === 'dashboard' ? 'dashboard' : 'webhook'} deploy\` to retry`);
+      }
     }
   }
 

@@ -21,6 +21,12 @@ export class TelegramProvider implements ChatProvider {
   private chatId: string;
   private offset = 0;
   private running = false;
+  // Track consecutive poll failures so we can suppress the noise from
+  // routine network blips (Telegram's long-poll endpoint sometimes returns
+  // ECONNRESET / ENOTFOUND / fetch failed for a single cycle, then
+  // recovers on the next). We only escalate to error once a streak is
+  // long enough to be a real outage.
+  private consecutivePollErrors = 0;
 
   constructor() {
     this.token = process.env.TELEGRAM_BOT_TOKEN || '';
@@ -110,41 +116,59 @@ export class TelegramProvider implements ChatProvider {
 
   private async pollLoop(onMessage: IncomingHandler): Promise<void> {
     while (this.running) {
+      let succeeded = false;
       try {
         const url = `${this.endpoint('getUpdates')}?offset=${this.offset}&timeout=${LONG_POLL_TIMEOUT_S}&allowed_updates=%5B%22message%22%5D`;
         const res = await fetch(url);
-        if (!res.ok) {
-          console.error(`[telegram] getUpdates failed: ${res.status}`);
-          await sleep(POLL_BACKOFF_MS);
-          continue;
-        }
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
         const data = await res.json() as {
           result?: Array<{
             update_id: number;
             message?: { chat: { id: number }; text?: string; from?: { id: number } };
           }>;
         };
-        if (!data.result || data.result.length === 0) continue;
+        succeeded = true;
 
-        for (const update of data.result) {
-          this.offset = update.update_id + 1;
-          const msg = update.message;
-          if (!msg?.text) continue;
-          // Only respond to messages in the configured chat
-          if (String(msg.chat.id) !== this.chatId) continue;
-          const text = msg.text.trim();
-          if (!text) continue;
-          try { logConversationMessage('in', text); } catch {}
-          try {
-            const reply = await onMessage(this.chatId, text);
-            if (reply) await this.send(reply);
-          } catch (err: any) {
-            console.error('[telegram] message handler error:', err.message);
+        if (data.result && data.result.length > 0) {
+          for (const update of data.result) {
+            this.offset = update.update_id + 1;
+            const msg = update.message;
+            if (!msg?.text) continue;
+            // Only respond to messages in the configured chat
+            if (String(msg.chat.id) !== this.chatId) continue;
+            const text = msg.text.trim();
+            if (!text) continue;
+            try { logConversationMessage('in', text); } catch {}
+            try {
+              const reply = await onMessage(this.chatId, text);
+              if (reply) await this.send(reply);
+            } catch (err: any) {
+              console.error('[telegram] message handler error:', err.message);
+            }
           }
+          this.persistOffset();
         }
-        this.persistOffset();
       } catch (err: any) {
-        console.error('[telegram] poll error:', err.message);
+        this.consecutivePollErrors += 1;
+        // Threshold-based logging: surface the first failure once at info
+        // level, then go silent, then escalate to error if the streak
+        // continues. Single-cycle network blips appear once in out.log
+        // and never reach pm2's error.log at all.
+        if (this.consecutivePollErrors === 1) {
+          console.log(`[telegram] poll error (transient): ${err.message}`);
+        } else if (this.consecutivePollErrors === 5) {
+          console.error(`[telegram] poll error: 5 consecutive failures, last: ${err.message}`);
+        } else if (this.consecutivePollErrors % 30 === 0) {
+          console.error(`[telegram] poll error: ${this.consecutivePollErrors} consecutive failures, last: ${err.message}`);
+        }
+      }
+
+      if (succeeded) {
+        if (this.consecutivePollErrors >= 5) {
+          console.log(`[telegram] poll recovered after ${this.consecutivePollErrors} failed attempts`);
+        }
+        this.consecutivePollErrors = 0;
+      } else {
         await sleep(POLL_BACKOFF_MS);
       }
     }

@@ -503,11 +503,68 @@ export async function runWizard(): Promise<void> {
     await offerKgBuild(p);
   }
 
+  // pm2 env reload after a reconfigure that changed env vars. `pm2 restart
+  // <name> --update-env` doesn't actually re-read the .env file via
+  // ecosystem.config.js (it merges the env block pm2 cached at first
+  // start), so a coordinator that was already running keeps its old env
+  // — and the user's fresh QA_STAGING_BASE_URL / Telegram token / etc.
+  // never take effect. Delete+start forces ecosystem.config.js to
+  // re-evaluate, which re-runs our loadEnv on the freshly-written .env.
+  if (mode === 'reconfigure' && instanceSlug && pm2HasInstance(instanceSlug)) {
+    const restart = await p.confirm({
+      message: `Restart pm2 for '${instanceSlug}' so the new config takes effect?`,
+      initialValue: true,
+    });
+    if (!p.isCancel(restart) && restart) {
+      const restartSpin = p.spinner();
+      restartSpin.start(`Restarting flockbots:${instanceSlug} with fresh env`);
+      const ok = pm2RestartWithFreshEnv(root, instanceSlug);
+      restartSpin.stop(ok ? `flockbots:${instanceSlug} restarted` : `Restart failed — run manually: pm2 delete flockbots:${instanceSlug} && pm2 start ${join(root, 'ecosystem.config.js')} --only flockbots:${instanceSlug}`);
+    }
+  }
+
   // Per-instance state — stamp this instance's state.json so the next
   // reconfigure can show "last reconfigured" hints.
   try { updateState(instanceHome, { lastReconfiguredAt: new Date().toISOString() }); } catch { /* best effort */ }
 
   p.outro('FlockBots configured. Run `flockbots doctor` to verify, then start the coordinator.');
+}
+
+/**
+ * Check pm2's running list for `flockbots:<slug>`. Returns false on any
+ * pm2 daemon error (offline, missing, etc.) — the right behavior when
+ * we're deciding whether to OFFER a restart.
+ */
+function pm2HasInstance(slug: string): boolean {
+  try {
+    const out = execSync('pm2 jlist', {
+      encoding: 'utf-8',
+      stdio: ['ignore', 'pipe', 'ignore'],
+      timeout: 5_000,
+    });
+    const apps = JSON.parse(out) as Array<{ name?: string }>;
+    return apps.some((a) => a.name === `flockbots:${slug}`);
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Force pm2 to re-evaluate ecosystem.config.js for one instance — delete
+ * the running app, then start with --only so just that slug spins up
+ * with fresh env from the freshly-written .env.
+ */
+function pm2RestartWithFreshEnv(root: string, slug: string): boolean {
+  const ecosystem = join(root, 'ecosystem.config.js');
+  try {
+    execSync(`pm2 delete flockbots:${slug}`, { stdio: 'ignore' });
+  } catch { /* might not exist; proceed */ }
+  try {
+    execSync(`pm2 start ${JSON.stringify(ecosystem)} --only flockbots:${slug}`, { stdio: 'ignore' });
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 /**
