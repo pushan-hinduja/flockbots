@@ -16,6 +16,7 @@ import { updateLinearIssue, createLinearIssue, enrichLinearIssue } from './linea
 import { validatePmOutput, validateUxOutput, validateDevOutput, validateReviewerOutput, validateQAOutput, buildValidationRetryPrompt } from './output-validator';
 import { rebaseOnStaging } from './worktree-manager';
 import { flockbotsHome, flockbotsRoot, tasksDir } from './paths';
+import { runDesignStage, runWireframesRendering, runDesignValidation } from './design-pipeline';
 
 const TARGET_REPO_PATH = process.env.TARGET_REPO_PATH || '';
 const TASKS_DIR = tasksDir();
@@ -29,7 +30,7 @@ const STALE_LOCK_MS = 65 * 60 * 1000; // 65 minutes
 
 function agentForStatus(status: string): string {
   switch (status) {
-    case 'inbox': case 'researching': case 'design_review':
+    case 'inbox': case 'researching': case 'design_validation':
       return 'pm';
     case 'design_pending': case 'designing':
       return 'ux';
@@ -39,6 +40,11 @@ function agentForStatus(status: string): string {
       return 'reviewer';
     case 'qa_pending': case 'qa_running':
       return 'qa';
+    // Coordinator-only stages (no agent invocation): wireframe rendering and
+    // the human-approval wait. Returned as themselves so concurrency locks
+    // don't grab an agent slot for them.
+    case 'wireframes_rendering': case 'awaiting_design_approval':
+      return status;
     default:
       return status;
   }
@@ -83,7 +89,9 @@ const STATUS_LABELS: Record<string, string> = {
   researching: 'Research started',
   design_pending: 'Queued for design',
   designing: 'Design started',
-  design_review: 'Design under review',
+  wireframes_rendering: 'Rendering wireframes',
+  design_validation: 'Validating wireframes against requirements',
+  awaiting_design_approval: 'Waiting for human design approval',
   dev_ready: 'Ready for development',
   developing: 'Development started',
   testing: 'Running tests',
@@ -99,7 +107,7 @@ const STATUS_LABELS: Record<string, string> = {
   awaiting_human: 'Waiting for human input',
 };
 
-async function updateStatus(taskId: string, status: string): Promise<void> {
+export async function updateStatus(taskId: string, status: string): Promise<void> {
   db.prepare('UPDATE tasks SET status = ?, updated_at = ? WHERE id = ?')
     .run(status, Date.now(), taskId);
   logEvent(taskId, 'system', 'status_change', STATUS_LABELS[status] || `Status: ${status}`);
@@ -149,7 +157,7 @@ function extractEscalation(taskId: string): string {
   return questions.length > 0 ? questions.join('\n') : '';
 }
 
-async function handleEscalation(task: Task, result: SessionResult, customMessage?: string): Promise<void> {
+export async function handleEscalation(task: Task, result: SessionResult, customMessage?: string): Promise<void> {
   let question = customMessage || extractEscalation(task.id);
 
   // If still no specific question, build a rich fallback with context + recent output
@@ -195,7 +203,7 @@ async function handleFailure(task: Task, result: SessionResult): Promise<void> {
   await notifyOperator(`Task failed: ${task.title}\n${result.output.slice(0, 500)}`);
 }
 
-async function handleAgentResult(task: Task, result: SessionResult): Promise<void> {
+export async function handleAgentResult(task: Task, result: SessionResult): Promise<void> {
   switch (result.status) {
     case 'questions_pending':
     case 'escalate':
@@ -386,97 +394,11 @@ async function runResearchStage(task: Task): Promise<void> {
   }
 }
 
-async function runDesignStage(task: Task): Promise<void> {
-  if (!canRunAgent('claude-sonnet-4-6', 'S')) return;
-
-  // If resuming after an answered escalation, inject the answer as context
-  const escalation = db.prepare(
-    "SELECT answer FROM escalations WHERE task_id = ? AND status = 'answered' ORDER BY answered_at DESC LIMIT 1"
-  ).get(task.id) as { answer: string } | undefined;
-  const isResume = !!escalation?.answer;
-  const answerContext = isResume
-    ? `\n\nHUMAN ANSWER TO YOUR QUESTION(S):\n${escalation.answer}\n\nContinue your design with this information. The questions.md file has been cleared since they are now answered. Only create a new questions.md if you have GENUINELY NEW questions.`
-    : '';
-
-  // Clear old questions.md so resumed session doesn't see stale questions
-  if (isResume) {
-    const questionsPath = join(TASKS_DIR, task.id, 'questions.md');
-    if (fileExists(questionsPath)) {
-      try { rmSync(questionsPath); } catch {}
-    }
-  }
-
-  const result = await runAgentWithRetry({
-    agent: 'ux',
-    taskId: task.id,
-    model: 'claude-sonnet-4-6',
-    tools: AGENT_DEFAULTS.ux.tools,
-    cwd: TARGET_REPO_PATH,
-    resume: isResume, // Resume UX's session if continuing after an escalation answer
-    extraPromptContext: answerContext || undefined,
-    enableStreaming: true,
-  }, 3);
-
-  if (isResume && result.status !== 'questions_pending' && result.status !== 'escalate') {
-    consumeAnsweredEscalations(task.id);
-  }
-
-  if (result.status === 'complete') {
-    await updateStatus(task.id, 'design_review');
-  } else {
-    await handleAgentResult(task, result);
-  }
-}
-
-async function runDesignReview(task: Task): Promise<void> {
-  if (!canRunAgent('claude-sonnet-4-6', 'S')) return;
-
-  // If resuming after an answered escalation, inject the answer as context
-  const escalation = db.prepare(
-    "SELECT answer FROM escalations WHERE task_id = ? AND status = 'answered' ORDER BY answered_at DESC LIMIT 1"
-  ).get(task.id) as { answer: string } | undefined;
-  const isResume = !!escalation?.answer;
-  const basePrompt = 'You are reviewing the UX design spec. Read design-spec.md and write your handoff decision to context.json.';
-  const extraContext = isResume
-    ? `${basePrompt}\n\nHUMAN ANSWER TO YOUR QUESTION(S):\n${escalation.answer}\n\nContinue your review with this information. The questions.md file has been cleared since they are now answered. Only create a new questions.md if you have GENUINELY NEW questions.`
-    : basePrompt;
-
-  // Clear old questions.md so resumed session doesn't see stale questions
-  if (isResume) {
-    const questionsPath = join(TASKS_DIR, task.id, 'questions.md');
-    if (fileExists(questionsPath)) {
-      try { rmSync(questionsPath); } catch {}
-    }
-  }
-
-  const result = await runAgentWithRetry({
-    agent: 'pm',
-    taskId: task.id,
-    model: 'claude-sonnet-4-6',
-    tools: ['Read', 'Write'],
-    resume: isResume,
-    extraPromptContext: extraContext,
-    cwd: TARGET_REPO_PATH,
-    enableStreaming: true,
-  }, 3);
-
-  if (isResume && result.status !== 'questions_pending' && result.status !== 'escalate') {
-    consumeAnsweredEscalations(task.id);
-  }
-
-  if (result.status === 'complete') {
-    const ctx = readJSON(join(TASKS_DIR, task.id, 'context.json'));
-    if (ctx.handoff?.HANDOFF_READY === true) {
-      logEvent(task.id, 'pm', 'design_approved', 'Design approved, ready for development');
-      await updateStatus(task.id, 'dev_ready');
-    } else {
-      logEvent(task.id, 'pm', 'design_revision', 'Design needs revision, sending back to designer');
-      await updateStatus(task.id, 'design_pending');
-    }
-  } else {
-    await handleAgentResult(task, result);
-  }
-}
+// Design-pipeline stages (designing → wireframes_rendering → design_validation)
+// live in their own module to keep pipeline.ts closer to the project's
+// <500-line guideline. See design-pipeline.ts for the circular-import
+// notes — it lazy-imports updateStatus / handleAgentResult / handleEscalation
+// from this file so the cycle is resolved at call time.
 
 /**
  * Resume dev agent on a task that was escalated and answered by a human.
@@ -1230,6 +1152,11 @@ async function runQAStage(task: Task): Promise<void> {
   const passed = /QA Report\s*[—-]\s*PASS/i.test(report);
   const failed = /QA Report\s*[—-]\s*FAIL/i.test(report);
 
+  // Visual drift handling runs on BOTH pass and fail paths since drift is a
+  // side-channel report independent of functional pass/fail. Drift_major
+  // items spawn their own child task.
+  await processVisualDrift(task);
+
   if (passed) {
     logEvent(task.id, 'qa', 'qa_passed', `QA verification passed for ${task.title}`);
     db.prepare("UPDATE tasks SET qa_status = 'passed' WHERE id = ?").run(task.id);
@@ -1261,6 +1188,87 @@ async function runQAStage(task: Task): Promise<void> {
     .run(Date.now(), Date.now(), task.id);
   await updateStatus(task.id, 'merged');
   cleanupQAArtifacts(task.id);
+}
+
+/**
+ * Read tasks/<id>/qa-visual-report.json (if QA wrote one) and spawn a single
+ * "Design drift" follow-up task covering all `drift_major` screens. Minor
+ * drift is recorded in the event log but doesn't spawn anything.
+ *
+ * Drift handling is intentionally decoupled from the parent task's
+ * pass/fail: visual fidelity is a soft check and shouldn't reopen a feature
+ * that functionally works.
+ */
+async function processVisualDrift(task: Task): Promise<void> {
+  const reportPath = join(TASKS_DIR, task.id, 'qa-visual-report.json');
+  if (!fileExists(reportPath)) return;
+
+  let report: any;
+  try {
+    report = readJSON(reportPath);
+  } catch (err: any) {
+    logEvent(task.id, 'qa', 'visual_report_unreadable', err?.message || 'unknown');
+    return;
+  }
+
+  const screens: any[] = Array.isArray(report?.screens) ? report.screens : [];
+  if (screens.length === 0) return;
+
+  const major = screens.filter(s => s?.verdict === 'drift_major');
+  const minor = screens.filter(s => s?.verdict === 'drift_minor');
+  const matched = screens.filter(s => s?.verdict === 'match');
+
+  logEvent(task.id, 'qa', 'visual_summary',
+    `match=${matched.length} drift_minor=${minor.length} drift_major=${major.length}`);
+
+  if (major.length > 0) {
+    await createDesignDriftTask(task, major);
+  }
+}
+
+/**
+ * Spawn a child task tracking visual drift between the merged implementation
+ * and the originally-approved wireframes. Mirrors createQAFixTask shape so
+ * the dashboard + chat surfaces handle both child types identically.
+ */
+async function createDesignDriftTask(parent: Task, drifts: any[]): Promise<void> {
+  const { createTask } = await import('./queue');
+  const { randomUUID } = await import('crypto');
+  const newId = randomUUID().slice(0, 8);
+
+  const lines: string[] = [
+    `Visual drift detected against the approved wireframes after merging task ${parent.id}.`,
+    '',
+    `${drifts.length} screen${drifts.length === 1 ? '' : 's'} flagged as drift_major. The functional QA check itself passed (or was independently logged as failed); these are visual-fidelity issues only.`,
+    '',
+    '## Drifted screens',
+    '',
+  ];
+  for (const d of drifts) {
+    const id = d?.id || '(unknown)';
+    const vp = d?.viewport ? ` (${d.viewport})` : '';
+    lines.push(`### ${id}${vp}`);
+    if (d?.notes) lines.push(d.notes);
+    if (d?.wireframe_path) lines.push(`- Wireframe: ${d.wireframe_path}`);
+    if (d?.live_screenshot_path) lines.push(`- Live: ${d.live_screenshot_path}`);
+    lines.push('');
+  }
+  lines.push(`Original PR: ${parent.pr_url || '(none)'}`);
+  lines.push(`Read full visual report at tasks/${parent.id}/qa-visual-report.json before coding.`);
+
+  createTask(
+    newId,
+    `Design drift: ${parent.title}`,
+    lines.join('\n'),
+    'qa-auto',
+    undefined,
+    parent.priority,
+  );
+  db.prepare('UPDATE tasks SET parent_task_id = ?, updated_at = ? WHERE id = ?')
+    .run(parent.id, Date.now(), newId);
+  await syncToSupabase('task_update', { id: newId });
+  logEvent(newId, 'system', 'design_drift_task',
+    `Auto-created design-drift task for parent ${parent.id} covering ${drifts.length} screen(s)`);
 }
 
 /**
@@ -1338,7 +1346,8 @@ async function createQAFixTask(parent: Task, failure: any): Promise<void> {
 
 async function notifyOperatorQAPass(task: Task, ctx: any): Promise<void> {
   const screenshot = ctx?.qa_result?.screenshot_path;
-  const msg = `QA passed ✓\n${task.title}\nPR: ${task.pr_url || '(none)'}`;
+  const childBlock = summarizeChildTasks(task.id);
+  const msg = `QA passed ✓\n${task.title}\nPR: ${task.pr_url || '(none)'}` + childBlock;
   if (screenshot) {
     const { notifyOperatorMedia } = await import('./notifier');
     const url = await uploadQAMedia(task.id, screenshot);
@@ -1351,14 +1360,14 @@ async function notifyOperatorQAPass(task: Task, ctx: any): Promise<void> {
 }
 
 async function notifyOperatorQAFail(task: Task, failure: any): Promise<void> {
+  const childBlock = summarizeChildTasks(task.id);
   const msg = [
     `QA failed ✗`,
     task.title,
     `Step: ${failure.failing_step || '(unknown)'}`,
     `Expected: ${failure.expected || '(unknown)'}`,
     `Actual: ${failure.actual || '(unknown)'}`,
-    `Auto-created fix task is in the queue.`,
-  ].join('\n');
+  ].join('\n') + childBlock;
   if (failure.screenshot_path) {
     const { notifyOperatorMedia } = await import('./notifier');
     const url = await uploadQAMedia(task.id, failure.screenshot_path);
@@ -1371,64 +1380,82 @@ async function notifyOperatorQAFail(task: Task, failure: any): Promise<void> {
 }
 
 /**
+ * List child tasks spawned by QA on this run (regression fixes + design
+ * drift). Returns a leading-newline-prefixed block ready to append to
+ * pass/fail messages, or an empty string when no children exist.
+ */
+function summarizeChildTasks(parentId: string): string {
+  const children = db.prepare(`
+    SELECT id, title FROM tasks
+    WHERE parent_task_id = ?
+    ORDER BY created_at DESC
+  `).all(parentId) as Array<{ id: string; title: string }>;
+
+  if (children.length === 0) return '';
+
+  const lines = [
+    '',
+    '',
+    `📋 QA created ${children.length} follow-up task${children.length === 1 ? '' : 's'}:`,
+  ];
+  for (const c of children) {
+    lines.push(`  • ${c.id} — ${c.title}`);
+  }
+  return lines.join('\n');
+}
+
+/**
  * Upload a QA screenshot/recording to Supabase Storage and return a
- * short-lived signed URL for WhatsApp media embedding.
+ * short-lived signed URL for WhatsApp media embedding. Wraps the shared
+ * `uploadTaskMedia` helper with QA-specific path resolution: the QA agent
+ * may emit relative or absolute paths, so we probe a few candidates before
+ * giving up.
  */
 async function uploadQAMedia(taskId: string, localPath: string): Promise<string | null> {
+  // The QA agent runs with cwd=TARGET_REPO_PATH and the prompt may emit
+  // relative paths like "tasks/<id>/qa-screenshots/step-3.png", which
+  // resolves under the user's target repo. The agent may also use an
+  // absolute path. Try every reasonable candidate so we find the file
+  // regardless of which convention the agent picked this run.
+  const candidates = localPath.startsWith('/')
+    ? [localPath]
+    : [
+        join(flockbotsHome(), localPath),
+        TARGET_REPO_PATH ? join(TARGET_REPO_PATH, localPath) : '',
+      ].filter(Boolean);
+  const fullPath = candidates.find(p => fileExists(p));
+  if (!fullPath) {
+    logEvent(taskId, 'qa', 'media_missing', `Screenshot not found at any of: ${candidates.join(', ')}`);
+    return null;
+  }
+
+  // Prefix by instance so two instances generating the same 8-char taskId
+  // never overwrite each other's QA artifacts.
+  const inst = process.env.FLOCKBOTS_INSTANCE_ID;
+  if (!inst) {
+    logEvent(taskId, 'qa', 'media_skipped', 'FLOCKBOTS_INSTANCE_ID not set');
+    return null;
+  }
+
+  let buffer: Buffer;
   try {
-    const { getSupabaseClient } = await import('./supabase-sync');
-    const supabase = getSupabaseClient();
-    if (!supabase) return null;
-
-    const bucket = process.env.SUPABASE_STORAGE_BUCKET_QA || 'qa-media';
-    // The QA agent runs with cwd=TARGET_REPO_PATH and the prompt may emit
-    // relative paths like "tasks/<id>/qa-screenshots/step-3.png", which
-    // resolves under the user's target repo. The agent may also use an
-    // absolute path. Try every reasonable candidate so we find the file
-    // regardless of which convention the agent picked this run.
-    const candidates = localPath.startsWith('/')
-      ? [localPath]
-      : [
-          join(flockbotsHome(), localPath),
-          TARGET_REPO_PATH ? join(TARGET_REPO_PATH, localPath) : '',
-        ].filter(Boolean);
-    const fullPath = candidates.find(p => fileExists(p));
-    if (!fullPath) {
-      logEvent(taskId, 'qa', 'media_missing', `Screenshot not found at any of: ${candidates.join(', ')}`);
-      return null;
-    }
-
-    // Prefix by instance so two instances generating the same 8-char taskId
-    // never overwrite each other's QA artifacts.
-    const inst = process.env.FLOCKBOTS_INSTANCE_ID;
-    if (!inst) {
-      logEvent(taskId, 'qa', 'media_skipped', 'FLOCKBOTS_INSTANCE_ID not set');
-      return null;
-    }
-    const key = `${inst}/${taskId}/${Date.now()}-${localPath.split('/').pop()}`;
-    const buffer = readFileSync(fullPath);
-    const contentType = localPath.endsWith('.webm') ? 'video/webm' : 'image/png';
-
-    const { error: uploadErr } = await supabase.storage.from(bucket).upload(key, buffer, {
-      contentType, upsert: false,
-    });
-    if (uploadErr) {
-      logEvent(taskId, 'qa', 'media_upload_failed', uploadErr.message);
-      return null;
-    }
-
-    const { data: signed, error: signErr } = await supabase.storage
-      .from(bucket)
-      .createSignedUrl(key, 7 * 24 * 60 * 60); // 7 days
-    if (signErr || !signed?.signedUrl) {
-      logEvent(taskId, 'qa', 'media_sign_failed', signErr?.message || 'no signedUrl');
-      return null;
-    }
-    return signed.signedUrl;
+    buffer = readFileSync(fullPath);
   } catch (err: any) {
     logEvent(taskId, 'qa', 'media_error', err.message);
     return null;
   }
+
+  const { uploadTaskMedia } = await import('./task-media-upload');
+  const url = await uploadTaskMedia({
+    bucket: process.env.SUPABASE_STORAGE_BUCKET_QA || 'qa-media',
+    key: `${inst}/${taskId}/${Date.now()}-${localPath.split('/').pop()}`,
+    buffer,
+    contentType: localPath.endsWith('.webm') ? 'video/webm' : 'image/png',
+  });
+  if (url === null) {
+    logEvent(taskId, 'qa', 'media_upload_failed', 'upload or sign failed (Supabase missing or rejected)');
+  }
+  return url;
 }
 
 // --- Post-Merge Knowledge Update ---
@@ -1520,17 +1547,19 @@ function getNextPendingStage(): Task | null {
   return db.prepare(`
     SELECT * FROM tasks
     WHERE status IN ('inbox', 'researching', 'design_pending', 'designing',
-                     'design_review', 'developing', 'review_pending', 'reviewing')
+                     'wireframes_rendering', 'design_validation',
+                     'developing', 'review_pending', 'reviewing')
     ORDER BY
       CASE status
         WHEN 'reviewing' THEN 1
         WHEN 'review_pending' THEN 2
         WHEN 'developing' THEN 3
-        WHEN 'design_review' THEN 4
-        WHEN 'designing' THEN 5
-        WHEN 'design_pending' THEN 6
-        WHEN 'researching' THEN 7
-        WHEN 'inbox' THEN 8
+        WHEN 'design_validation' THEN 4
+        WHEN 'wireframes_rendering' THEN 5
+        WHEN 'designing' THEN 6
+        WHEN 'design_pending' THEN 7
+        WHEN 'researching' THEN 8
+        WHEN 'inbox' THEN 9
       END,
       priority ASC,
       created_at ASC
@@ -1554,8 +1583,11 @@ async function processTaskStage(task: Task): Promise<void> {
     case 'designing':
       await runDesignStage(task);
       break;
-    case 'design_review':
-      await runDesignReview(task);
+    case 'wireframes_rendering':
+      await runWireframesRendering(task);
+      break;
+    case 'design_validation':
+      await runDesignValidation(task);
       break;
     case 'developing':
       await resumeDevWithContext(task);
@@ -1588,7 +1620,8 @@ export async function processNextTask(): Promise<void> {
   const pendingTasks = db.prepare(`
     SELECT * FROM tasks
     WHERE status IN ('inbox', 'researching', 'design_pending', 'designing',
-                     'design_review', 'developing', 'review_pending', 'reviewing',
+                     'wireframes_rendering', 'design_validation',
+                     'developing', 'review_pending', 'reviewing',
                      'qa_pending', 'qa_running')
       AND NOT (status = 'qa_pending' AND qa_ready_at IS NOT NULL AND qa_ready_at > ?)
     ORDER BY
@@ -1596,13 +1629,14 @@ export async function processNextTask(): Promise<void> {
         WHEN 'reviewing' THEN 1
         WHEN 'review_pending' THEN 2
         WHEN 'developing' THEN 3
-        WHEN 'design_review' THEN 4
-        WHEN 'designing' THEN 5
-        WHEN 'design_pending' THEN 6
-        WHEN 'researching' THEN 7
-        WHEN 'inbox' THEN 8
-        WHEN 'qa_running' THEN 9
-        WHEN 'qa_pending' THEN 10
+        WHEN 'design_validation' THEN 4
+        WHEN 'wireframes_rendering' THEN 5
+        WHEN 'designing' THEN 6
+        WHEN 'design_pending' THEN 7
+        WHEN 'researching' THEN 8
+        WHEN 'inbox' THEN 9
+        WHEN 'qa_running' THEN 10
+        WHEN 'qa_pending' THEN 11
       END,
       priority ASC,
       created_at ASC
@@ -1788,4 +1822,4 @@ export async function deployToProduction(): Promise<string> {
   }
 }
 
-export { updateStatus, handleEscalation, handleFailure, isLocked };
+export { handleFailure, isLocked };

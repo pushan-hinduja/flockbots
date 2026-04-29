@@ -23,7 +23,10 @@ const PIPELINE_STAGES = [
   { id: 'inbox',        name: 'INBOX',       statuses: ['inbox'] },
   { id: 'researching',  name: 'RESEARCH',    statuses: ['researching'] },
   { id: 'designing',    name: 'DESIGN',      statuses: ['designing', 'design_pending'] },
-  { id: 'design_review',name: 'REVIEW·DES',  statuses: ['design_review'] },
+  // VALIDATION bundles the post-design steps before dev: rendering wireframes,
+  // PM validation against requirements, and the human approval wait. They're
+  // visually one "between design and ready" slot.
+  { id: 'design_validation', name: 'REVIEW·DES', statuses: ['wireframes_rendering', 'design_validation', 'awaiting_design_approval'] },
   { id: 'dev_ready',    name: 'READY',       statuses: ['dev_ready'] },
   { id: 'developing',   name: 'DEV',         statuses: ['developing', 'testing'] },
   { id: 'reviewing',    name: 'CODE REVIEW', statuses: ['reviewing', 'review_pending'] },
@@ -42,7 +45,7 @@ type StageId = typeof PIPELINE_STAGES[number]['id'];
 // and flips status to qa_running, at which point Zara goes to her desk.
 const STATUS_TO_AGENT: Record<string, string> = {
   researching: 'pm',
-  design_review: 'pm',
+  design_validation: 'pm',
   designing: 'ux',
   design_pending: 'ux',
   developing: 'dev',
@@ -51,6 +54,9 @@ const STATUS_TO_AGENT: Record<string, string> = {
   review_pending: 'reviewer',
   // Zara handles QA (coordinator agent role is 'qa', dashboard character id is 'test')
   qa_running: 'test',
+  // wireframes_rendering and awaiting_design_approval are intentionally
+  // unmapped — neither has an agent at the desk (one is a coordinator
+  // batch render, the other is waiting on a human reply).
 };
 
 // Which events come from the running system vs. from an agent.
@@ -211,7 +217,7 @@ export function MissionConsole() {
   // stuck). We detect it via error.previous_status, mirroring agentStates.
   const stageCounts = useMemo(() => {
     const out: Record<StageId, number> = {
-      inbox: 0, researching: 0, designing: 0, design_review: 0,
+      inbox: 0, researching: 0, designing: 0, design_validation: 0,
       dev_ready: 0, developing: 0, reviewing: 0, merged: 0,
     };
     for (const stage of PIPELINE_STAGES) {
@@ -242,7 +248,7 @@ export function MissionConsole() {
   const [showDeployedModal, setShowDeployedModal] = useState(false);
 
   const pendingCount = stageCounts.inbox + stageCounts.dev_ready;
-  const runningCount = stageCounts.researching + stageCounts.designing + stageCounts.design_review + stageCounts.developing + stageCounts.reviewing;
+  const runningCount = stageCounts.researching + stageCounts.designing + stageCounts.design_validation + stageCounts.developing + stageCounts.reviewing;
 
   // Agent customizations — merged names + sprite rows with defaults.
   const { agents: AGENTS, byId: agentsById, save: saveAgent } = useAgentCustomizations();

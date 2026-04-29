@@ -5,15 +5,18 @@ interface TaskPipelineProps {
   tasks: any[];
 }
 
-// Stages shown in the timeline view (subset)
+// Stages shown in the timeline view (subset). The post-design coordinator/PM/
+// human steps collapse into a single "design_validation" pillar in the timeline
+// — visually one slot, three internal stages (rendering, PM check, human gate).
 const PIPELINE_STAGES = [
-  'inbox', 'researching', 'designing', 'design_review',
+  'inbox', 'researching', 'designing', 'design_validation',
   'dev_ready', 'developing', 'reviewing', 'merged',
 ];
 
 // Full ordering of all possible task statuses, used for revert eligibility checks
 const FULL_STAGE_ORDER = [
-  'inbox', 'researching', 'design_pending', 'designing', 'design_review',
+  'inbox', 'researching', 'design_pending', 'designing',
+  'wireframes_rendering', 'design_validation', 'awaiting_design_approval',
   'dev_ready', 'developing', 'testing', 'review_pending', 'reviewing', 'merged',
 ];
 
@@ -21,8 +24,10 @@ const STAGE_LABELS: Record<string, string> = {
   inbox: 'Inbox',
   researching: 'Research',
   designing: 'Design',
-  design_review: 'Review Design',
   design_pending: 'Design',
+  wireframes_rendering: 'Render',
+  design_validation: 'Review Design',
+  awaiting_design_approval: 'Approval',
   dev_ready: 'Ready',
   developing: 'Dev',
   reviewing: 'Code Review',

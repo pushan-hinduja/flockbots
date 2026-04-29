@@ -72,7 +72,7 @@ export async function dismissTask(taskId: string): Promise<string> {
  * Move a task back to a previous pipeline stage.
  * Tasks can only move backward, never forward. Merged tasks cannot be reverted.
  */
-const STAGE_ORDER = ['inbox', 'researching', 'design_pending', 'designing', 'design_review', 'dev_ready', 'developing', 'testing', 'review_pending', 'reviewing'];
+const STAGE_ORDER = ['inbox', 'researching', 'design_pending', 'designing', 'wireframes_rendering', 'design_validation', 'awaiting_design_approval', 'dev_ready', 'developing', 'testing', 'review_pending', 'reviewing'];
 
 export async function revertTaskStage(taskId: string, targetStatus: string): Promise<string> {
   const task = db.prepare('SELECT * FROM tasks WHERE id = ?').get(taskId) as any;

@@ -157,10 +157,53 @@ Responsibilities:
    Write to context.json under "design_brief":
    { userGoal, affectedScreens, affectedComponents, constraints, successCriteria }
 
-6. DEV HANDOFF (status: design_review)
-   After UX completes, review design-spec.md.
-   Write "HANDOFF_READY: true" or "HANDOFF_READY: false" + feedback
-   to context.json under "handoff".
+6. DESIGN VALIDATION (status: design_validation)
+   After the designer produces wireframes, validate them against the
+   functional requirements you wrote earlier. This is a requirements check,
+   not a design critique — the human approves or rejects the visuals later.
+   You are checking only that nothing functional is missing.
+
+   Steps:
+   a. Read tasks/{TASK_ID}/wireframes/index.json to get the screen list.
+   b. Read each screen's `description` field — that's the designer's stated
+      intent for the screen. Optionally Read the rendered PNGs at the paths
+      listed in the index for visual confirmation.
+   c. Cross-reference against context.json#research.summary, context.json
+      #design_brief.successCriteria, and any explicit requirements from the
+      task description.
+   d. For each requirement, decide present / missing / unclear.
+
+   Output to context.json#design:
+   {
+     "validation_round": <integer, current round>,
+     "handoff": "approved" | "revise",
+     "missing_requirements": ["<requirement>", ...]   // only if handoff = revise
+     "open_pm_notes": ["<note>", ...]                 // optional, surfaced to human
+   }
+
+   Routing:
+   - If every requirement is present → handoff: "approved".
+   - If anything is missing or unclear AND validation_round < 2 → handoff:
+     "revise". Write a per-screen feedback file at
+     tasks/{TASK_ID}/validation-feedback.md so the designer can act on it.
+     Designer will re-run; coordinator increments validation_round.
+   - If validation_round >= 2 — do not loop again. Set handoff: "approved",
+     and list the still-open items under open_pm_notes. The human gate
+     surfaces those notes when sending the proofs for approval.
+
+   The validation-feedback.md format mirrors design-feedback.md (used by
+   the human-rework loop) so the designer reads both with the same logic:
+
+   ```
+   ## screen-id-here
+   <one-paragraph feedback>
+
+   ## another-screen-id
+   <feedback>
+
+   ## all
+   <global feedback applying to every screen, optional>
+   ```
 
 7. ANSWER DEV QUESTIONS
    Questions in tasks/{TASK_ID}/questions.md prefixed "DEV_QUESTION:".

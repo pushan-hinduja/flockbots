@@ -4,6 +4,7 @@ import { rollbackTask, deployToProduction } from '../coordinator/src/pipeline';
 import { retryTask, dismissTask } from '../coordinator/src/task-actions';
 import { syncToSupabase } from '../coordinator/src/supabase-sync';
 import { killSession, isSessionRunning } from '../coordinator/src/session-manager';
+import { handleDesignReply } from '../coordinator/src/design-reply-handler';
 import { randomUUID } from 'crypto';
 
 const VALID_EFFORT_LEVELS = ['medium', 'high', 'xhigh', 'max'];
@@ -20,7 +21,7 @@ const MODEL_ALIASES: Record<string, string> = {
 // but inlined to avoid importing internals.
 function agentForTaskStatus(status: string): 'pm' | 'ux' | 'dev' | 'reviewer' | null {
   switch (status) {
-    case 'inbox': case 'researching': case 'design_review': return 'pm';
+    case 'inbox': case 'researching': case 'design_validation': return 'pm';
     case 'design_pending': case 'designing': return 'ux';
     case 'dev_ready': case 'developing': case 'testing': return 'dev';
     case 'review_pending': case 'reviewing': return 'reviewer';
@@ -57,6 +58,7 @@ export async function handleWhatsAppMessage(from: string, text: string): Promise
         '  /retry {id} - Retry a failed task',
         '  /dismiss {id} - Dismiss a failed task',
         '  /answer {id} {text} - Answer an agent escalation',
+        '  /design_reply {id} {text} - Approve / revise wireframes (use "approved" to ship)',
         '',
         'Overrides (apply to current stage; kills + reruns if in-flight)',
         '  /effort {id} {medium|high|xhigh|max}',
@@ -143,6 +145,18 @@ export async function handleWhatsAppMessage(from: string, text: string): Promise
         `Should pause: ${budget.shouldPause ? 'YES' : 'no'}`,
         `Tasks queued: ${queueLine || 'none'}`,
       ].join('\n');
+    }
+
+    case '/design_reply': {
+      const taskId = parts[1];
+      const reply = parts.slice(2).join(' ');
+      if (!taskId || !reply) return 'Usage: /design_reply {task-id} {text}';
+
+      const task = db.prepare('SELECT * FROM tasks WHERE id = ?').get(taskId) as Task | undefined;
+      if (!task) return `Task ${taskId} not found`;
+
+      const result = await handleDesignReply(task, reply);
+      return result.message;
     }
 
     case '/answer': {

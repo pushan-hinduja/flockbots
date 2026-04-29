@@ -100,22 +100,47 @@ export function validatePmOutput(taskId: string): ValidationResult {
 
 /**
  * Validate UX agent output after design phase.
+ *
+ * The designer's output is now high-fidelity HTML wireframes plus an
+ * `index.json` that lists them. We require the index to exist, parse, and
+ * point at ≥1 HTML file that's actually on disk.
  */
 export function validateUxOutput(taskId: string): ValidationResult {
   const errors: string[] = [];
-  const specPath = join(TASKS_DIR, taskId, 'design-spec.md');
+  const wireframesDir = join(TASKS_DIR, taskId, 'wireframes');
+  const indexPath = join(wireframesDir, 'index.json');
 
-  if (!existsSync(specPath)) {
-    errors.push('design-spec.md not created');
+  if (!existsSync(indexPath)) {
+    errors.push('wireframes/index.json not created');
     return { valid: false, errors };
   }
 
-  const content = readFileSync(specPath, 'utf-8');
-  if (!content.includes('STATUS: COMPLETE')) {
-    errors.push('design-spec.md does not contain "STATUS: COMPLETE"');
+  let parsed: any;
+  try {
+    parsed = JSON.parse(readFileSync(indexPath, 'utf-8'));
+  } catch (err: any) {
+    errors.push(`wireframes/index.json failed to parse: ${err.message}`);
+    return { valid: false, errors };
   }
-  if (content.trim().length < 100) {
-    errors.push('design-spec.md appears too short (< 100 chars)');
+
+  if (!parsed || typeof parsed !== 'object' || !Array.isArray(parsed.screens)) {
+    errors.push('wireframes/index.json missing required "screens" array');
+    return { valid: false, errors };
+  }
+
+  if (parsed.screens.length === 0) {
+    errors.push('wireframes/index.json has empty screens list');
+  }
+
+  for (const screen of parsed.screens) {
+    if (!screen?.id || !screen?.file) {
+      errors.push(`screen entry missing id/file: ${JSON.stringify(screen)}`);
+      continue;
+    }
+    const htmlPath = join(wireframesDir, screen.file);
+    if (!existsSync(htmlPath)) {
+      errors.push(`screen "${screen.id}" references missing file: ${screen.file}`);
+    }
   }
 
   if (errors.length > 0) {

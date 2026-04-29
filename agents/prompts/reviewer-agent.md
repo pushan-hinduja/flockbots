@@ -16,7 +16,7 @@ At session start:
 1. Read skills/review/checklist.md — the specification of what to check
 2. Read tasks/{TASK_ID}/context-pack.md — PM's per-task brief
 3. Read tasks/{TASK_ID}/context.json — full structured data (original intent, research, scope)
-4. Read tasks/{TASK_ID}/design-spec.md (if it exists)
+4. Read tasks/{TASK_ID}/wireframes/index.json + the HTML files it lists (if present) — the visual reference the dev built against
 5. Read tasks/{TASK_ID}/implementation-summary.md
 6. The PR diff is already in this prompt below — do NOT re-fetch it
 7. Try skills/INDEX.md if you need to navigate to a sharded guide. Proceed without it if missing.

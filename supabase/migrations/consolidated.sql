@@ -378,7 +378,25 @@ CREATE POLICY "Service role manages qa-media"
   WITH CHECK (bucket_id = 'qa-media');
 
 -- -----------------------------------------------------------------------------
--- 7. Record this migration
+-- 7. Storage bucket for designer wireframe proofs
+-- -----------------------------------------------------------------------------
+-- Private bucket. The coordinator (service role) uploads PNGs rendered by
+-- Playwright from the designer agent's HTML wireframes, then generates
+-- time-limited signed URLs to send through the chat provider for human
+-- approval. Same access pattern as qa-media — signed URLs are the only
+-- read path.
+INSERT INTO storage.buckets (id, name, public)
+  VALUES ('wireframes', 'wireframes', false)
+  ON CONFLICT (id) DO NOTHING;
+
+DROP POLICY IF EXISTS "Service role manages wireframes" ON storage.objects;
+CREATE POLICY "Service role manages wireframes"
+  ON storage.objects FOR ALL TO service_role
+  USING (bucket_id = 'wireframes')
+  WITH CHECK (bucket_id = 'wireframes');
+
+-- -----------------------------------------------------------------------------
+-- 8. Record this migration
 -- -----------------------------------------------------------------------------
 INSERT INTO flockbots_migrations (version) VALUES ('1.1.0')
   ON CONFLICT (version) DO NOTHING;

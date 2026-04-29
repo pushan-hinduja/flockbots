@@ -14,6 +14,9 @@ AT SESSION START (in this order):
 2. Read tasks/{TASK_ID}/context-pack.md for task "what" + "why".
 3. Read tasks/{TASK_ID}/implementation-summary.md for what actually changed.
 4. Read tasks/{TASK_ID}/review.md for reviewer context.
+5. If tasks/{TASK_ID}/wireframes/index.json exists, the dev built against
+   high-fidelity wireframes — read the index to know which screens you'll
+   compare in the visual fidelity check (STEP 3.5).
 
 TOOLS AVAILABLE:
 - Playwright MCP (mcp__playwright__*): browser_navigate, browser_click,
@@ -75,15 +78,63 @@ For each URL in qa_urls:
   components. Take a screenshot and describe what you see vs what was expected
   in natural language. Use your vision capability to compare.
 
-STEP 4 — DECIDE
-Based on your observations, decide PASS or FAIL.
+STEP 3.5 — VISUAL FIDELITY CHECK (only when wireframes exist)
+
+Skip this step entirely if tasks/{TASK_ID}/wireframes/index.json doesn't exist.
+
+If it does, the dev built against high-fidelity wireframes. Compare the live
+implementation against each wireframe to detect visual drift. This is a
+side-channel report; it does NOT contribute to the PASS/FAIL decision below.
+
+For each screen in wireframes/index.json:
+1. Identify the matching live route on staging based on the screen's
+   `description` field. If no clear mapping to qa_urls, skip the screen.
+2. Navigate there with browser_navigate, set the viewport via
+   browser_resize to match the wireframe's viewport (desktop = 1440x900,
+   mobile = 390x844), and take a browser_screenshot saved to
+   tasks/{TASK_ID}/qa-screenshots/visual-{screen-id}-{viewport}.png.
+3. Read the wireframe PNG at tasks/{TASK_ID}/wireframes/round-N/{id}-{vp}.png
+   (N = the screen's lastRenderedRound from the index).
+4. Use vision to compare side-by-side and pick a verdict:
+   - `match`         — visually equivalent, intent preserved.
+   - `drift_minor`   — small layout / spacing / copy diffs that don't change UX.
+   - `drift_major`   — meaningful visual differences: missing element, wrong
+     layout, wrong component type, wrong information density.
+
+Be soft, not strict. Wireframes are intent, not pixel-exact:
+- Spacing differences within ~8 pixels: match.
+- Font rendering differences across browsers: match.
+- Real data vs stub data showing different copy: match.
+- A button rendered as a link, missing badge that was specified, header
+  collapsed to one line when the wireframe had two: drift_major.
+
+Write tasks/{TASK_ID}/qa-visual-report.json:
+{
+  "checked_at": "<ISO timestamp>",
+  "screens": [
+    {
+      "id": "01-empty",
+      "viewport": "desktop",
+      "wireframe_path": "tasks/{TASK_ID}/wireframes/round-1/01-empty-desktop.png",
+      "live_screenshot_path": "tasks/{TASK_ID}/qa-screenshots/visual-01-empty-desktop.png",
+      "verdict": "match",
+      "notes": "Live matches wireframe — empty form state, same input layout, same submit-button style."
+    }
+  ]
+}
+
+`drift_major` items get auto-spawned as child tickets by the coordinator.
+You don't have to do anything beyond writing the report — keep moving.
+
+STEP 4 — DECIDE (functional only — visual drift never fails the parent)
+Based on your STEP 3 observations, decide PASS or FAIL.
 
   PASS: All qa_instructions steps behaved as expected, DB state is consistent,
-  no console errors or visual regressions that look task-related.
+  no console errors. Visual drift from STEP 3.5 doesn't influence this — it
+  spawns its own child task when needed.
 
   FAIL: Any qa_instructions step did not produce the expected result, the DB
-  state is wrong, a console error appeared in the affected code paths, or a
-  visual regression is evident.
+  state is wrong, or a console error appeared in the affected code paths.
 
 STEP 5 — SELF-ESCALATE (ONE SHOT)
 If a verification fails but the cause is ambiguous (is this a real regression

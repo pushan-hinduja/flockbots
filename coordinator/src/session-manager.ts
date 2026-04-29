@@ -119,7 +119,7 @@ export interface SessionResult {
 
 const AGENT_DEFAULTS: Record<string, { tools: string[]; maxTurns: number }> = {
   pm:       { tools: ['Read', 'Write', 'WebSearch', 'WebFetch'], maxTurns: 20 },
-  ux:       { tools: ['Read', 'Write'], maxTurns: 15 },
+  ux:       { tools: ['Read', 'Write'], maxTurns: 30 },
   dev:      { tools: ['Read', 'Write', 'Edit', 'Bash', 'Glob', 'Grep'], maxTurns: 50 },
   reviewer: { tools: ['Read', 'Bash', 'Glob', 'Grep'], maxTurns: 20 },
   // QA: browser automation via Playwright MCP + DB queries via Supabase MCP.
@@ -381,7 +381,7 @@ export async function runAgent(config: AgentConfig): Promise<SessionResult> {
   //   3. Size-derived fallback
   const effortLevel: EffortLevel = config.effortLevel
     || (config.agent === 'pm' ? 'high'
-        : config.agent === 'ux' ? 'medium'
+        : config.agent === 'ux' ? 'high'
         : config.agent === 'qa' ? 'medium'
         : (EFFORT_LEVEL[config.effortSize || 'M'] || 'medium'));
   args.push('--effort', effortLevel);

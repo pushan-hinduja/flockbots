@@ -15,9 +15,12 @@ const STALENESS_TIMEOUT: Record<string, number> = {
 };
 const DEFAULT_TIMEOUT = 60 * 60 * 1000; // 60 min fallback
 
-// Active states that should be progressing
+// Active states that should be progressing. wireframes_rendering and
+// awaiting_design_approval are intentionally excluded — the first is sub-second
+// (Playwright batch render), the second is unbounded (waiting for human
+// reply) and shouldn't trigger a stuck-task alarm.
 const ACTIVE_STATES = [
-  'researching', 'designing', 'design_review',
+  'researching', 'designing', 'design_validation',
   'developing', 'testing', 'reviewing',
 ];
 

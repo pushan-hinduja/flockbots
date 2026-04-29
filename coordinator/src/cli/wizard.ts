@@ -2255,6 +2255,7 @@ function buildEnvContent(c: WizardConfig, root: string, instanceSlug: string): s
       `SUPABASE_ANON_KEY=${c.supabaseAnonKey || ''}`,
       `VITE_SUPABASE_URL=${c.supabaseUrl}`,
       `VITE_SUPABASE_ANON_KEY=${c.supabaseAnonKey || ''}`,
+      'SUPABASE_STORAGE_BUCKET_WIREFRAMES=wireframes',
     );
   } else {
     out.push('SUPABASE_URL=', 'SUPABASE_SERVICE_ROLE_KEY=', 'SUPABASE_ANON_KEY=');

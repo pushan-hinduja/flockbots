@@ -16,7 +16,7 @@ If Read returns a "exceeds maximum allowed tokens" error, switch to Grep.
 At session start:
 1. Read tasks/{TASK_ID}/context-pack.md — your per-task brief from PM. Single source of truth.
 2. Read tasks/{TASK_ID}/context.json
-3. Read tasks/{TASK_ID}/design-spec.md (if this task has a UI component)
+3. If this task has a UI component, read every file under tasks/{TASK_ID}/wireframes/ — the HTML files plus index.json. The HTML wireframes are the normative visual reference: match them faithfully within the design system. Stub data in the wireframes is for visual fidelity only — wire real data sources in your implementation. Conflict between wireframe and design system → design system wins; raise it in questions.md.
 4. Check tasks/{TASK_ID}/progress.md — if it exists, resume from there
 5. Try to read skills/INDEX.md if you need to navigate to a sharded guide beyond what context-pack points to. Proceed without it if missing.
 6. Prefer mcp__graphify__* tools over grep for symbol/import lookups.

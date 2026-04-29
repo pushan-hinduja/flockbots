@@ -1,4 +1,5 @@
 import { execSync, spawnSync } from 'child_process';
+import { existsSync } from 'fs';
 
 export interface PrereqCheck {
   name: string;
@@ -140,5 +141,42 @@ export function runPrereqChecks(): PrereqCheck[] {
     fix: 'Install: npm install -g pm2  (sudo may be needed depending on your npm prefix)',
   });
 
+  // Playwright Chromium — required for wireframe rendering on every install
+  // (not just QA-enabled ones). The browser binary lands in Playwright's
+  // OS-specific cache dir during `npm install` postinstall + the setup.sh
+  // pre-warm. If `chromium-*` is missing, surface it so the user knows to
+  // run `npx playwright install chromium`.
+  const chromium = checkPlaywrightChromium();
+  checks.push({
+    name: 'Playwright Chromium',
+    ok: chromium.ok,
+    detail: chromium.detail,
+    required: true,
+    fix: 'Run: cd coordinator && npx playwright install chromium',
+  });
+
   return checks;
+}
+
+/**
+ * Authoritative Playwright Chromium check. We ask Playwright itself where
+ * its expected binary lives (factors in the installed-package version) and
+ * verify the file exists. Pattern-matching the cache directory is unreliable
+ * because Playwright pins to a specific build number per package version.
+ */
+function checkPlaywrightChromium(): { ok: boolean; detail: string } {
+  try {
+    // eslint-disable-next-line @typescript-eslint/no-var-requires
+    const { chromium } = require('playwright');
+    const p: string = chromium.executablePath();
+    if (existsSync(p)) {
+      // Extract the versioned cache dir name (e.g. "chromium-1217") for a
+      // recognizable detail line — full executable path is too long.
+      const versionTag = p.match(/chromium[-_][^/]+/)?.[0] || 'installed';
+      return { ok: true, detail: versionTag };
+    }
+    return { ok: false, detail: `binary missing (run: npx playwright install chromium)` };
+  } catch (err: any) {
+    return { ok: false, detail: err?.message || 'playwright import failed' };
+  }
 }

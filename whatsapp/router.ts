@@ -243,6 +243,9 @@ AVAILABLE COMMANDS:
 - /queue                                 — List active tasks
 - /budget                                — Rate-limit budget summary
 - /answer {taskId} {text}                — Answer a pending agent escalation
+- /design_reply {taskId} {text}          — Approve or revise wireframes for a task awaiting design approval
+                                          (text "approved" / "yes" / "lgtm" → ship to dev;
+                                          anything else is parsed as per-screen feedback)
 - /retry {taskId}                        — Retry a failed task                      [DESTRUCTIVE]
 - /dismiss {taskId}                      — Dismiss a failed task                    [DESTRUCTIVE]
 - /deploy                                — Merge staging → master                    [DESTRUCTIVE]
@@ -275,6 +278,11 @@ RULES:
    command directly (no confirmation needed) — it just updates the override for the next stage run.
 3. If the operator is clearly answering a pending escalation (e.g. "use OAuth", "keep the sidebar"),
    use /answer {taskId} {text} with the escalation's task ID from state.
+3a. If the operator is replying to a task in "Awaiting design approval" (state lists these
+   under "Awaiting design approval"), use /design_reply {taskId} {text} — pass the operator's
+   FULL reply verbatim as text. The downstream Haiku parser handles approval-vs-feedback
+   classification, so do NOT rewrite or summarize. Pick the design-approval taskId by
+   recency or whichever the operator references.
 4. Pronouns / references ("that task", "the second one") should resolve against the task list in state.
 5. If intent is unclear, set command=null and ask a clarifying question in reply.
 6. Replies are short (1–2 sentences), friendly, not robotic. No emojis.
@@ -298,6 +306,22 @@ async function buildStructuredState(
     for (const e of escalations.slice(0, 10)) {
       const q = (e.question || '').slice(0, 160).replace(/\s+/g, ' ');
       lines.push(`  - task ${e.task_id}: ${q}`);
+    }
+  }
+
+  // Tasks waiting on design approval — operator's reply should route to
+  // /design_reply, not /answer (which is for escalation Q&A).
+  const awaitingDesign = db.prepare(`
+    SELECT id, title FROM tasks
+    WHERE status = 'awaiting_design_approval'
+    ORDER BY updated_at DESC
+    LIMIT 5
+  `).all() as any[];
+  if (awaitingDesign.length > 0) {
+    lines.push('Awaiting design approval (reply with "approved" or describe changes):');
+    for (const t of awaitingDesign) {
+      const title = (t.title || '').slice(0, 80);
+      lines.push(`  - ${t.id} "${title}"`);
     }
   }
 

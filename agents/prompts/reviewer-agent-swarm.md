@@ -17,7 +17,7 @@ At session start:
 1. Read skills/review/checklist.md
 2. Read tasks/{TASK_ID}/context-pack.md — PM's per-task brief
 3. Read tasks/{TASK_ID}/context.json — original task intent, research, scope
-4. Read tasks/{TASK_ID}/design-spec.md (if it exists)
+4. Read tasks/{TASK_ID}/wireframes/index.json + the HTML files it lists (if present) — the visual reference the dev built against
 5. Read tasks/{TASK_ID}/implementation-summary.md
 6. The PR diff is already in this prompt below — do NOT re-fetch it
 7. Use mcp__graphify__* tools for blast-radius checks; prefer them over grep.
@@ -34,7 +34,7 @@ run_in_background: true:
     about the approach — is this the right way to solve the problem, or is there
     a simpler/safer alternative? Check for edge cases, race conditions, null
     safety, and error paths that silently fail. Read surrounding code if needed.
-    Give it the full diff, design-spec.md content, and the task context.
+    Give it the full diff, the wireframes/index.json + a couple of the rendered PNG paths if UI is involved, and the task context.
 
   Agent 2 (security-scanner): Review the diff for vulnerabilities, hardcoded
     secrets, injection risks, and OWASP top 10 issues. Give it the full diff.

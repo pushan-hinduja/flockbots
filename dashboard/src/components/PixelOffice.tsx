@@ -22,19 +22,22 @@ const SUB_AGENT_OFFSETS: Array<{ dx: number; dy: number }> = [
 // post-merge deploy buffer Zara isn't working, so she shouldn't be at her desk.
 // She only goes to her desk once the task transitions to qa_running.
 const STATUS_MAP: Record<string, string> = {
-  researching: 'pm', designing: 'ux', design_review: 'pm', design_pending: 'ux',
+  researching: 'pm', designing: 'ux', design_validation: 'pm', design_pending: 'ux',
   developing: 'dev', testing: 'test', review_pending: 'reviewer', reviewing: 'reviewer',
   qa_running: 'test',
+  // wireframes_rendering and awaiting_design_approval are intentionally absent —
+  // no agent is at their desk for either (coordinator render / human wait).
 };
 const ESCALATION_AGENT_MAP: Record<string, string> = {
-  researching: 'pm', designing: 'ux', design_review: 'pm',
+  researching: 'pm', designing: 'ux', design_validation: 'pm',
   developing: 'dev', testing: 'test', reviewing: 'reviewer',
   qa_pending: 'test', qa_running: 'test',
 };
 const ACTIVITY_LABELS: Record<string, string> = {
-  researching: 'Researching', designing: 'Designing', design_review: 'Reviewing design',
+  researching: 'Researching', designing: 'Designing', design_validation: 'Validating design',
   developing: 'Coding', reviewing: 'Reviewing PR', testing: 'Testing',
   design_pending: 'Starting design', review_pending: 'Opening PR',
+  wireframes_rendering: 'Rendering wireframes', awaiting_design_approval: 'Awaiting design approval',
   qa_running: 'Verifying',
 };
 
