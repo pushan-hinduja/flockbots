@@ -51,6 +51,59 @@ export function dim(text: string): string {
 }
 
 /**
+ * Max width (in columns) for content inside p.note boxes. Matches the
+ * longest line in the welcome box's time-estimate row so the boxes are
+ * visually consistent across the wizard. Applied via help() so every call
+ * site gets it for free.
+ */
+export const NOTE_MAX_WIDTH = 76;
+
+/**
+ * Word-wrap each input line to `maxWidth`. Preserves leading whitespace as
+ * the continuation indent; for "- foo" / "* foo" / "1. foo" list items, the
+ * continuation also pads past the marker so wrapped text aligns with the
+ * first character of the bullet content. Words longer than `maxWidth` (long
+ * URLs, file paths) are emitted on their own line rather than mid-broken.
+ */
+export function wrapText(text: string, maxWidth: number = NOTE_MAX_WIDTH): string {
+  return text
+    .split('\n')
+    .map(line => wrapLine(line, maxWidth))
+    .join('\n');
+}
+
+function wrapLine(line: string, maxWidth: number): string {
+  if (line.length <= maxWidth) return line;
+
+  const m = line.match(/^(\s*)(?:([-*•])\s+|(\d+\.)\s+)?(.*)$/);
+  if (!m) return line;
+  const indent = m[1];
+  const marker = m[2] || m[3] || '';
+  const body = m[4];
+
+  const firstPrefix = marker ? `${indent}${marker} ` : indent;
+  const contPrefix = marker ? indent + ' '.repeat(marker.length + 1) : indent;
+
+  const words = body.split(/\s+/).filter(Boolean);
+  if (words.length === 0) return line;
+
+  const out: string[] = [];
+  let cur = firstPrefix + words[0];
+  for (let i = 1; i < words.length; i++) {
+    const w = words[i];
+    const candidate = cur + ' ' + w;
+    if (candidate.length > maxWidth) {
+      out.push(cur);
+      cur = contPrefix + w;
+    } else {
+      cur = candidate;
+    }
+  }
+  out.push(cur);
+  return out.join('\n');
+}
+
+/**
  * Color helper text with ANSI 8-color cyan (SGR 36) so it's guaranteed to
  * match clack's active-prompt marker — clack uses picocolors' `.cyan` which
  * also emits SGR 36. That way whatever shade the user's terminal theme
@@ -58,12 +111,16 @@ export function dim(text: string): string {
  * the instructional text inside note boxes and the selected-state indicator
  * are the same hue.
  *
+ * Also wraps content to NOTE_MAX_WIDTH so every p.note(help([...])) box has
+ * the same visual width across the wizard.
+ *
  * Applied per-line because clack's note renderer iterates line-by-line to
  * draw the box border, and a single escape at the top of a multi-line
  * string ends up scoped to the first line only.
  */
 export function help(text: string): string {
-  if (!colorEnabled()) return text;
+  const wrapped = wrapText(text);
+  if (!colorEnabled()) return wrapped;
   // \x1b[22m turns off dim/bold. clack's p.note wraps body lines in
   // e.dim(...) (\x1b[2m) which crushes our cyan into a washed-out tone
   // that reads lighter than clack's own ◆ active-prompt marker. Prepending
@@ -71,7 +128,7 @@ export function help(text: string): string {
   // renders at the same brightness as the marker.
   const prefix = '\x1b[22m\x1b[36m';
   const suffix = '\x1b[0m';
-  return text
+  return wrapped
     .split('\n')
     .map(line => (line.length > 0 ? prefix + line + suffix : line))
     .join('\n');

@@ -67,6 +67,11 @@ export interface SiblingApp {
 
 export type ClackModule = typeof import('@clack/prompts');
 
+// Process-scoped flag: once the user confirms they're signed into github.com,
+// don't re-ask within the same wizard run (the wizard creates two apps back-
+// to-back, and the github.com session is shared across both flows).
+let signedInConfirmed = false;
+
 // ---------------------------------------------------------------------------
 // Public entry
 // ---------------------------------------------------------------------------
@@ -190,6 +195,49 @@ export async function createGitHubApp(
 }
 
 /**
+ * Ask the user to confirm they're signed into github.com before we open a
+ * browser flow that requires authentication. If they say no, open the login
+ * page and wait for them to come back. The result is cached at module scope
+ * so we don't re-ask when the wizard creates a second app in the same run.
+ *
+ * GitHub's manifest POST returns a 404 when the user isn't authenticated,
+ * which silently strips the manifest payload — without this pre-flight, the
+ * wizard sits at "Waiting for GitHub to redirect back" forever.
+ */
+async function ensureSignedIn(p: ClackModule): Promise<boolean> {
+  if (signedInConfirmed) return true;
+
+  const status = await p.select({
+    message: 'Are you signed into GitHub on the web (github.com)?',
+    options: [
+      { value: 'yes', label: 'Yes — continue' },
+      { value: 'no',  label: 'No — open github.com to sign in first' },
+    ],
+    initialValue: 'yes',
+  });
+  if (p.isCancel(status)) return false;
+
+  if (status === 'no') {
+    p.note(
+      help([
+        'Opening github.com/login in your browser.',
+        'Sign in, then come back here and confirm.',
+      ].join('\n')),
+      'Sign in to GitHub'
+    );
+    openBrowser('https://github.com/login');
+    const done = await p.confirm({
+      message: 'Done — signed into github.com?',
+      initialValue: true,
+    });
+    if (p.isCancel(done) || !done) return false;
+  }
+
+  signedInConfirmed = true;
+  return true;
+}
+
+/**
  * Walk the user through reusing an existing GitHub App on a new repo.
  * The app already has credentials + a .pem we can copy; the only thing
  * that has to change on github.com is adding `<owner>/<repo>` to the
@@ -247,6 +295,7 @@ async function reuseGitHubApp(
       ].join('\n')),
       'Add new repo to installation'
     );
+    if (!(await ensureSignedIn(p))) return null;
     openBrowser(`https://github.com/settings/installations/${source.installationId}`);
 
     const confirmed = await p.confirm({
@@ -452,25 +501,34 @@ async function runManifestFlow(
       '     jump to GitHub with permissions pre-filled',
       '  2. Review the permissions, click the green "Create GitHub App"',
       '  3. GitHub redirects back here automatically',
+      '',
+      'If you see a 404 page on github.com instead, it means you\'re not',
+      'signed in. Sign in at github.com, then pick "Retry" at the prompt',
+      'below to re-open the link.',
     ].join('\n')),
     'Create the app'
   );
 
+  if (!(await ensureSignedIn(p))) return null;
+
   // Start callback server BEFORE opening browser (race-safe).
   // The server also serves a /start page that POSTs the manifest to GitHub —
   // GitHub's manifest flow requires a POST form, not a GET URL param.
-  const codePromise = awaitManifestCallback(port, state, formAction, manifest, appName);
-  openBrowser(`http://localhost:${port}/start`);
+  const cb = startManifestCallback(port, state, formAction, manifest, appName);
+  const startUrl = `http://localhost:${port}/start`;
+  const openStart = (): void => openBrowser(startUrl);
+  openStart();
 
-  const createSpin = p.spinner();
-  createSpin.start('Waiting for GitHub to redirect back (up to 5 min)');
-  const code = await codePromise;
+  let code: string | null;
+  try {
+    code = await waitForManifestCode(p, cb.codePromise, openStart);
+  } finally {
+    cb.close();
+  }
   if (!code) {
-    createSpin.stop('No callback received');
     p.log.error('GitHub App creation did not complete.');
     return null;
   }
-  createSpin.stop('Callback received');
 
   const exchSpin = p.spinner();
   exchSpin.start('Fetching app credentials from GitHub');
@@ -505,16 +563,15 @@ async function runManifestFlow(
   );
   const installReady = await p.confirm({ message: 'Open the install page?', initialValue: true });
   if (p.isCancel(installReady) || !installReady) return null;
-  openBrowser(`${app.html_url}/installations/new`);
+  const installUrl = `${app.html_url}/installations/new`;
+  const openInstall = (): void => openBrowser(installUrl);
+  openInstall();
 
-  const pollSpin = p.spinner();
-  pollSpin.start('Waiting for you to install the app');
-  const installationId = await pollForInstallation(app.id, app.pem, 5 * 60 * 1000);
+  const installationId = await waitForInstallation(p, app.id, app.pem, openInstall);
   if (!installationId) {
-    pollSpin.stop('Installation not detected within 5 minutes');
+    p.log.error('Installation not detected.');
     return null;
   }
-  pollSpin.stop(`Installation ID: ${installationId}`);
 
   return { appId: app.id, installationId, pemPath, name: app.name };
 }
@@ -795,65 +852,121 @@ function buildErrorPage(title: string, detail: string): string {
 // Callback server
 // ---------------------------------------------------------------------------
 
-function awaitManifestCallback(
+/**
+ * Stand up the local HTTP server that serves /start (auto-POSTs the manifest
+ * to GitHub) and /callback (receives the manifest code from GitHub's redirect).
+ * Returns the codePromise plus an explicit close() so the caller can drive the
+ * wait loop and cancellation.
+ */
+function startManifestCallback(
   port: number,
   expectedState: string,
   formAction: string,
   manifest: Record<string, unknown>,
   appName: string,
-): Promise<string | null> {
-  return new Promise((resolve) => {
-    let settled = false;
-    const server: Server = createServer((req, res) => {
-      if (!req.url) {
-        res.writeHead(400); res.end('bad request');
-        return;
-      }
-      const url = new URL(req.url, `http://localhost:${port}`);
+): { codePromise: Promise<string | null>; close: () => void } {
+  let settled = false;
+  let resolveCode!: (v: string | null) => void;
+  const codePromise = new Promise<string | null>((r) => { resolveCode = r; });
 
-      // /start — serves an auto-submitting HTML form that POSTs the manifest
-      // to GitHub. Required because the manifest flow is POST-only.
-      if (url.pathname === '/start') {
-        const html = buildStartPage(formAction, expectedState, manifest, appName);
-        res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
-        res.end(html);
-        return;
-      }
-
-      if (url.pathname !== '/callback') {
-        res.writeHead(404); res.end('not found');
-        return;
-      }
-      const state = url.searchParams.get('state');
-      const code = url.searchParams.get('code');
-      if (state !== expectedState) {
-        res.writeHead(400, { 'Content-Type': 'text/html; charset=utf-8' });
-        res.end(buildErrorPage('State mismatch', 'The state parameter returned by GitHub did not match. For security, the callback was rejected.'));
-        finish(null);
-        return;
-      }
-      if (!code) {
-        res.writeHead(400, { 'Content-Type': 'text/html; charset=utf-8' });
-        res.end(buildErrorPage('Missing code parameter', 'GitHub redirected back without a code in the URL. Something went wrong mid-flow.'));
-        finish(null);
-        return;
-      }
-      res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
-      res.end(buildSuccessPage(appName));
-      finish(code);
-    });
-    server.listen(port);
-
-    const timeout = setTimeout(() => finish(null), 5 * 60 * 1000);
-
-    function finish(code: string | null): void {
-      if (settled) return;
-      settled = true;
-      clearTimeout(timeout);
-      server.close();
-      resolve(code);
+  const server: Server = createServer((req, res) => {
+    if (!req.url) {
+      res.writeHead(400); res.end('bad request');
+      return;
     }
+    const url = new URL(req.url, `http://localhost:${port}`);
+
+    // /start — serves an auto-submitting HTML form that POSTs the manifest
+    // to GitHub. Required because the manifest flow is POST-only.
+    if (url.pathname === '/start') {
+      const html = buildStartPage(formAction, expectedState, manifest, appName);
+      res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+      res.end(html);
+      return;
+    }
+
+    if (url.pathname !== '/callback') {
+      res.writeHead(404); res.end('not found');
+      return;
+    }
+    const state = url.searchParams.get('state');
+    const code = url.searchParams.get('code');
+    if (state !== expectedState) {
+      res.writeHead(400, { 'Content-Type': 'text/html; charset=utf-8' });
+      res.end(buildErrorPage('State mismatch', 'The state parameter returned by GitHub did not match. For security, the callback was rejected.'));
+      finish(null);
+      return;
+    }
+    if (!code) {
+      res.writeHead(400, { 'Content-Type': 'text/html; charset=utf-8' });
+      res.end(buildErrorPage('Missing code parameter', 'GitHub redirected back without a code in the URL. Something went wrong mid-flow.'));
+      finish(null);
+      return;
+    }
+    res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+    res.end(buildSuccessPage(appName));
+    finish(code);
   });
+  server.listen(port);
+
+  function finish(code: string | null): void {
+    if (settled) return;
+    settled = true;
+    server.close();
+    resolveCode(code);
+  }
+
+  return { codePromise, close: () => finish(null) };
+}
+
+/**
+ * Wait for the manifest callback to arrive, with a periodic prompt that lets
+ * the user re-open the link or cancel. Each interval is 45s; if no callback
+ * arrives the wizard offers wait/retry/cancel and loops until the user picks
+ * one or the code lands.
+ */
+async function waitForManifestCode(
+  p: ClackModule,
+  codePromise: Promise<string | null>,
+  retry: () => void,
+): Promise<string | null> {
+  const intervalMs = 45_000;
+  let firstAttempt = true;
+  // Track whether the callback already landed (possibly while the user is in
+  // the prompt). Without this, picking "retry" after the code arrived would
+  // re-POST the manifest and create a duplicate GitHub App on the user's
+  // account — a real cleanup burden. The next loop iteration's race will
+  // resolve instantly with the existing code.
+  let codeReady = false;
+  void codePromise.then(() => { codeReady = true; });
+
+  while (true) {
+    const spin = p.spinner();
+    spin.start(firstAttempt ? 'Waiting for GitHub to redirect back' : 'Waiting...');
+    const result = await Promise.race([
+      codePromise,
+      sleep(intervalMs).then(() => 'timeout' as const),
+    ]);
+
+    if (result !== 'timeout') {
+      spin.stop(result ? 'Callback received' : 'Callback failed');
+      return result;
+    }
+    spin.stop('No redirect yet');
+
+    const action = await p.select({
+      message: "GitHub hasn't redirected back. What would you like to do?",
+      options: [
+        { value: 'wait',   label: 'Keep waiting (45s more)' },
+        { value: 'retry',  label: 'Re-open the link in browser', hint: 'pick this if you saw a 404 or had to log in' },
+        { value: 'cancel', label: 'Cancel' },
+      ],
+      initialValue: 'wait',
+    });
+    if (p.isCancel(action) || action === 'cancel') return null;
+    if (action === 'retry' && !codeReady) retry();
+    firstAttempt = false;
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -884,12 +997,13 @@ async function exchangeManifestCode(code: string): Promise<ManifestConversionRes
 }
 
 /**
- * Poll GET /app/installations using the app's JWT until the user installs
- * the app on a repo. Returns the first installation's ID, or null on timeout.
+ * Single polling window: GET /app/installations every 3s for `durationMs`,
+ * returning the first installation's ID as soon as it appears. Network errors
+ * are swallowed (keep polling). Returns null on window timeout.
  */
-async function pollForInstallation(appId: number, privateKey: string, timeoutMs: number): Promise<number | null> {
+async function pollInstallationOnce(appId: number, privateKey: string, durationMs: number): Promise<number | null> {
   const auth = createAppAuth({ appId, privateKey });
-  const deadline = Date.now() + timeoutMs;
+  const deadline = Date.now() + durationMs;
   while (Date.now() < deadline) {
     try {
       const appAuth = await auth({ type: 'app' });
@@ -910,6 +1024,47 @@ async function pollForInstallation(appId: number, privateKey: string, timeoutMs:
     await sleep(3000);
   }
   return null;
+}
+
+/**
+ * Poll for the user to install the app, with a periodic prompt that lets the
+ * user re-open the install page or cancel. Each window is 45s; if nothing is
+ * detected the wizard offers wait/retry/cancel and loops until the user picks
+ * one or the install lands.
+ */
+async function waitForInstallation(
+  p: ClackModule,
+  appId: number,
+  privateKey: string,
+  retry: () => void,
+): Promise<number | null> {
+  const intervalMs = 45_000;
+  let firstAttempt = true;
+
+  while (true) {
+    const spin = p.spinner();
+    spin.start(firstAttempt ? 'Waiting for you to install the app' : 'Waiting...');
+    const installId = await pollInstallationOnce(appId, privateKey, intervalMs);
+
+    if (installId !== null) {
+      spin.stop(`Installation ID: ${installId}`);
+      return installId;
+    }
+    spin.stop('Installation not detected yet');
+
+    const action = await p.select({
+      message: "Install not detected yet. What would you like to do?",
+      options: [
+        { value: 'wait',   label: 'Keep waiting (45s more)' },
+        { value: 'retry',  label: 'Re-open the install page', hint: "pick this if the page didn't load" },
+        { value: 'cancel', label: 'Cancel' },
+      ],
+      initialValue: 'wait',
+    });
+    if (p.isCancel(action) || action === 'cancel') return null;
+    if (action === 'retry') retry();
+    firstAttempt = false;
+  }
 }
 
 // ---------------------------------------------------------------------------
