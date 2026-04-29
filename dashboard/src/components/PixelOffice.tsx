@@ -59,6 +59,11 @@ function getAgentSets(tasks: any[]): { active: Set<string>; waiting: Set<string>
       try { prev = JSON.parse(t.error)?.previous_status || ''; } catch {}
       const a = ESCALATION_AGENT_MAP[prev];
       if (a) waiting.add(a); else waiting.add('pm');
+    } else if (t.status === 'awaiting_design_approval') {
+      // Designer is the responsible agent — proofs are sitting waiting for
+      // operator approval. Send Luna to the lounge so the office reflects
+      // the actual blocker (human, not designer).
+      waiting.add('ux');
     } else {
       const a = STATUS_MAP[t.status];
       if (a) active.add(a);

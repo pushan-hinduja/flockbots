@@ -111,8 +111,11 @@ export async function updateStatus(taskId: string, status: string): Promise<void
   db.prepare('UPDATE tasks SET status = ?, updated_at = ? WHERE id = ?')
     .run(status, Date.now(), taskId);
   logEvent(taskId, 'system', 'status_change', STATUS_LABELS[status] || `Status: ${status}`);
-  // Auto-clear pending escalations when task moves past awaiting_human
-  if (status !== 'awaiting_human') {
+  // Auto-clear pending escalations when the task moves past a human-wait
+  // status. awaiting_design_approval also creates an escalation row (so the
+  // dashboard banner surfaces it), so we keep that escalation alive while
+  // the task is in either of these statuses and dismiss it on transition out.
+  if (status !== 'awaiting_human' && status !== 'awaiting_design_approval') {
     dismissEscalationsForTask(taskId);
   }
   await syncToSupabase('task_update', { id: taskId, status });

@@ -262,11 +262,18 @@ export function MissionConsole() {
       const ownedTasks = tasks.filter((t: any) => STATUS_TO_AGENT[t.status] === def.id);
       const activeTask = ownedTasks[0];
       const waitingTasks = tasks.filter((t: any) => {
-        if (t.status !== 'awaiting_human') return false;
-        try {
-          const prev = JSON.parse(t.error || '{}').previous_status;
-          return STATUS_TO_AGENT[prev] === def.id;
-        } catch { return false; }
+        if (t.status === 'awaiting_human') {
+          try {
+            const prev = JSON.parse(t.error || '{}').previous_status;
+            return STATUS_TO_AGENT[prev] === def.id;
+          } catch { return false; }
+        }
+        // Design-approval gates pin the UX agent to the waiting lounge —
+        // proofs are sitting blocked on operator review.
+        if (t.status === 'awaiting_design_approval' && def.id === 'ux') {
+          return true;
+        }
+        return false;
       });
       const isActive = !!activeTask;
       const isWaiting = waitingTasks.length > 0;
@@ -276,7 +283,9 @@ export function MissionConsole() {
       const taskLine = activeTask
         ? activeTask.title
         : isWaiting
-          ? `Awaiting human · ${waitingTasks[0].title}`
+          ? (waitingTasks[0].status === 'awaiting_design_approval'
+              ? `Awaiting design approval · ${waitingTasks[0].title}`
+              : `Awaiting human · ${waitingTasks[0].title}`)
           : 'Idle';
       return { def, status, activeTask, taskLine };
     });
@@ -481,7 +490,13 @@ export function MissionConsole() {
   const handleSignOut = async () => { await supabase.auth.signOut(); };
 
   // ----- Escalations banner (lightweight version) -----
-  const awaitingHuman = tasks.filter((t: any) => t.status === 'awaiting_human');
+  // Both regular escalations and design-approval gates block on a human reply,
+  // so they're counted together in the in-page banner. The cross-instance
+  // EscalationBanner component (rendered by Dashboard.tsx) breaks them out
+  // with per-row context + the right slash-command hint.
+  const awaitingHuman = tasks.filter((t: any) =>
+    t.status === 'awaiting_human' || t.status === 'awaiting_design_approval'
+  );
 
   return (
     <div className="mc-root" data-accent={accent}>

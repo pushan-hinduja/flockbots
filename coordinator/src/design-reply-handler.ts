@@ -13,9 +13,8 @@
 
 import { existsSync, readFileSync, rmSync, writeFileSync } from 'fs';
 import { join } from 'path';
-import { db, Task, logEvent } from './queue';
+import { Task, logEvent } from './queue';
 import { tasksDir } from './paths';
-import { syncToSupabase } from './supabase-sync';
 import { parseDesignFeedback, feedbackToMarkdown, affectedScreenIds } from './design-feedback-parser';
 import type { WireframeIndex } from './wireframe-renderer';
 
@@ -56,6 +55,13 @@ export async function handleDesignReply(task: Task, reply: string): Promise<Desi
 
   const verdict = await parseDesignFeedback(reply, screenContext);
 
+  // updateStatus dismisses the synthesized escalation (created when the task
+  // entered awaiting_design_approval) so the dashboard banner clears
+  // automatically. It also handles the Supabase sync + status_change event.
+  // Lazy-imported to avoid the pipeline.ts ↔ design-pipeline.ts cycle from
+  // surfacing to this module.
+  const { updateStatus } = await import('./pipeline');
+
   if (verdict.approved) {
     // Clean up any leftover feedback file from prior rounds so the next
     // designer run (on a future task or rework cycle) doesn't see stale
@@ -65,10 +71,8 @@ export async function handleDesignReply(task: Task, reply: string): Promise<Desi
       try { rmSync(feedbackPath); } catch { /* best effort */ }
     }
 
-    db.prepare("UPDATE tasks SET status = 'dev_ready', updated_at = ? WHERE id = ?")
-      .run(Date.now(), task.id);
     logEvent(task.id, 'human', 'design_approved', 'Design approved by operator');
-    await syncToSupabase('task_update', { id: task.id, status: 'dev_ready' });
+    await updateStatus(task.id, 'dev_ready');
     return {
       outcome: 'approved',
       message: `Design approved for task ${task.id}. Routing to dev.`,
@@ -109,11 +113,9 @@ export async function handleDesignReply(task: Task, reply: string): Promise<Desi
   };
   writeFileSync(ctxPath, JSON.stringify(ctx, null, 2));
 
-  db.prepare("UPDATE tasks SET status = 'design_pending', updated_at = ? WHERE id = ?")
-    .run(Date.now(), task.id);
   logEvent(task.id, 'human', 'design_revision_requested',
     `Round ${prevRound + 1}: ${renderTargets.length > 0 ? `screens ${renderTargets.join(', ')}` : 'global feedback'}`);
-  await syncToSupabase('task_update', { id: task.id, status: 'design_pending' });
+  await updateStatus(task.id, 'design_pending');
 
   const summary = renderTargets.length > 0
     ? `Routing back to designer for round ${prevRound + 1} — revising ${renderTargets.length} screen${renderTargets.length === 1 ? '' : 's'}.`

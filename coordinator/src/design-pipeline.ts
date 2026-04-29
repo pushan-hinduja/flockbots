@@ -19,7 +19,7 @@
 
 import { existsSync, rmSync, writeFileSync } from 'fs';
 import { join } from 'path';
-import { db, Task, logEvent, consumeAnsweredEscalations } from './queue';
+import { db, Task, logEvent, consumeAnsweredEscalations, createEscalation } from './queue';
 import { AGENT_DEFAULTS, runAgentWithRetry, readJSON, fileExists } from './session-manager';
 import { canRunAgent } from './scheduler';
 import { tasksDir } from './paths';
@@ -202,6 +202,28 @@ export async function runWireframesRendering(task: Task): Promise<void> {
   }
 }
 
+/**
+ * Best-effort screen count from the wireframes index, used in the synthesized
+ * escalation question. On any error returns 0 — the escalation message is
+ * still informative ("0 screens" → operator notices something is off).
+ */
+function countScreensInIndex(taskId: string, round: number): number {
+  try {
+    // eslint-disable-next-line @typescript-eslint/no-var-requires
+    const indexPath = join(TASKS_DIR, taskId, 'wireframes', 'index.json');
+    if (!existsSync(indexPath)) return 0;
+    // eslint-disable-next-line @typescript-eslint/no-var-requires
+    const fs = require('fs');
+    const idx = JSON.parse(fs.readFileSync(indexPath, 'utf-8'));
+    const all = Array.isArray(idx?.screens) ? idx.screens : [];
+    if (round === 1) return all.length;
+    // Rework round: count only screens re-rendered this round.
+    return all.filter((s: any) => s?.lastRenderedRound === round).length;
+  } catch {
+    return 0;
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Stage: design_validation — PM checks wireframes against requirements
 // ---------------------------------------------------------------------------
@@ -294,6 +316,21 @@ export async function runDesignValidation(task: Task): Promise<void> {
     // chat provider with caption + PM open notes. The operator's reply
     // routes through /design_reply (parsed by Haiku) and either ships to
     // dev or kicks rework.
+    //
+    // Synthesize an escalation row so the dashboard's existing escalation
+    // surfaces (top-of-page banner, awaiting-human count, PixelOffice
+    // waiting lounge) pick this up for free. The row is dismissed
+    // automatically when the task transitions out of awaiting_design_approval
+    // (see updateStatus's dismiss-on-leave guard).
+    const screenCount = countScreensInIndex(task.id, ctxAfter.design?.round ?? 1);
+    const openNotes: string[] = ctxAfter.design?.open_pm_notes || [];
+    const screenNoun = screenCount === 1 ? 'screen' : 'screens';
+    const notesSuffix = openNotes.length > 0 ? ` PM still flags: ${openNotes.join('; ')}` : '';
+    createEscalation(
+      task.id,
+      `Design proofs ready for approval — ${screenCount} ${screenNoun}. Reply "approved" to ship to dev, or describe changes.${notesSuffix}`,
+    );
+
     const { notifyDesignApproval } = await import('./design-notify');
     await updateStatus(task.id, 'awaiting_design_approval');
     await notifyDesignApproval(task);
