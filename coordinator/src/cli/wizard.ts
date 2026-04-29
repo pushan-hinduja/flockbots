@@ -350,13 +350,13 @@ export async function runWizard(): Promise<void> {
 
   // ----- GitHub Apps (x2: PR creator + reviewer) -----------------------------
   if (wants('github-apps')) {
-    // Reuse-from-sibling option only kicks in for fresh-install flows where
-    // sibling instances already have apps configured. In reconfigure mode
-    // (existing is set), the user goes through the existing 3-option menu
-    // (keep / new with custom name / re-create) — we don't suggest "reuse"
-    // because they already have their own app configured.
+    // Sibling-reuse option is offered in both fresh-install AND reconfigure
+    // flows. Fresh install uses it as the recommended path when N≥2 instances
+    // share an app. Reconfigure uses it for consolidation: an operator who
+    // initially created separate apps per instance can switch this instance
+    // to use a sibling's app via the same flow.
     const agentExisting = existingGitHubApp(config, 'agent');
-    const agentReusable = mode === 'fresh' ? await findReusableApps('agent', instanceSlug || undefined) : [];
+    const agentReusable = await findReusableApps('agent', instanceSlug || undefined);
     const agentApp = await createGitHubApp(p, 'agent', {
       existing: agentExisting,
       reusableFromSiblings: agentReusable,
@@ -371,7 +371,7 @@ export async function runWizard(): Promise<void> {
     config.githubAppPrivateKeyPath = agentApp.pemPath;
 
     const reviewerExisting = existingGitHubApp(config, 'reviewer');
-    const reviewerReusable = mode === 'fresh' ? await findReusableApps('reviewer', instanceSlug || undefined) : [];
+    const reviewerReusable = await findReusableApps('reviewer', instanceSlug || undefined);
     const reviewerApp = await createGitHubApp(p, 'reviewer', {
       existing: reviewerExisting,
       reusableFromSiblings: reviewerReusable,

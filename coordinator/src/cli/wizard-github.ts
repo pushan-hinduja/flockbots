@@ -82,11 +82,15 @@ let signedInConfirmed = false;
  * Three modes, depending on what comes in via `opts.existing`:
  *   1. Fresh install (no `existing`) — prompt for name (default
  *      "FlockBots Agent" / "FlockBots Reviewer"), then run the manifest
- *      flow to create the app.
- *   2. Reconfigure with verifiable existing app — show 3-option select:
- *      keep / create new with custom name / re-create with default name.
- *   3. Reconfigure with broken existing app — same 3-option select but
- *      "keep" is disabled because the JWT call failed.
+ *      flow to create the app. If sibling instances already have an app
+ *      configured, the "reuse from another instance" option is surfaced
+ *      as the recommended choice.
+ *   2. Reconfigure with verifiable existing app — show select with:
+ *      keep / reuse from sibling (when siblings exist) / create new with
+ *      custom name / re-create with default name.
+ *   3. Reconfigure with broken existing app — same select but "keep" is
+ *      disabled. When siblings exist, "reuse from sibling" becomes the
+ *      recommended fix.
  */
 export async function createGitHubApp(
   p: ClackModule,
@@ -96,7 +100,7 @@ export async function createGitHubApp(
   const label = role === 'agent' ? 'PR creator' : 'Reviewer';
   const defaultName = role === 'agent' ? 'FlockBots Agent' : 'FlockBots Reviewer';
 
-  // ---- Reconfigure path: 3-option choice -----------------------------------
+  // ---- Reconfigure path ----------------------------------------------------
   if (opts.existing) {
     const existing = opts.existing;
     const aliveSpin = p.spinner();
@@ -108,16 +112,26 @@ export async function createGitHubApp(
       aliveSpin.stop(`Existing app is unreachable: ${alive.reason}`);
     }
 
-    const choice = await p.select({
+    const siblings = opts.reusableFromSiblings || [];
+    const canReuseFromSibling = siblings.length > 0 && !!opts.newRepo && !!opts.newInstanceHome;
+
+    type ReconfigureChoice = 'keep' | 'reuse' | 'new' | 'recreate';
+    const reuseHint = alive.ok
+      ? 'switch this instance to a sibling app'
+      : 'recommended — consolidate onto a working app';
+    const choice = await p.select<ReconfigureChoice>({
       message: `${label} GitHub App:`,
       options: [
         ...(alive.ok
           ? [{ value: 'keep' as const, label: 'Use existing app — no changes', hint: 'recommended' }]
           : []),
+        ...(canReuseFromSibling
+          ? [{ value: 'reuse' as const, label: `Reuse ${label.toLowerCase()} app from another instance`, hint: reuseHint }]
+          : []),
         { value: 'new' as const,      label: 'Create a new app with a different name', hint: 'old app keeps existing' },
         { value: 'recreate' as const, label: 'Re-create with the same name', hint: "I've deleted the old app on github.com already" },
       ],
-      initialValue: alive.ok ? 'keep' : 'new',
+      initialValue: alive.ok ? 'keep' : (canReuseFromSibling ? 'reuse' : 'new'),
     });
     if (p.isCancel(choice)) return null;
 
@@ -128,6 +142,14 @@ export async function createGitHubApp(
         pemPath: existing.pemPath,
         name: alive.ok ? alive.name : defaultName,
       };
+    }
+
+    if (choice === 'reuse') {
+      // canReuseFromSibling guards this branch — newRepo/newInstanceHome are
+      // guaranteed non-null here. The reuse helper overwrites this instance's
+      // existing keys/<role>.pem with the sibling's, which is the intended
+      // behavior for a consolidation switch.
+      return reuseGitHubApp(p, role, label, siblings, opts.newRepo!, opts.newInstanceHome!);
     }
 
     if (choice === 'new') {
