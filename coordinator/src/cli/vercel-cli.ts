@@ -452,10 +452,16 @@ export async function setVercelEnv(
   // Best-effort remove (no-op if not yet set). --yes accepts the
   // "Are you sure?" confirm.
   await runVercelCommand(['env', 'rm', name, envScope, '--yes'], { cwd });
-  // Add: pipe value via stdin with trailing newline.
+  // Add: pipe value via stdin. Critical — DO NOT append a trailing newline.
+  // Vercel CLI v52+ stores the entire stdin content as the env-var value, so
+  // `value + '\n'` would land "<value>\n" in production. WhatsApp's webhook
+  // verification fails this way: Meta sends `hub.verify_token=<value>` (no
+  // newline), the relay compares against process.env.WHATSAPP_VERIFY_TOKEN
+  // which is "<value>\n", strict equality fails, relay returns 403, Meta
+  // shows "verify token couldn't be validated."
   const add = await runVercelCommand(['env', 'add', name, envScope], {
     cwd,
-    input: value + '\n',
+    input: value,
   });
   return add.code === 0;
 }

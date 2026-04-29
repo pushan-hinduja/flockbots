@@ -5,7 +5,13 @@ const supabase = createClient(
   process.env.SUPABASE_SERVICE_ROLE_KEY!
 );
 
-const VERIFY_TOKEN = process.env.WHATSAPP_VERIFY_TOKEN || '';
+// Trim defensively — env vars set via `vercel env add` historically arrived
+// with a trailing newline that broke strict equality against Meta's
+// hub.verify_token. The webhook-deploy CLI was fixed in v1.2.3 to send the
+// value without trailing newline, but trimming here guards against any
+// future contamination (manual env-var edits, pasted-with-newline values,
+// etc.) — the verify token is hex/random so trimming is always safe.
+const VERIFY_TOKEN = (process.env.WHATSAPP_VERIFY_TOKEN || '').trim();
 
 // Vercel filesystem routing: this file matches /api/webhook/<anything>.
 // The slug is the last path segment — each FlockBots instance gets its own
