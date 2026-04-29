@@ -69,6 +69,23 @@ async function fetchVercelTeams(): Promise<VercelTeam[]> {
   return data?.teams || [];
 }
 
+/**
+ * Fetch the cached token's owning user. We use this to surface the current
+ * Vercel identity in the deploy flow so an operator who's signed in to the
+ * wrong account can spot it and switch — without ever having to run
+ * `vercel whoami` (which v52+ treats as interactive and may auto-launch a
+ * device-auth browser flow). Returns null on any failure; the caller falls
+ * back to "Signed in (account unknown)" rather than blocking.
+ */
+async function fetchVercelUser(): Promise<{ email: string; username: string } | null> {
+  const data = await vercelApi<{ user: { email?: string; username?: string } }>('/v2/user');
+  if (!data?.user) return null;
+  const email = data.user.email || '';
+  const username = data.user.username || '';
+  if (!email && !username) return null;
+  return { email, username };
+}
+
 /** Fetch projects scoped to a team (or personal account when slug is null). */
 async function fetchVercelProjects(teamId: string | null): Promise<VercelProject[]> {
   const path = teamId ? `/v9/projects?teamId=${teamId}&limit=100` : '/v9/projects?limit=100';
@@ -194,18 +211,68 @@ export function vercelLoggedIn(): boolean {
 }
 
 /**
- * Interactive browser-based login. No-op if already logged in. Wraps the
- * actual `vercel whoami` check in a spinner since it can take a few
- * seconds on first run (auth file lookup + token validation against
- * Vercel's API).
+ * Interactive browser-based login. Surfaces the current account identity
+ * when a token is already cached, and offers a "sign out + sign in to a
+ * different account" option — important when the cached token belongs to
+ * the wrong personal/team account and the operator can't fix it via
+ * vercel.com (logging out in the browser doesn't invalidate the local
+ * CLI token).
  */
 export async function ensureVercelLogin(p: ClackModule): Promise<boolean> {
   const checkSpin = p.spinner();
   checkSpin.start('Checking Vercel auth');
   const loggedIn = vercelLoggedIn();
-  checkSpin.stop(loggedIn ? 'Signed in to Vercel' : 'Not signed in to Vercel');
-  if (loggedIn) return true;
+  if (!loggedIn) {
+    checkSpin.stop('Not signed in to Vercel');
+    return runVercelLogin(p);
+  }
+  // Surface the current identity so the operator can confirm or switch.
+  const user = await fetchVercelUser();
+  const label = user
+    ? (user.email || user.username || 'unknown account')
+    : 'account unknown — token may be expired';
+  checkSpin.stop(`Signed in to Vercel as ${label}`);
 
+  // VERCEL_TOKEN bypass: the env var owns the auth, so vercel logout/login
+  // can't change it. Tell the operator to clear the env var if they want
+  // to switch accounts in this session.
+  if (process.env.VERCEL_TOKEN) {
+    p.log.info('VERCEL_TOKEN is set — that env var is in charge of auth. Unset it to switch accounts.');
+    return true;
+  }
+
+  const choice = await p.select<'continue' | 'switch'>({
+    message: `Use this Vercel account (${label})?`,
+    options: [
+      { value: 'continue', label: 'Yes — continue', hint: 'recommended' },
+      { value: 'switch',   label: 'Sign out and sign in as a different account' },
+    ],
+    initialValue: 'continue',
+  });
+  if (p.isCancel(choice)) return false;
+  if (choice === 'continue') return true;
+
+  // Switch path: clear cached token, then fall through to fresh login flow.
+  const logoutSpin = p.spinner();
+  logoutSpin.start('Signing out of current Vercel account');
+  const logoutResult = spawnSync('npx', ['--yes', 'vercel', 'logout'], {
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  if (logoutResult.status !== 0) {
+    logoutSpin.stop('Sign-out failed');
+    p.log.error('`vercel logout` exited non-zero. Try running it manually then retry the deploy.');
+    return false;
+  }
+  logoutSpin.stop('Signed out');
+
+  return runVercelLogin(p);
+}
+
+/**
+ * Browser-based device login. Extracted from ensureVercelLogin so the
+ * "switch account" path can call it cleanly after the logout step.
+ */
+async function runVercelLogin(p: ClackModule): Promise<boolean> {
   p.note(
     help([
       'Sign-in flow:',
@@ -217,7 +284,7 @@ export async function ensureVercelLogin(p: ClackModule): Promise<boolean> {
       'The auth token saves to ~/Library/Application Support/com.vercel.cli/',
       '(macOS) and is shared across every flock + survives FlockBots upgrades.',
     ].join('\n')),
-    'Vercel sign-in (one-time)',
+    'Vercel sign-in',
   );
 
   const proceed = await p.confirm({

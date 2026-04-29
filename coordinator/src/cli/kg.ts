@@ -116,12 +116,43 @@ export function kgState(): KgState {
     }
   }
 
-  let graphifyInstalled = false;
+  return { graphifyInstalled: !!findGraphifyBinary(), graphExists, graphAgeDays };
+}
+
+/**
+ * Locate the graphify executable. `command -v graphify` is the fast path; if
+ * it misses (PATH doesn't include the user-pip install dir), fall back to
+ * known install locations across macOS, Linux, and Homebrew.
+ *
+ * Why this matters: `pip install --user graphifyy` lands the binary in
+ *   macOS: ~/Library/Python/3.x/bin/graphify
+ *   Linux: ~/.local/bin/graphify
+ * Neither directory is on the default PATH on most shells, so a wizard run
+ * that just installed graphify will see graphify_doctor flag it as missing
+ * unless the user has manually added the dir to PATH. Probing these paths
+ * directly fixes the false-negative.
+ */
+function findGraphifyBinary(): string | null {
   try {
-    const out = require('child_process').execSync('command -v graphify', { encoding: 'utf-8', stdio: ['ignore', 'pipe', 'ignore'] });
-    graphifyInstalled = !!out.trim();
-  } catch {
-    // Not installed
-  }
-  return { graphifyInstalled, graphExists, graphAgeDays };
+    const out = require('child_process').execSync('command -v graphify', {
+      encoding: 'utf-8',
+      stdio: ['ignore', 'pipe', 'ignore'],
+    });
+    const found = (out as string).trim();
+    if (found) return found;
+  } catch { /* fall through to candidate scan */ }
+
+  const home = process.env.HOME || '';
+  const candidates = [
+    `${home}/Library/Python/3.14/bin/graphify`,
+    `${home}/Library/Python/3.13/bin/graphify`,
+    `${home}/Library/Python/3.12/bin/graphify`,
+    `${home}/Library/Python/3.11/bin/graphify`,
+    `${home}/Library/Python/3.10/bin/graphify`,
+    `${home}/.local/bin/graphify`,             // Linux pip --user default
+    '/opt/homebrew/bin/graphify',              // macOS Homebrew (Apple Silicon)
+    '/usr/local/bin/graphify',                 // macOS Homebrew (Intel) / generic Linux
+  ];
+  for (const c of candidates) if (existsSync(c)) return c;
+  return null;
 }

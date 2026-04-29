@@ -16,13 +16,16 @@ const GRAPHIFY_PATH: string | null = (() => {
     const found = execSync('command -v graphify', { encoding: 'utf-8' }).trim();
     return found || null;
   } catch {
-    // Try common locations. Covers Python 3.10–3.14 user-installs and Homebrew.
+    // Try common locations. Covers Python 3.10–3.14 user-installs (macOS +
+    // Linux) and Homebrew. Mirrored in cli/kg.ts's findGraphifyBinary —
+    // keep the lists in sync if you add a new path.
     const candidates = [
       `${process.env.HOME}/Library/Python/3.14/bin/graphify`,
       `${process.env.HOME}/Library/Python/3.13/bin/graphify`,
       `${process.env.HOME}/Library/Python/3.12/bin/graphify`,
       `${process.env.HOME}/Library/Python/3.11/bin/graphify`,
       `${process.env.HOME}/Library/Python/3.10/bin/graphify`,
+      `${process.env.HOME}/.local/bin/graphify`,    // Linux pip --user default
       '/opt/homebrew/bin/graphify',
       '/usr/local/bin/graphify',
     ];

@@ -1833,7 +1833,7 @@ async function writeConfig(
     nextSteps.push('', 'When you\'re ready, deploy with:', ...deployCmds);
   }
 
-  p.note(nextSteps.join('\n'), 'Next steps');
+  p.note(help(nextSteps.join('\n')), 'Next steps');
 }
 
 /**
