@@ -1,4 +1,4 @@
-import { readFileSync, rmSync, writeFileSync } from 'fs';
+import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'fs';
 import { join } from 'path';
 import simpleGit from 'simple-git';
 import { db, logEvent, Task, createEscalation, dismissEscalationsForTask, consumeAnsweredEscalations } from './queue';
@@ -1160,6 +1160,13 @@ async function runQAStage(task: Task): Promise<void> {
 
   const mcpConfigPath = join(SHARED_ROOT, 'agents', 'mcp-configs', 'qa.json');
 
+  // Pre-create the per-task QA screenshots dir under flockbotsHome so the
+  // agent's first browser_screenshot call doesn't fail on a missing
+  // directory and lands the file in the right place from the very first
+  // step. mkdirSync(recursive) is a no-op if the dir already exists.
+  const qaScreenshotsDir = join(flockbotsHome(), 'tasks', task.id, 'qa-screenshots');
+  mkdirSync(qaScreenshotsDir, { recursive: true });
+
   // Build qa context for the prompt
   const qaContext = [
     `QA verification for task ${task.id}.`,
@@ -1167,6 +1174,14 @@ async function runQAStage(task: Task): Promise<void> {
     `qa_instructions: ${qaBlock.qa_instructions || '(none)'}`,
     `qa_uses_canvas: ${!!qaBlock.qa_uses_canvas}`,
     `PR: ${task.pr_url || '(none)'}`,
+    ``,
+    `SCREENSHOT SAVE PATH (CRITICAL):`,
+    `Save every screenshot to this exact directory:`,
+    `  ${qaScreenshotsDir}`,
+    `Use the absolute path when calling browser_screenshot — for example:`,
+    `  browser_screenshot(path: "${qaScreenshotsDir}/step-1.png")`,
+    `DO NOT save screenshots to a relative path. DO NOT save them in the`,
+    `target repo. The directory is pre-created — just write to it.`,
   ].join('\n');
 
   const result = await runAgentWithRetry({
@@ -1177,7 +1192,13 @@ async function runQAStage(task: Task): Promise<void> {
     tools: AGENT_DEFAULTS.qa.tools,
     mcpConfigPath,
     extraPromptContext: qaContext,
-    cwd: TARGET_REPO_PATH,
+    // cwd is flockbotsHome (NOT target repo): the QA prompt's relative
+    // paths like "tasks/<id>/qa-screenshots/step-1.png" resolve here as
+    // <flockbotsHome>/tasks/<id>/qa-screenshots/step-1.png — alongside the
+    // canonical context.json + qa-report.md + qa-failure.json. QA tests
+    // the deployed staging URL via Playwright; no target-repo file access
+    // is needed, so changing cwd costs nothing.
+    cwd: flockbotsHome(),
     enableStreaming: true,
   }, 1); // Single retry only — QA is expensive + Playwright flakiness isn't fixed by retrying
 
@@ -1218,6 +1239,7 @@ async function runQAStage(task: Task): Promise<void> {
       .run(Date.now(), Date.now(), task.id);
     await updateStatus(task.id, 'merged');
     await notifyOperatorQAPass(task, ctxAfter);
+    cleanupQAArtifacts(task.id);
     return;
   }
 
@@ -1238,6 +1260,42 @@ async function runQAStage(task: Task): Promise<void> {
   db.prepare('UPDATE tasks SET completed_at = ?, updated_at = ? WHERE id = ?')
     .run(Date.now(), Date.now(), task.id);
   await updateStatus(task.id, 'merged');
+  cleanupQAArtifacts(task.id);
+}
+
+/**
+ * Remove the QA agent's local screenshot/video artifacts after they've
+ * been uploaded to Supabase + sent to chat. The QA prompt directs the
+ * agent to save under tasks/<taskId>/qa-screenshots/, which with
+ * cwd=TARGET_REPO_PATH lands the files INSIDE the user's target repo —
+ * polluting their working tree if not gitignored. We also clean the
+ * flockbotsHome variant in case a future prompt change moves them there.
+ *
+ * Best-effort: silent on errors. If the dir doesn't exist (e.g. legacy
+ * run that uploaded directly without local copies) the rmSync no-ops.
+ */
+function cleanupQAArtifacts(taskId: string): void {
+  const candidates = [
+    TARGET_REPO_PATH ? join(TARGET_REPO_PATH, 'tasks', taskId, 'qa-screenshots') : '',
+    join(flockbotsHome(), 'tasks', taskId, 'qa-screenshots'),
+  ].filter(Boolean);
+  for (const dir of candidates) {
+    try {
+      rmSync(dir, { recursive: true, force: true });
+    } catch { /* best effort */ }
+  }
+  // If the parent tasks/<taskId>/ dir under TARGET_REPO_PATH is now empty
+  // (we created it just for screenshots — the canonical task artifacts
+  // live under flockbotsHome), remove it too. The parent tasks/ dir at
+  // the repo root is left alone — it might be the user's own.
+  if (TARGET_REPO_PATH) {
+    const taskDirInRepo = join(TARGET_REPO_PATH, 'tasks', taskId);
+    try {
+      if (existsSync(taskDirInRepo) && readdirSync(taskDirInRepo).length === 0) {
+        rmSync(taskDirInRepo, { recursive: true, force: true });
+      }
+    } catch { /* best effort */ }
+  }
 }
 
 /**
@@ -1323,9 +1381,20 @@ async function uploadQAMedia(taskId: string, localPath: string): Promise<string 
     if (!supabase) return null;
 
     const bucket = process.env.SUPABASE_STORAGE_BUCKET_QA || 'qa-media';
-    const fullPath = localPath.startsWith('/') ? localPath : join(flockbotsHome(), localPath);
-    if (!fileExists(fullPath)) {
-      logEvent(taskId, 'qa', 'media_missing', `Screenshot not found at ${fullPath}`);
+    // The QA agent runs with cwd=TARGET_REPO_PATH and the prompt may emit
+    // relative paths like "tasks/<id>/qa-screenshots/step-3.png", which
+    // resolves under the user's target repo. The agent may also use an
+    // absolute path. Try every reasonable candidate so we find the file
+    // regardless of which convention the agent picked this run.
+    const candidates = localPath.startsWith('/')
+      ? [localPath]
+      : [
+          join(flockbotsHome(), localPath),
+          TARGET_REPO_PATH ? join(TARGET_REPO_PATH, localPath) : '',
+        ].filter(Boolean);
+    const fullPath = candidates.find(p => fileExists(p));
+    if (!fullPath) {
+      logEvent(taskId, 'qa', 'media_missing', `Screenshot not found at any of: ${candidates.join(', ')}`);
       return null;
     }
 

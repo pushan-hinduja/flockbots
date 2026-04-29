@@ -95,9 +95,20 @@ async function ensureRemoteStagingExists(git: SimpleGit, taskId: string): Promis
   }
 }
 
+/**
+ * Remove the worktree AND delete the local task branch. We use -D (force)
+ * because the branch is either merged (in which case the merge already
+ * landed on staging — local copy is no longer needed) or terminal-failed
+ * (in which case there's nothing to preserve). Remote branches are left
+ * alone — GitHub's "Auto-delete head branches" setting is the right
+ * place for that decision since users may want a grace period for review
+ * trails. Best-effort: branch may not exist yet, may be checked out
+ * elsewhere, etc. — silent on errors.
+ */
 export async function cleanupWorktree(taskId: string): Promise<void> {
   const git: SimpleGit = simpleGit(TARGET_REPO_PATH);
   const worktreePath = join(WORKTREE_DIR, `task-${taskId}`);
+  const branchName = `task/${taskId}`;
 
   if (existsSync(worktreePath)) {
     await git.raw(['worktree', 'remove', worktreePath, '--force']);
@@ -105,6 +116,12 @@ export async function cleanupWorktree(taskId: string): Promise<void> {
   }
 
   await git.raw(['worktree', 'prune']);
+
+  // Delete the local task branch — it's done its job. Best-effort.
+  try {
+    await git.branch(['-D', branchName]);
+    logEvent(taskId, 'system', 'branch_deleted', `Deleted local branch ${branchName}`);
+  } catch { /* branch already gone or never created */ }
 }
 
 export function getWorktreePath(taskId: string): string {
@@ -374,6 +391,11 @@ export async function pruneStaleWorktrees(): Promise<void> {
       } catch (err: any) {
         console.error(`Failed to prune worktree ${entry.name}:`, err.message);
       }
+      // Also delete the local task branch — same rationale as cleanupWorktree.
+      // Branch convention is task/<id>; entry.name is task-<id>.
+      try {
+        await git.branch(['-D', `task/${taskId}`]);
+      } catch { /* branch already gone or never created */ }
     }
   }
 

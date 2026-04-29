@@ -111,6 +111,8 @@ Runs after merge. Tests the *deployed* code, not the diff.
 
 > **You bring the deploy, QA brings the test.** The QA agent visits whatever URL you set as `STAGING_BASE_URL` during `flockbots init` — it doesn't deploy anything itself. You need an auto-deploy hooked up to your staging branch so a fresh build is live by the time QA opens the browser. **Vercel is the recommended setup**: connect Vercel to your GitHub repo, point the production deployment at your `main`/`prod` branch and a preview/production deployment at your `staging` branch (in two-branch mode), and Vercel ships every merge automatically. Then `STAGING_BASE_URL=https://your-app-staging.vercel.app` and QA always tests the post-merge build for *that* branch — never the wrong environment. Without a working auto-deploy at the URL you configured, QA times out waiting for the deploy and fails the verification.
 
+> **Other URL types work too.** `STAGING_BASE_URL` accepts anything Playwright can open — not just Vercel/HTTPS. If you don't have a hosted staging environment, you can point QA at a **local dev server** (`STAGING_BASE_URL=http://localhost:3000`) or a **local static build** (`STAGING_BASE_URL=file:///Users/me/Code/myapp/dist/index.html`) and skip the auto-deploy entirely. Useful for static-site projects, prototyping, or air-gapped setups where you don't want to host anything publicly. The trade-off: you have to make sure the local URL is actually live + reflects your latest merge before QA runs (no auto-deploy means no automatic refresh — kicking off a build manually after merge is on you).
+
 ### Coordinator — the orchestrator
 
 Not a Claude agent — a plain Node process. The glue that makes the flock work as a team.
