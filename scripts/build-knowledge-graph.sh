@@ -79,6 +79,17 @@ fi
 # to the script's own parent directory.
 INSTALL_ROOT="${FLOCKBOTS_HOME:-${PROJECT_ROOT:-$RESOLVED_ROOT}}"
 
+# Per-instance output target (v1.1+). The graph is target-repo-specific, so
+# it MUST live under the instance that owns the .env (one repo = one graph).
+# Falls back to the shared root for the dev / source-tree case where the
+# script is invoked outside an instance — that path is intentionally legacy
+# and only used in development.
+if [ -n "$FLOCKBOTS_INSTANCE_ID" ]; then
+  INSTANCE_HOME="$INSTALL_ROOT/instances/$FLOCKBOTS_INSTANCE_ID"
+else
+  INSTANCE_HOME="$INSTALL_ROOT"
+fi
+
 # ── Python 3.10+ ──
 PYTHON=$(command -v python3.12 || command -v python3.11 || command -v python3.10 || command -v python3)
 if [ -z "$PYTHON" ]; then
@@ -109,7 +120,7 @@ if [ ! -f "$HOME/.claude/skills/graphify/SKILL.md" ]; then
   graphify install
 fi
 
-OUT_DIR="$INSTALL_ROOT/skills/kg"
+OUT_DIR="$INSTANCE_HOME/skills/kg"
 mkdir -p "$OUT_DIR"
 
 # Lockfile prevents overlapping builds (e.g., two post-merge hooks firing close
