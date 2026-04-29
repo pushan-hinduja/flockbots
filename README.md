@@ -13,6 +13,8 @@ flockbots init
 
 Self-hosted. ~10 minutes to a running flock. Your code stays on your machine; only Claude + GitHub traffic leaves the box.
 
+**[Easy to install](#install)** — one-line installer, 10-minute setup wizard, no manual config files to edit.
+
 ---
 
 ## Use your existing Claude subscription — no API costs
@@ -26,56 +28,32 @@ The wizard lets you pick either at setup; you can switch later by editing `~/.fl
 
 ---
 
-## The problem with vibecoding
-
-The "chat with an AI and ship whatever it says" workflow has real problems:
-
-| Problem | What it costs you |
-|---------|-------------------|
-| **No context retention** | Every session starts from scratch. The model re-reads your codebase every time, burning tokens on exploration that's already been done. |
-| **No review layer** | The same AI that wrote the code "reviews" it. Self-bias makes the review superficial. Bugs, security holes, and off-scope changes slip through. |
-| **Manual QA** | The model says "done." Does it actually work in a browser? You still have to check. |
-| **Lost progress on failures** | Rate limit hit mid-task? Network blip? You lose intermediate work and restart from zero. |
-| **Token blackhole on large repos** | Broad greps, blind file reads, and repeated exploration burn budget on a 50k-file codebase. |
-| **Locked to your laptop** | You have to be at your machine to chat. No shipping from a phone. |
-| **No multi-step orchestration** | Design → code → test → review → ship is seven manual back-and-forths, not a pipeline. |
-
-## How FlockBots solves it
-
-| Problem | FlockBots' answer |
-|---------|-------------------|
-| No context retention | **PM agent writes a context pack once.** Every downstream agent reads it instead of re-exploring — research cost paid once per task. |
-| No review layer | **Two separate GitHub App identities** — PR author and reviewer are distinct, and the reviewer runs a fresh Claude session with a mandatory review checklist. |
-| Manual QA | **QA agent drives your deployed staging env** via Playwright, screenshots the result, and messages you pass/fail with images. |
-| Lost progress | **SQLite-backed state + resumable sessions.** Crashes and rate-limit hits are recovered on next pipeline tick. |
-| Token blackhole | **Knowledge graph indexing.** Agents query a graph of your codebase (symbols, imports, call sites) via `mcp__graphify__*` tools — ~5–10× cheaper than grep on real repos. |
-| Locked to laptop | **Telegram / Slack / WhatsApp.** Your phone is the interface. |
-| No pipeline | **Stage-gated orchestrator** enforces pass/fail between every agent, handles retries, surfaces escalations through your chat channel. |
-
----
-
 ## The flock — specialized agents, coordinated
 
 Not one AI writing code. A **team of specialized agents**, each with a defined role, system prompt, and tool set, handing work off through disk-persistent artifacts. A **coordinator** picks the right agent at the right stage and enforces gates between them.
 
-### PM — research + specification
+### PM — research + specification + design validation
 
-Starts every task. Its job is to do all the exploration work once so nobody else has to repeat it.
+Starts every task. Its job is to do all the exploration work once so nobody else has to repeat it, then validate that the designer's output covers what was specified.
 
 - Surveys the codebase using **graphify MCP tools** — symbol lookup, import graph, blast-radius queries — instead of brute-force grep.
 - Reads your project's `skills/` knowledge: product vision, domain concepts, architecture decisions, code conventions, design guidelines.
 - Classifies the task's **effort size** (XS → XL) and picks the right Claude model per downstream agent — **Sonnet** for typical work, **Opus** for complex / high-stakes changes (large refactors, security-sensitive code, architectural calls). Working agents only ever run on Sonnet or Opus.
 - Decides if a UX stage is needed based on whether any UI changes are in scope.
 - Writes a **context pack** to `tasks/<id>/context.json` — structured JSON with the spec, affected files, relevant snippets, design hints. This is what every other agent reads.
+- After the designer produces wireframes (UI tasks), **validates them against the functional requirements** — catches "you specified a dinosaur game, but I don't see a dinosaur" before the proofs go to you. Up to 2 revision rounds with the designer; on round 3 it force-promotes to your approval gate with any unresolved items called out in the chat caption.
 - Escalates to you (via chat) if requirements are ambiguous — rather than guessing.
 
-### UX — design
+### UX — high-fidelity wireframes + your approval
 
-Runs only when the task touches UI.
+Runs only when the task touches UI. No more text-only design specs — the designer produces actual proofs you sign off on before code is written.
 
-- Reads design skills: `principles.md`, `components.md`, `layouts.md`, `responsive.md`, `motion.md` — your project's visual language.
-- Picks existing components from your library rather than reinventing them.
-- Produces component specs, layout notes, interaction states, responsive behavior — added to the context pack for dev.
+- **Reads your design system** if one exists at `skills/design/` (principles, components, layouts, responsive, motion). If absent, picks a coherent visual language inferred from PM intent + existing UI in the repo and documents the choice inline so subsequent screens stay consistent.
+- **Produces high-fidelity HTML wireframes** under `tasks/<id>/wireframes/<NN>-<id>.html` — what the final product will actually look like, not box-drawn mockups. Real typography, real components, realistic copy, inline stub data so each screen renders standalone in a headless browser.
+- **One screen per visually distinct state** the user will encounter — distinct routes, multi-step flow stages, empty / error / populated / success layouts. Skips trivial variants (hover states, focus rings) and pathological cases.
+- **Coordinator drives Playwright** over each HTML file, screenshots desktop (1440×900) and mobile (390×844) viewports, uploads to a Supabase `wireframes` storage bucket, and **sends them to your chat** with one numbered caption per screen.
+- **You approve in chat** — reply `approved` to ship to dev, or describe changes in plain English. A Claude Haiku router parses your reply ("screen 2 needs more padding", "all of these feel cluttered", "looks good but tweak the dashboard") into structured rework instructions. The designer iterates **only on the screens you flagged** — unchanged screens stay approved.
+- **Soft visual gate later** — when QA runs after merge, it compares the live implementation to the approved wireframes and spawns a "Design drift" follow-up task if anything diverges meaningfully. Wireframes are intent, not pixel-exact, so spacing differences within ~8px and font rendering quirks are tolerated.
 
 ### Dev — implementation
 
@@ -106,7 +84,9 @@ Runs after merge. Tests the *deployed* code, not the diff.
 - Drives the staging URL via **Playwright MCP** — navigates, fills forms, clicks through flows, asserts on the rendered DOM.
 - Handles login automatically if you gave it test credentials; skips login on public-facing sites.
 - **Takes screenshots and short video clips** of both happy paths and failures, uploads them to your Supabase Storage bucket as signed URLs, and sends them to your chat provider — so you see the actual rendered change on your phone.
-- On failure: auto-creates a fix-it task with the screenshot + failure details, puts it back at the top of the queue for Dev to address.
+- For UI tasks built from approved wireframes: runs a **visual fidelity check** alongside functional tests — compares live screenshots against the wireframes and categorizes each screen as `match`, `drift_minor`, or `drift_major`. Soft match (intent preserved, ~8px tolerance), not pixel-exact. **Visual drift never fails the parent task** — it spawns a "Design drift" child task instead, so you don't reopen a feature that functionally works just because spacing is slightly off.
+- On functional failure: auto-creates a fix-it task with the screenshot + failure details, puts it back at the top of the queue for Dev to address.
+- **Pass / fail message in chat lists every follow-up task spawned** — regression fixes + design drift in one block, so you always see the full footprint of what the QA run produced.
 - **Requires Supabase** — screenshots + video clips land in the `qa-media` Storage bucket. If you skip the dashboard/Supabase step during `flockbots init`, QA is unavailable and the wizard skips the step entirely.
 
 > **You bring the deploy, QA brings the test.** The QA agent visits whatever URL you set as `STAGING_BASE_URL` during `flockbots init` — it doesn't deploy anything itself. You need an auto-deploy hooked up to your staging branch so a fresh build is live by the time QA opens the browser. **Vercel is the recommended setup**: connect Vercel to your GitHub repo, point the production deployment at your `main`/`prod` branch and a preview/production deployment at your `staging` branch (in two-branch mode), and Vercel ships every merge automatically. Then `STAGING_BASE_URL=https://your-app-staging.vercel.app` and QA always tests the post-merge build for *that* branch — never the wrong environment. Without a working auto-deploy at the URL you configured, QA times out waiting for the deploy and fails the verification.
@@ -181,18 +161,25 @@ Net effect: you can queue 50 tasks at once and walk away. The flock will pace it
 flowchart LR
   You([You, in chat]) --> Queue[(Task queue<br/>SQLite)]
   Queue --> PM[PM<br/>research + context pack]
-  PM --> UX[UX<br/>design]
-  UX --> Dev[Dev<br/>implement + test]
+  PM --> UX[UX<br/>HTML wireframes]
+  UX --> Render[Coordinator<br/>renders + uploads PNGs]
+  Render --> PMValidate[PM<br/>validates vs requirements]
+  PMValidate -->|missing| UX
+  PMValidate -->|ok| Approval([You approve<br/>in chat])
+  Approval -->|describe changes| UX
+  Approval -->|approved| Dev[Dev<br/>implement + test]
   PM -.->|no UI changes| Dev
   Dev --> PR[GitHub PR]
   PR --> Reviewer[Reviewer<br/>diff review]
   Reviewer -->|REQUEST_CHANGES| Dev
   Reviewer -->|APPROVE| Merged[Merged<br/>to staging]
   Merged --> Vercel[Vercel auto-deploy]
-  Vercel --> QA[QA<br/>Playwright + screenshots]
-  QA -->|pass + screenshot| Done([Shipped ✓])
-  QA -->|fail| FixTask[Auto-created fix task<br/>+ screenshot of failure]
+  Vercel --> QA[QA<br/>functional + visual fidelity]
+  QA -->|pass| Done([Shipped ✓])
+  QA -->|functional fail| FixTask[Auto fix task]
+  QA -->|visual drift| DriftTask[Auto design-drift task]
   FixTask --> Queue
+  DriftTask --> Queue
   Done -.->|/deploy from phone| Prod([Merged to prod])
 ```
 
@@ -207,14 +194,16 @@ The full power move, end to end:
 1. **You send a WhatsApp / Telegram / Slack message**: *"Add a dark-mode toggle to the settings page."*
 2. **Coordinator picks up the task**, queues it, acknowledges in chat.
 3. **PM agent** researches: reads your design skills, finds the settings page file, identifies how theme state is managed.
-4. **UX agent** picks the toggle component from your library, writes style notes.
-5. **Dev agent** implements in an isolated worktree, runs tests + lint + typecheck, opens a PR.
-6. **Reviewer agent** reads the diff, checks for security / correctness / scope, posts APPROVE.
-7. **PR merges to staging**. Your **Vercel auto-deploy** (recommended — connects to your GitHub branches and ships on every merge without any extra CI config) pushes to `staging.your-app.com`.
-8. **QA agent** waits for the deploy, drives staging in headless Chromium — opens the settings page, clicks the toggle, verifies the theme changes, screenshots both states.
-9. **You get a WhatsApp message with the screenshots.** "QA passed: light mode → dark mode. Screenshot 1 + 2 attached."
-10. **You reply `/deploy`** from your phone. Coordinator opens a second PR, staging → production, and merges it.
-11. **Vercel deploys to production.** You're done. Total time on the task from you: two messages.
+4. **UX agent** writes high-fidelity HTML wireframes for the settings page in both light and dark states. Coordinator renders them via Playwright at desktop + mobile and **sends the proofs to your phone**.
+5. **PM validates** the wireframes against the spec — confirms the toggle, both theme states, and the settings-page integration are all represented.
+6. **You reply `approved`** (or describe changes in plain English: *"the toggle should be on the right, not the left"* — the designer iterates only on what you flagged). One message to greenlight.
+7. **Dev agent** implements against the approved wireframes in an isolated worktree, runs tests + lint + typecheck, opens a PR.
+8. **Reviewer agent** reads the diff, checks for security / correctness / scope, posts APPROVE.
+9. **PR merges to staging**. Your **Vercel auto-deploy** (recommended — connects to your GitHub branches and ships on every merge without any extra CI config) pushes to `staging.your-app.com`.
+10. **QA agent** waits for the deploy, drives staging in headless Chromium — opens the settings page, clicks the toggle, verifies the theme changes, screenshots both states. Then runs the visual fidelity check against your approved wireframes.
+11. **You get a WhatsApp message with the screenshots.** "QA passed: light mode → dark mode. Visual match. Screenshot 1 + 2 attached."
+12. **You reply `/deploy`** from your phone. Coordinator opens a second PR, staging → production, and merges it.
+13. **Vercel deploys to production.** You're done. Total time on the task from you: two short messages.
 
 No laptop. No dev env. No context switching from whatever you were doing.
 
@@ -251,22 +240,6 @@ Or use the terminal:
 ```bash
 flockbots task add "Add a dark-mode toggle to the settings page"
 ```
-
----
-
-## Integrations
-
-FlockBots connects to a handful of external services. Only the first three are required; everything else is optional (but some are strongly recommended).
-
-| Service | Role | Required? | Notes |
-|---------|------|-----------|-------|
-| **Anthropic Claude** | Runs every agent session (PM, UX, Dev, Reviewer, QA, chat router) | Yes | Use your **Claude Max/Pro via OAuth** (recommended — no per-token cost) or an Anthropic API key |
-| **GitHub** | Hosts your target codebase; two apps handle PR authorship + reviewer identity | Yes | Two GitHub Apps auto-created by the wizard via the manifest flow (~30 seconds each) |
-| **Telegram / Slack / WhatsApp** | Chat interface — how you talk to the flock | Yes (pick one) | Telegram fastest to set up; WhatsApp is best for users who prefer it as their primary communication tool — see [`docs/setup/whatsapp.md`](docs/setup/whatsapp.md) for the full Meta + webhook-relay walkthrough |
-| **Vercel** | Auto-deploy on merge to staging and prod | **Recommended** | Connect your GitHub branches to Vercel — every merge ships automatically, so QA can test the actual deployed URL and `/deploy` from chat becomes a real one-tap prod release |
-| **Supabase** | Powers the live web dashboard: task history, token usage, office view, QA screenshot hosting | Optional | Free tier works. Skip if you're CLI-only |
-| **Linear** | **Two-way sync** — pulls labeled Linear issues into the task queue as triggers, and the coordinator writes back: PR links, stage transitions, completion notes, failure reasons enriched onto the ticket as comments. Your Linear board becomes a live view of everything the flock is doing | Optional | Skip unless you already track work there |
-| **graphify** | Knowledge graph index of your codebase — cuts agent token usage ~5–10× on symbol / import / call-site lookups | Optional | **The wizard can install + build it for you automatically** (`pip install --user graphifyy` → first graph build takes 10–30 min on a real repo); or run `flockbots kg build` anytime later |
 
 ---
 
@@ -501,6 +474,22 @@ The installer checks every one of these up-front and tells you what's missing.
 Each flock is its own coordinator process. Shared resources (dashboard, Supabase project, dashboard login, Claude rate-limit budget) live at the root; per-flock state (queue, worktrees, GitHub Apps, chat tokens, target repo) lives under `instances/<slug>/`. SQLite is authoritative; Supabase is a downstream async mirror for the dashboard, with every row keyed by `instance_id` so the switcher can scope panels per flock.
 
 Deeper walkthrough: [`docs/architecture.md`](docs/architecture.md).
+
+---
+
+## Integrations
+
+FlockBots connects to a handful of external services. Only the first three are required; everything else is optional (but some are strongly recommended).
+
+| Service | Role | Required? | Notes |
+|---------|------|-----------|-------|
+| **Anthropic Claude** | Runs every agent session (PM, UX, Dev, Reviewer, QA, chat router) | Yes | Use your **Claude Max/Pro via OAuth** (recommended — no per-token cost) or an Anthropic API key |
+| **GitHub** | Hosts your target codebase; two apps handle PR authorship + reviewer identity | Yes | Two GitHub Apps auto-created by the wizard via the manifest flow (~30 seconds each) |
+| **Telegram / Slack / WhatsApp** | Chat interface — how you talk to the flock | Yes (pick one) | Telegram fastest to set up; WhatsApp is best for users who prefer it as their primary communication tool — see [`docs/setup/whatsapp.md`](docs/setup/whatsapp.md) for the full Meta + webhook-relay walkthrough |
+| **Vercel** | Auto-deploy on merge to staging and prod | **Recommended** | Connect your GitHub branches to Vercel — every merge ships automatically, so QA can test the actual deployed URL and `/deploy` from chat becomes a real one-tap prod release |
+| **Supabase** | Powers the live web dashboard, hosts wireframe proofs + QA screenshots, holds the dashboard auth users | Optional | Free tier works. Skip if you're CLI-only — but skipping disables the wireframe approval flow (proofs need somewhere to live for chat to fetch them) and the QA agent (no screenshot hosting) |
+| **Linear** | **Two-way sync** — pulls labeled Linear issues into the task queue as triggers, and the coordinator writes back: PR links, stage transitions, completion notes, failure reasons enriched onto the ticket as comments. Your Linear board becomes a live view of everything the flock is doing | Optional | Skip unless you already track work there |
+| **graphify** | Knowledge graph index of your codebase — cuts agent token usage ~5–10× on symbol / import / call-site lookups | Optional | **The wizard can install + build it for you automatically** (`pip install --user graphifyy` → first graph build takes 10–30 min on a real repo); or run `flockbots kg build` anytime later |
 
 ---
 

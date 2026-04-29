@@ -9,20 +9,28 @@ FlockBots is a Node process (the **coordinator**) that runs a SQLite task queue.
 ## The pipeline
 
 ```
-inbox → researching → [designing] → dev_ready → developing → review_pending → reviewing → [merged → qa]
+inbox → researching → [designing → wireframes_rendering → design_validation → awaiting_design_approval]
+      → dev_ready → developing → review_pending → reviewing → [merged → qa]
 ```
+
+The bracketed UI sub-pipeline runs only when the task touches UI. PM marks `skip_design: true` for backend / config / infra tasks, which routes the task straight from `researching` to `dev_ready`.
 
 | Stage | Agent | Entry | Exit |
 |-------|-------|-------|------|
 | inbox | (queue) | Task created | scheduler picks it up |
 | researching | PM | Task description | Spec + context pack |
-| designing | UX *(skipped for backend)* | Spec | Design tokens, screens |
-| developing | Dev | Spec + design | PR opened |
+| designing | UX *(skipped for backend)* | Context pack | HTML wireframes + `index.json` |
+| wireframes_rendering | (coordinator) | Wireframes written | PNGs uploaded to Supabase + per-screen `mediaUrls` written back to `index.json` |
+| design_validation | PM | Rendered proofs | `approved` or `revise` (≤2 PM rounds, then force-promote) |
+| awaiting_design_approval | (human) | Proofs sent to chat | Operator reply via `/design_reply` — approves or describes per-screen changes |
+| developing | Dev | Approved wireframes + spec | PR opened |
 | reviewing | Reviewer | PR URL | APPROVE or REQUEST_CHANGES |
 | merged | — | PR merged | QA queued if enabled |
-| qa | QA | Staging URL | Pass/fail + fix task if fail |
+| qa | QA | Staging URL | Pass / fail + visual fidelity report (drift_major spawns a child task) |
 
 Each stage uses a dedicated prompt in `agents/prompts/`. Large tasks enter "swarm mode": the dev session uses the Agent tool to spawn parallel sub-agents per file.
+
+**Design rework loops.** Both the PM-validation step and the human-approval step can route back to `design_pending` for another designer pass. PM revisions are capped at 2 (then force-promoted to the human gate so they don't ping-pong forever). Human revisions are unbounded — every reply that isn't `approved` triggers another round, and each round increments `context.json#design.round` so the renderer keeps PNGs from prior rounds at `wireframes/round-N/` for historical reference.
 
 ## Modules
 
@@ -30,6 +38,12 @@ Each stage uses a dedicated prompt in `agents/prompts/`. Large tasks enter "swar
 coordinator/src/
 ├── index.ts                Startup, cron schedules, graceful shutdown
 ├── pipeline.ts             The big state machine — one stage at a time
+├── design-pipeline.ts      Designing → wireframes_rendering → design_validation stages (split out of pipeline.ts; lazy-imports back into pipeline.ts to break the cycle)
+├── wireframe-renderer.ts   Drives Playwright over the designer's HTML; uploads PNGs to the Supabase wireframes bucket; tracks per-screen versions for partial re-render
+├── design-notify.ts        Sends rendered proofs to the operator with caption + per-screen images; on rework rounds, only attaches the screens the designer just touched
+├── design-feedback-parser.ts Haiku parser — operator's free-form reply → {approved, feedback: {"screen-id": "..."}}
+├── design-reply-handler.ts /design_reply command body → state transition (dev_ready or design_pending) + design-feedback.md
+├── task-media-upload.ts    Shared Supabase Storage upload helper (qa-media + wireframes); thin wrappers in pipeline.ts and wireframe-renderer.ts
 ├── queue.ts                SQLite queue + event/usage/escalation logging
 ├── scheduler.ts            Task picker — respects rate limits, peak hours
 ├── rate-limiter.ts         Budget estimation, calibration; reads shared rate-limit-state.json
