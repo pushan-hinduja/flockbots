@@ -35,7 +35,7 @@ export function InstanceSwitcher() {
           title={`${inst.target_repo} — ${online ? 'online' : 'offline'}`}
         >
           <span className="dot" />
-          {inst.display_name || inst.id}
+          <span className="name">{inst.display_name || inst.id}</span>
         </span>
       </div>
     );
@@ -55,7 +55,7 @@ export function InstanceSwitcher() {
         onClick={() => setOpen((v) => !v)}
       >
         <span className="dot" />
-        {current?.display_name || current?.id || '—'}
+        <span className="name">{current?.display_name || current?.id || '—'}</span>
         <span className="caret">▾</span>
       </button>
       {open && (

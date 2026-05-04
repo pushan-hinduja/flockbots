@@ -177,6 +177,20 @@ button.mc-instance-pill:hover { color: var(--accent); }
 }
 .mc-instance-pill[aria-expanded="true"] .caret { transform: rotate(180deg); }
 
+/* Truncate long instance names with ellipsis so the chrome never overflows
+ * the viewport. min-width:0 on the grid cell + max-width:100% on the pill
+ * lets the 1fr column at ≤1024px actually shrink below content size; the
+ * .name span carries the ellipsis. dot/caret stay fixed-width. */
+.mc-instance-wrap { min-width: 0; }
+.mc-instance-pill { max-width: 100%; }
+.mc-instance-pill .dot { flex-shrink: 0; }
+.mc-instance-pill .caret { flex-shrink: 0; }
+.mc-instance-pill .name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  min-width: 0;
+}
+
 .mc-instance-backdrop {
   position: fixed;
   inset: 0;
@@ -1222,12 +1236,15 @@ button.mc-instance-pill:hover { color: var(--accent); }
 }
 
 @media (max-width: 640px) {
-  /* --- Chrome: hide clock + uptime, keep brand + instance + status + signout --- */
+  /* --- Chrome: 4 items must fit (brand-mark, instance, status, signout).
+     Drop FLOCKBOTS wordmark + SYNC button to free width; tighten instance pill. --- */
   .mc-chrome { grid-template-columns: auto 1fr auto auto; }
   .mc-signout { padding: 0 10px; font-size: 9px; letter-spacing: 0.15em; }
   .mc-brand { padding: 0 10px; }
-  .mc-brand-name { font-size: 10px; letter-spacing: 0.22em; }
+  .mc-brand-name { display: none; }
+  .mc-instance-pill { padding: 0 10px; font-size: 10px; letter-spacing: 0.12em; gap: 6px; }
   .mc-chrome-status { padding: 0 8px; gap: 6px; font-size: 10px; }
+  .mc-chrome-status button { display: none; }
   .mc-chrome-right { display: none; }
 
   /* --- Tickers: single column --- */
