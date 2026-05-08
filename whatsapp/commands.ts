@@ -1,10 +1,11 @@
 import { db, Task, createTask, answerEscalation, getPendingEscalations, logEvent } from '../coordinator/src/queue';
 import { getBudgetEstimate, isPeakHours } from '../coordinator/src/rate-limiter';
-import { rollbackTask, deployToProduction } from '../coordinator/src/pipeline';
+import { rollbackTask, deployToProduction, updateStatus } from '../coordinator/src/pipeline';
 import { retryTask, dismissTask } from '../coordinator/src/task-actions';
 import { syncToSupabase } from '../coordinator/src/supabase-sync';
 import { killSession, isSessionRunning } from '../coordinator/src/session-manager';
 import { handleDesignReply } from '../coordinator/src/design-reply-handler';
+import { approveEpic, cancelEpic } from '../coordinator/src/epic';
 import { randomUUID } from 'crypto';
 
 const VALID_EFFORT_LEVELS = ['medium', 'high', 'xhigh', 'max'];
@@ -59,6 +60,8 @@ export async function handleWhatsAppMessage(from: string, text: string): Promise
         '  /dismiss {id} - Dismiss a failed task',
         '  /answer {id} {text} - Answer an agent escalation',
         '  /design_reply {id} {text} - Approve / revise wireframes (use "approved" to ship)',
+        '  /approve_epic {id} - Approve a decomposed epic and queue its phases',
+        '  /cancel_epic {id} - Cancel a decomposed epic before phases run',
         '',
         'Overrides (apply to current stage; kills + reruns if in-flight)',
         '  /effort {id} {medium|high|xhigh|max}',
@@ -242,6 +245,18 @@ export async function handleWhatsAppMessage(from: string, text: string): Promise
       const taskId = parts[1];
       if (!taskId) return 'Usage: /dismiss {task-id}';
       return await dismissTask(taskId);
+    }
+
+    case '/approve_epic': {
+      const epicId = parts[1];
+      if (!epicId) return 'Usage: /approve_epic {epic-id}';
+      return await approveEpic(epicId, updateStatus);
+    }
+
+    case '/cancel_epic': {
+      const epicId = parts[1];
+      if (!epicId) return 'Usage: /cancel_epic {epic-id}';
+      return await cancelEpic(epicId);
     }
 
     case '/rollback': {

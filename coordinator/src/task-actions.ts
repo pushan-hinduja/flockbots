@@ -45,16 +45,65 @@ export async function retryTask(taskId: string): Promise<string> {
     `Retrying from ${resumeStatus} (research artifacts: ${hasResearch ? 'reused' : 'none'})`);
   await syncToSupabase('task_update', { id: taskId });
 
+  // If this is a phase whose parent epic was halted (awaiting_human due to
+  // this phase failing), un-halt the epic so the orchestrator tick can
+  // continue once the phase finishes. The epic's saved previous_status
+  // (in error JSON) is 'epic_in_progress', so we restore that.
+  if (task.parent_task_id) {
+    const parent = db.prepare('SELECT id, status, is_epic FROM tasks WHERE id = ?')
+      .get(task.parent_task_id) as { id: string; status: string; is_epic: number } | undefined;
+    if (parent?.is_epic === 1 && parent.status === 'awaiting_human') {
+      db.prepare('UPDATE tasks SET status = ?, error = NULL, updated_at = ? WHERE id = ?')
+        .run('epic_in_progress', Date.now(), parent.id);
+      dismissEscalationsForTask(parent.id);
+      logEvent(parent.id, 'system', 'epic_resumed',
+        `Resumed (epic_in_progress) after retry of phase ${taskId}`);
+      await syncToSupabase('task_update', { id: parent.id });
+    }
+  }
+
   return `Task ${taskId} queued for retry at ${resumeStatus}`;
 }
 
 /**
  * Dismiss a task — removes it from the pipeline regardless of current status.
+ * For epics, cascades: any non-terminal phase / integration-QA child is also
+ * dismissed (with its session killed if running). The epic branch on origin
+ * is left intact so the operator can inspect or salvage work later.
  */
 export async function dismissTask(taskId: string): Promise<string> {
   const task = db.prepare('SELECT * FROM tasks WHERE id = ?').get(taskId) as any;
   if (!task) return `Task ${taskId} not found`;
-  if (task.status === 'dismissed' || task.status === 'merged') return `Task ${taskId} is already ${task.status}`;
+  if (task.status === 'dismissed' || task.status === 'merged' || task.status === 'epic_done') {
+    return `Task ${taskId} is already ${task.status}`;
+  }
+
+  // Epic cascade: dismiss children before dismissing the epic itself.
+  let cascadedSummary = '';
+  if (task.is_epic === 1) {
+    const TERMINAL = ['merged', 'dismissed', 'failed', 'deployed', 'epic_done'];
+    const children = db.prepare(`
+      SELECT id, status FROM tasks
+      WHERE parent_task_id = ? AND status NOT IN (${TERMINAL.map(() => '?').join(',')})
+    `).all(taskId, ...TERMINAL) as Array<{ id: string; status: string }>;
+
+    if (children.length > 0) {
+      const { killSession, isSessionRunning } = await import('./session-manager');
+      for (const child of children) {
+        try {
+          if (isSessionRunning(child.id).running) killSession(child.id);
+        } catch { /* best effort */ }
+        try { await cleanupWorktree(child.id); } catch {}
+        db.prepare('UPDATE tasks SET status = ?, error = NULL, updated_at = ? WHERE id = ?')
+          .run('dismissed', Date.now(), child.id);
+        dismissEscalationsForTask(child.id);
+        await syncToSupabase('task_update', { id: child.id });
+        logEvent(child.id, 'system', 'task_dismissed_cascade',
+          `Dismissed as part of epic ${taskId} cancellation (was ${child.status})`);
+      }
+      cascadedSummary = ` (cascaded to ${children.length} child task${children.length === 1 ? '' : 's'})`;
+    }
+  }
 
   try { await cleanupWorktree(taskId); } catch {}
 
@@ -62,10 +111,11 @@ export async function dismissTask(taskId: string): Promise<string> {
     .run('dismissed', Date.now(), taskId);
 
   dismissEscalationsForTask(taskId);
-  logEvent(taskId, 'system', 'task_dismissed', 'Task dismissed from dashboard');
+  logEvent(taskId, 'system', 'task_dismissed',
+    task.is_epic === 1 ? `Epic dismissed${cascadedSummary}` : 'Task dismissed from dashboard');
   await syncToSupabase('task_update', { id: taskId });
 
-  return `Task ${taskId} dismissed`;
+  return `Task ${taskId} dismissed${cascadedSummary}`;
 }
 
 /**

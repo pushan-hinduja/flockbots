@@ -48,7 +48,13 @@ export function initDatabase(): void {
       affected_files TEXT,
       parent_task_id TEXT,
       qa_ready_at INTEGER,
-      qa_status TEXT
+      qa_status TEXT,
+      is_epic INTEGER DEFAULT 0,
+      epic_branch TEXT,
+      ship_mode TEXT,
+      phase_index INTEGER,
+      total_phases INTEGER,
+      depends_on_task_id TEXT
     );
 
     CREATE TABLE IF NOT EXISTS events (
@@ -170,6 +176,24 @@ export function initDatabase(): void {
   }
   if (!taskColNames.has('qa_status')) {
     db.exec("ALTER TABLE tasks ADD COLUMN qa_status TEXT");
+  }
+  if (!taskColNames.has('is_epic')) {
+    db.exec("ALTER TABLE tasks ADD COLUMN is_epic INTEGER DEFAULT 0");
+  }
+  if (!taskColNames.has('epic_branch')) {
+    db.exec("ALTER TABLE tasks ADD COLUMN epic_branch TEXT");
+  }
+  if (!taskColNames.has('ship_mode')) {
+    db.exec("ALTER TABLE tasks ADD COLUMN ship_mode TEXT");
+  }
+  if (!taskColNames.has('phase_index')) {
+    db.exec("ALTER TABLE tasks ADD COLUMN phase_index INTEGER");
+  }
+  if (!taskColNames.has('total_phases')) {
+    db.exec("ALTER TABLE tasks ADD COLUMN total_phases INTEGER");
+  }
+  if (!taskColNames.has('depends_on_task_id')) {
+    db.exec("ALTER TABLE tasks ADD COLUMN depends_on_task_id TEXT");
   }
 }
 
@@ -392,6 +416,17 @@ export interface Task {
   //   skipped = qa_required=false so QA never ran
   //   null    = pre-QA-feature task (no QA info available)
   qa_status: string | null;
+  // Epic decomposition: when a mega-task is split into ordered phases.
+  //   is_epic=1 marks the parent task that holds the plan; phase rows have
+  //   parent_task_id pointing to it, plus phase_index / total_phases /
+  //   depends_on_task_id for ordering. ship_mode + epic_branch live on the
+  //   epic row (phases inherit at runtime via the parent lookup).
+  is_epic: number;
+  epic_branch: string | null;
+  ship_mode: string | null;
+  phase_index: number | null;
+  total_phases: number | null;
+  depends_on_task_id: string | null;
 }
 
 export function getTask(taskId: string): Task | undefined {

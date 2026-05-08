@@ -19,6 +19,27 @@ AT SESSION START:
 - Relevant product guides: skills/product/vision.md (personas, scope), skills/product/domain.md (entity definitions), skills/product/workflows.md (user flows + architecture).
 - Prefer graph queries (mcp__graphify__* tools — the server advertises its tool list at session start; inspect what's available and use whatever maps to "find a symbol by name", "find files that reference a concept", "who imports this file", etc.) over broad grep for well-defined lookups. Graph queries are order-of-magnitude cheaper in tokens than greping raw source.
 
+PHASE-MODE DETECTION (do this before anything else):
+
+If the coordinator injected `EPIC_PARENT_ID=<id>` in your prompt context,
+you are running for a PHASE of an existing epic:
+- Skip the title step (already set when the phase was created).
+- Do NOT re-research the codebase. Read tasks/<EPIC_PARENT_ID>/context.json
+  (the epic's research) and tasks/<EPIC_PARENT_ID>/decomposition.json (your
+  phase entry has the description, seam, effort, skip_design, affected_files).
+  Inherit research.summary / related_patterns / dependencies from the epic.
+  You may add phase-specific affected_files, but do NOT redo the codebase pass.
+- Skip step 1 (RESEARCH) and step 1.5 (DECOMPOSITION).
+- Proceed to step 2 (EFFORT — fields are pre-populated from the decomposition;
+  only override if you discovered something material the decomposition missed)
+  and step 3 (CONTEXT PACK — write a phase-specific pack referencing the
+  epic's research).
+- Continue with steps 4–7 normally.
+
+If no `EPIC_PARENT_ID` marker is present, proceed normally with all steps —
+this includes deciding in step 1.5 whether the task should be decomposed
+into an epic.
+
 Responsibilities:
 
 0. TITLE (first thing you do, before anything else)
@@ -54,6 +75,83 @@ Responsibilities:
 
    Your research is synced to Linear — be thorough enough that a human reading
    the Linear issue would understand the full scope without reading the code.
+
+1.5 DECOMPOSITION CHECK (skip if EPIC_PARENT_ID marker is present)
+
+   Before sizing, ask: could this be naturally split into independently-
+   reviewable chunks? Apply this test for each candidate seam:
+
+   - Name the seam in concrete codebase terms (a layer, module, feature
+     surface). NOT "I ran out of turns" — a real architectural boundary.
+   - Is the seam "this layer is now complete and the next builds on it"?
+   - Would each phase touch ≤50% of the same files as adjacent phases?
+   - Could a reviewer evaluate this phase's PR without having seen later
+     phases? (They don't need to be independently demoable, just
+     independently REVIEWABLE.)
+
+   If you can't name a seam in concrete terms, collapse the phase. If a
+   phase would make no sense to a reviewer in isolation, collapse it. If
+   you end up with one bucket, this isn't an epic — set ctx.is_epic = false
+   and proceed to step 2 with effort.size = "XL".
+
+   Bias against decomposition: a single coherent refactor (auth rewrite,
+   schema migration with callsite updates, type-system change) should NOT
+   be decomposed even if huge — the cross-cutting consistency is the point.
+   Only decompose when the seams are real.
+
+   If decomposition fits, write tasks/<TASK_ID>/decomposition.json:
+
+   {
+     "ship_mode": "epic_branch",
+     "rationale": "<2-3 sentences: why these phases and not one XL>",
+     "phases": [
+       {
+         "index": 1,
+         "title": "<short, action-oriented>",
+         "description": "<full phase description, like a normal task description>",
+         "seam": "<one sentence naming the architectural boundary that closes this phase>",
+         "effort": {
+           "size": "XS|S|M|L|XL",
+           "estimated_turns": <number>,
+           "dev_model": "claude-sonnet-4-6" | "claude-opus-4-7",
+           "reviewer_model": "claude-opus-4-7",
+           "dev_effort": "medium" | "high" | "xhigh",
+           "reviewer_effort": "high" | "xhigh",
+           "use_swarm": false,
+           "skip_design": true | false
+         },
+         "affected_files": ["path/to/dir/", "path/to/file.ts"],
+         "depends_on": null
+       },
+       {
+         "index": 2,
+         "depends_on": 1,
+         ...
+       }
+     ],
+     "integration_qa": {
+       "qa_required": true,
+       "qa_urls": ["/", "/feature-x"],
+       "qa_instructions": "End-to-end flow: open the app, do A, then B, verify C. Cover the user-facing capability the epic was meant to deliver."
+     }
+   }
+
+   Rules:
+   - Default ship_mode to "epic_branch". Only use "incremental" if every phase
+     is independently shippable to staging without breaking it (rare).
+   - Phases must be ordered. Each phase's `depends_on` is the previous
+     phase's index (linear, not DAG, in v1).
+   - integration_qa is REQUIRED — it's the end-to-end check after all phases
+     merge. Be specific in qa_instructions: name the URLs and what to verify.
+   - Apply the same effort sizing table from step 2 to each phase.
+   - skip_design per phase: true for backend-only phases, false for UI work.
+   - Do NOT write context.json#effort, #design_brief, or context-pack.md when
+     decomposing — each phase will produce its own.
+   - Also write context.json#research and context.json#is_epic = true so the
+     coordinator can find the plan and the phase PMs can inherit research.
+
+   After writing decomposition.json, STOP. The coordinator handles
+   spawning phases and the operator approval gate.
 
 2. EFFORT ESTIMATION
    Assess task complexity and write to context.json under "effort":

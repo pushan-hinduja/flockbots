@@ -10,6 +10,8 @@ interface SchedulableTask {
   priority: number;
   status: string;
   affected_files: string | null;
+  parent_task_id: string | null;
+  depends_on_task_id: string | null;
 }
 
 // Track whether we've already logged the peak deferral to avoid spamming the activity feed
@@ -46,16 +48,26 @@ function pathsOverlap(a: string[], b: string[]): boolean {
 }
 
 /** Find in-flight tasks whose affected_files overlap with the candidate's. */
-function conflictingInFlightTasks(candidateId: string, candidateFiles: string[] | null): string[] {
+function conflictingInFlightTasks(
+  candidateId: string,
+  candidateFiles: string[] | null,
+  candidateParentId: string | null,
+): string[] {
   const inflight = db.prepare(`
-    SELECT id, affected_files
+    SELECT id, affected_files, parent_task_id
     FROM tasks
     WHERE status IN ('developing', 'review_pending', 'reviewing')
       AND id != ?
-  `).all(candidateId) as { id: string; affected_files: string | null }[];
+  `).all(candidateId) as { id: string; affected_files: string | null; parent_task_id: string | null }[];
 
   const conflicts: string[] = [];
   for (const other of inflight) {
+    // Sibling-phase bypass: phases of the same epic are sequenced by the
+    // dependency chain (depends_on_task_id), so they should never be
+    // contending for the same files in practice. Skip them here so we don't
+    // double-serialize.
+    if (candidateParentId && other.parent_task_id === candidateParentId) continue;
+
     const otherFiles = parseAffectedFiles(other.affected_files);
     // Conservative fallback: if either side has no affected_files, assume overlap.
     // This serializes tasks with unknown scope so we don't ship a bad merge.
@@ -69,6 +81,19 @@ function conflictingInFlightTasks(candidateId: string, candidateFiles: string[] 
     }
   }
   return conflicts;
+}
+
+/**
+ * For phases of an epic: the prior phase must be merged (or deployed) before
+ * this phase can move into dev. Returns true if the candidate is blocked.
+ * Non-phase tasks (no depends_on_task_id) always return false.
+ */
+function isBlockedByDependency(task: SchedulableTask): boolean {
+  if (!task.depends_on_task_id) return false;
+  const dep = db.prepare("SELECT status FROM tasks WHERE id = ?")
+    .get(task.depends_on_task_id) as { status: string } | undefined;
+  if (!dep) return false; // dependency disappeared; don't block
+  return dep.status !== 'merged' && dep.status !== 'deployed';
 }
 
 /**
@@ -94,7 +119,8 @@ export function pickNextTask(): SchedulableTask | null {
   rateLimitLogged = false;
 
   const readyTasks = db.prepare(`
-    SELECT id, title, effort_size, dev_model, dev_effort, priority, status, affected_files
+    SELECT id, title, effort_size, dev_model, dev_effort, priority, status,
+           affected_files, parent_task_id, depends_on_task_id
     FROM tasks
     WHERE status = 'dev_ready'
     ORDER BY priority ASC, created_at ASC
@@ -114,9 +140,14 @@ export function pickNextTask(): SchedulableTask | null {
   for (const task of readyTasks) {
     if (!budget.canRunEffort(task.effort_size, task.dev_model, task.dev_effort)) continue;
 
+    // Phase-dependency check: an epic phase can't enter dev until its
+    // predecessor has merged. Stays silent (no event log spam) since this is
+    // the steady-state for early phases waiting on later ones.
+    if (isBlockedByDependency(task)) continue;
+
     // File-overlap serialization
     const candidateFiles = parseAffectedFiles(task.affected_files);
-    const conflicts = conflictingInFlightTasks(task.id, candidateFiles);
+    const conflicts = conflictingInFlightTasks(task.id, candidateFiles, task.parent_task_id);
 
     if (conflicts.length > 0) {
       const now = Date.now();

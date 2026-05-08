@@ -273,6 +273,10 @@ export function MissionConsole() {
         if (t.status === 'awaiting_design_approval' && def.id === 'ux') {
           return true;
         }
+        // Epic-plan-approval gates pin PM (PM authored the decomposition).
+        if (t.status === 'epic_awaiting_approval' && def.id === 'pm') {
+          return true;
+        }
         return false;
       });
       const isActive = !!activeTask;
@@ -285,6 +289,8 @@ export function MissionConsole() {
         : isWaiting
           ? (waitingTasks[0].status === 'awaiting_design_approval'
               ? `Awaiting design approval · ${waitingTasks[0].title}`
+              : waitingTasks[0].status === 'epic_awaiting_approval'
+              ? `Awaiting epic approval · ${waitingTasks[0].title}`
               : `Awaiting human · ${waitingTasks[0].title}`)
           : 'Idle';
       return { def, status, activeTask, taskLine };
@@ -495,7 +501,9 @@ export function MissionConsole() {
   // EscalationBanner component (rendered by Dashboard.tsx) breaks them out
   // with per-row context + the right slash-command hint.
   const awaitingHuman = tasks.filter((t: any) =>
-    t.status === 'awaiting_human' || t.status === 'awaiting_design_approval'
+    t.status === 'awaiting_human' ||
+    t.status === 'awaiting_design_approval' ||
+    t.status === 'epic_awaiting_approval'
   );
 
   return (

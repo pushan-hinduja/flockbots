@@ -14,9 +14,14 @@ import { syncToSupabase } from './supabase-sync';
 import { notifyOperator } from './notifier';
 import { updateLinearIssue, createLinearIssue, enrichLinearIssue } from './linear-sync';
 import { validatePmOutput, validateUxOutput, validateDevOutput, validateReviewerOutput, validateQAOutput, buildValidationRetryPrompt } from './output-validator';
-import { rebaseOnStaging } from './worktree-manager';
+import { rebaseOnBase } from './worktree-manager';
 import { flockbotsHome, flockbotsRoot, tasksDir } from './paths';
 import { runDesignStage, runWireframesRendering, runDesignValidation } from './design-pipeline';
+import {
+  enterEpicApprovalGate, validateDecomposition,
+  isEpicPhase, getBaseBranchForTask,
+  spawnIntegrationQATask, finalizeEpic, maybeFinalizeEpicAfterFix,
+} from './epic';
 
 const TARGET_REPO_PATH = process.env.TARGET_REPO_PATH || '';
 const TASKS_DIR = tasksDir();
@@ -40,11 +45,16 @@ function agentForStatus(status: string): string {
       return 'reviewer';
     case 'qa_pending': case 'qa_running':
       return 'qa';
-    // Coordinator-only stages (no agent invocation): wireframe rendering and
-    // the human-approval wait. Returned as themselves so concurrency locks
-    // don't grab an agent slot for them.
+    // Coordinator-only stages (no agent invocation): wireframe rendering,
+    // human-approval waits, and epic orchestration states. Distinct keys
+    // so an epic orchestrator tick doesn't block an integration tick.
     case 'wireframes_rendering': case 'awaiting_design_approval':
+    case 'epic_awaiting_approval': case 'epic_done':
       return status;
+    case 'epic_in_progress':
+      return 'epic_orchestrator';
+    case 'epic_integrating':
+      return 'epic_integrator';
     default:
       return status;
   }
@@ -105,6 +115,12 @@ const STATUS_LABELS: Record<string, string> = {
   deployed: 'Deployed to production',
   failed: 'Task failed',
   awaiting_human: 'Waiting for human input',
+  // Epic decomposition statuses (a mega-task split into ordered phases).
+  epic_planning: 'Planning phases',
+  epic_awaiting_approval: 'Waiting for human to approve phase plan',
+  epic_in_progress: 'Phases in progress',
+  epic_integrating: 'Integration QA running',
+  epic_done: 'Epic complete',
 };
 
 export async function updateStatus(taskId: string, status: string): Promise<void> {
@@ -112,10 +128,13 @@ export async function updateStatus(taskId: string, status: string): Promise<void
     .run(status, Date.now(), taskId);
   logEvent(taskId, 'system', 'status_change', STATUS_LABELS[status] || `Status: ${status}`);
   // Auto-clear pending escalations when the task moves past a human-wait
-  // status. awaiting_design_approval also creates an escalation row (so the
-  // dashboard banner surfaces it), so we keep that escalation alive while
-  // the task is in either of these statuses and dismiss it on transition out.
-  if (status !== 'awaiting_human' && status !== 'awaiting_design_approval') {
+  // status. awaiting_design_approval and epic_awaiting_approval also create
+  // escalation rows (so the dashboard banner surfaces them), so we keep
+  // those escalations alive while in those statuses and dismiss on
+  // transition out.
+  if (status !== 'awaiting_human' &&
+      status !== 'awaiting_design_approval' &&
+      status !== 'epic_awaiting_approval') {
     dismissEscalationsForTask(taskId);
   }
   await syncToSupabase('task_update', { id: taskId, status });
@@ -270,6 +289,25 @@ async function runResearchStage(task: Task): Promise<void> {
     }
   }
 
+  // Phase mode: when a task is a phase of an epic, inject the EPIC_PARENT_ID
+  // marker so the PM prompt skips RESEARCH + DECOMPOSITION and inherits from
+  // the epic's already-completed research.
+  let phaseContext = '';
+  if (isEpicPhase(task)) {
+    phaseContext = [
+      '',
+      `EPIC_PARENT_ID=${task.parent_task_id}`,
+      `You are running for PHASE ${task.phase_index || '?'} of epic ${task.parent_task_id}.`,
+      `Read tasks/${task.parent_task_id}/decomposition.json (your phase entry) and`,
+      `tasks/${task.parent_task_id}/context.json (the epic's research). Follow the`,
+      `PHASE-MODE DETECTION rules at the top of your prompt — skip RESEARCH and`,
+      `DECOMPOSITION steps, write a phase-specific context-pack, then proceed to`,
+      `EFFORT/DESIGN_BRIEF as needed.`,
+    ].join('\n');
+  }
+
+  const combinedContext = [answerContext, phaseContext].filter(Boolean).join('');
+
   const result = await runAgentWithRetry({
     agent: 'pm',
     taskId: task.id,
@@ -277,7 +315,7 @@ async function runResearchStage(task: Task): Promise<void> {
     tools: AGENT_DEFAULTS.pm.tools,
     cwd: TARGET_REPO_PATH,
     resume: isResume, // Resume PM's session if continuing after an escalation answer
-    extraPromptContext: answerContext || undefined,
+    extraPromptContext: combinedContext || undefined,
     enableStreaming: true,
   }, 3);
 
@@ -301,6 +339,40 @@ async function runResearchStage(task: Task): Promise<void> {
   switch (result.status) {
     case 'complete': {
       const ctx = readJSON(join(TASKS_DIR, task.id, 'context.json'));
+
+      // Epic-mode short-circuit: PM decided to decompose this task. Validate
+      // the plan, then enter the operator-approval gate. The normal
+      // effort/design/dev routing does NOT apply here — each spawned phase
+      // will run its own PM stage. We retry once on validation failure
+      // (mirrors the per-task validatePmOutput retry below), then escalate.
+      if (ctx?.is_epic === true) {
+        let validation = validateDecomposition(task.id);
+        if (!validation.valid) {
+          logEvent(task.id, 'validator', 'epic_invalid', validation.errors.join(', '));
+          const retryResult = await runAgentWithRetry({
+            agent: 'pm', taskId: task.id, model: 'claude-sonnet-4-6',
+            tools: AGENT_DEFAULTS.pm.tools, cwd: TARGET_REPO_PATH,
+            resume: true,
+            extraPromptContext: buildValidationRetryPrompt(validation.errors),
+            enableStreaming: true,
+          }, 1);
+          if (retryResult.status !== 'complete') {
+            await handleAgentResult(task, retryResult);
+            break;
+          }
+          validation = validateDecomposition(task.id);
+          if (!validation.valid) {
+            await handleFailure(task, {
+              ...result,
+              output: `Epic decomposition invalid after retry: ${validation.errors.join(', ')}`,
+            });
+            break;
+          }
+        }
+        await enterEpicApprovalGate(task, validation.decomposition!, updateStatus);
+        break;
+      }
+
       if (ctx.effort) {
         db.prepare(`
           UPDATE tasks SET effort_size = ?, estimated_turns = ?,
@@ -356,11 +428,17 @@ async function runResearchStage(task: Task): Promise<void> {
         await syncToSupabase('task_update', { id: task.id });
       }
 
-      // Sync research findings to Linear
+      // Sync research findings to Linear. Phases (source='epic-phase'),
+      // integration QA tasks (source='epic-qa'), and integration-QA fixes
+      // (source='epic-qa-fix') do NOT get their own Linear issues — the
+      // parent epic owns the Linear link in v1.
       const cleanTitle = pmTitle || task.title;
+      const isEpicChild = task.source === 'epic-phase' ||
+                          task.source === 'epic-qa' ||
+                          task.source === 'epic-qa-fix';
       if (task.source === 'linear' && task.source_id) {
         await enrichLinearIssue(task.source_id, ctx, pmTitle);
-      } else if (!task.source_id) {
+      } else if (!task.source_id && !isEpicChild) {
         const linearId = await createLinearIssue(
           cleanTitle,
           `${task.description}\n\n${ctx.research?.summary || ''}`,
@@ -480,7 +558,8 @@ ${humanContext}${priorReviews}`,
 }
 
 async function runDevPipeline(task: Task): Promise<void> {
-  const worktreePath = await createWorktree(task.id);
+  const baseBranch = getBaseBranchForTask(task, GITHUB_STAGING_BRANCH);
+  const worktreePath = await createWorktree(task.id, baseBranch);
   db.prepare('UPDATE tasks SET worktree_path = ?, branch_name = ?, updated_at = ? WHERE id = ?')
     .run(worktreePath, `task/${task.id}`, Date.now(), task.id);
   await syncToSupabase('task_update', { id: task.id });
@@ -597,12 +676,14 @@ async function runCreatePR(task: Task): Promise<void> {
   if (!worktreePath || !branchName) { await handleFailure(task, { status: 'failed', output: 'Missing worktree_path or branch_name', durationMs: 0, exitCode: 1 }); return; }
   const octokit = await getOctokit();
 
-  // Rebase on latest staging to avoid merge conflicts. The helper escalates
-  // rebase → merge → AI conflict resolver before giving up.
-  const rebaseResult = await rebaseOnStaging(task.id);
+  // Rebase on the task's base branch (staging for normal tasks, epic/<id>
+  // for phases). The helper escalates rebase → merge → AI conflict resolver
+  // before giving up.
+  const baseBranchForRebase = getBaseBranchForTask(task, GITHUB_STAGING_BRANCH);
+  const rebaseResult = await rebaseOnBase(task.id, baseBranchForRebase);
   if (rebaseResult.ok && rebaseResult.strategy !== 'rebase') {
     logEvent(task.id, 'system', 'rebase_recovered',
-      `Integrated staging via "${rebaseResult.strategy}" strategy (rebase had conflicts)`);
+      `Integrated ${baseBranchForRebase} via "${rebaseResult.strategy}" strategy (rebase had conflicts)`);
   }
   if (!rebaseResult.ok) {
     // Network errors are transient — leave the task at review_pending and let the next
@@ -676,7 +757,12 @@ Or use the dashboard to revert the task to Ready and let dev re-implement.`);
     prBody = `Automated implementation for task ${task.id}`;
   }
 
-  let pr: { html_url: string; number: number } = null as any;
+  let pr: { html_url: string; number: number; base?: { ref: string } } = null as any;
+
+  // Phase tasks PR into their epic branch instead of staging — keeps
+  // staging clean until the epic is fully integrated. Computed up front so
+  // both reuse and recover paths can verify the PR's base matches.
+  const prBaseBranch = getBaseBranchForTask(task, GITHUB_STAGING_BRANCH);
 
   // If the task already has a PR from a previous cycle, reuse it
   if (task.pr_number) {
@@ -715,7 +801,7 @@ Or use the dashboard to revert the task to Ready and let dev re-implement.`);
         repo: GITHUB_REPO,
         title: task.title,
         head: branchName,
-        base: GITHUB_STAGING_BRANCH,
+        base: prBaseBranch,
         body: prBody,
       });
       pr = data;
@@ -757,6 +843,28 @@ Or use the dashboard to revert the task to Ready and let dev re-implement.`);
         await handleFailure(task, { status: 'failed', output: `PR creation failed: ${detail}`, durationMs: 0, exitCode: 1 });
         return;
       }
+    }
+  }
+
+  // Verify the PR's base matches the branch we expect. Reused/reopened PRs
+  // can target a stale base (e.g. an old PR targeting staging when this is
+  // now a phase needing epic/<id>). Update via API — supports retargeting
+  // open PRs without a close+recreate cycle. Best effort: if the update
+  // fails, the merge step will surface the issue.
+  const currentBase = pr.base?.ref;
+  if (currentBase && currentBase !== prBaseBranch) {
+    logEvent(task.id, 'system', 'pr_base_corrected',
+      `PR #${pr.number} retargeted: ${currentBase} → ${prBaseBranch}`);
+    try {
+      const { data: updated } = await octokit.pulls.update({
+        owner: GITHUB_OWNER, repo: GITHUB_REPO,
+        pull_number: pr.number,
+        base: prBaseBranch,
+      });
+      pr = updated;
+    } catch (err: any) {
+      logEvent(task.id, 'system', 'pr_base_update_failed',
+        `Could not retarget PR #${pr.number} base to ${prBaseBranch}: ${err?.message || err}`);
     }
   }
 
@@ -912,9 +1020,19 @@ Your job this round:
 
       // Decide next status: if reviewer flagged qa_required and QA is enabled,
       // transition to qa_pending instead of merged. Otherwise go straight to merged.
+      // Epic phases skip per-phase QA entirely — the integration QA at epic
+      // completion is what verifies user-facing behavior. (The reviewer's
+      // qa_required flag is still preserved in context.json for posterity.)
       const ctxAfterMerge = readJSON(join(TASKS_DIR, task.id, 'context.json'));
-      const qaRequired = ctxAfterMerge?.qa?.qa_required === true;
+      const reviewerWantsQA = ctxAfterMerge?.qa?.qa_required === true;
       const qaEnabled = (process.env.QA_ENABLED || '').toLowerCase() === 'true';
+      const phaseSkipsQA = isEpicPhase(task);
+      const qaRequired = reviewerWantsQA && !phaseSkipsQA;
+
+      if (phaseSkipsQA && reviewerWantsQA) {
+        logEvent(task.id, 'system', 'phase_qa_deferred',
+          `Reviewer flagged qa_required, but phase QA is deferred to epic-level integration QA`);
+      }
 
       if (qaRequired && qaEnabled) {
         // Give Vercel time to finish deploying the merge before QA hits staging.
@@ -935,9 +1053,29 @@ Your job this round:
         db.prepare("UPDATE tasks SET qa_status = 'skipped', updated_at = ? WHERE id = ?")
           .run(Date.now(), task.id);
         await updateStatus(task.id, 'merged');
-        await notifyOperator(`${task.title}\nPR: ${task.pr_url}`);
+
+        // Phase-aware notification: epic phases get "Phase N/M merged" so the
+        // operator can track progress through the decomposition. Standalone
+        // tasks keep the original single-line notification.
+        if (phaseSkipsQA && task.phase_index && task.total_phases) {
+          const epicTitle = task.parent_task_id
+            ? (db.prepare('SELECT title FROM tasks WHERE id = ?').get(task.parent_task_id) as any)?.title
+            : null;
+          const epicLine = epicTitle ? `\nEpic: ${epicTitle}` : '';
+          await notifyOperator(
+            `Phase ${task.phase_index}/${task.total_phases} merged: ${task.title}${epicLine}\nPR: ${task.pr_url}`
+          );
+        } else {
+          await notifyOperator(`${task.title}\nPR: ${task.pr_url}`);
+        }
         if (qaRequired && !qaEnabled) {
           logEvent(task.id, 'system', 'qa_skipped', `QA was flagged required but QA_ENABLED=false — skipping`);
+        }
+
+        // Epic QA fix landed — close the epic if all integration-QA fixes
+        // are done. No-op if this isn't a fix or other fixes are pending.
+        if (task.source === 'epic-qa-fix' && task.parent_task_id) {
+          await maybeFinalizeEpicAfterFix(task.parent_task_id);
         }
       }
 
@@ -1168,7 +1306,20 @@ async function runQAStage(task: Task): Promise<void> {
     db.prepare('UPDATE tasks SET completed_at = ?, updated_at = ? WHERE id = ?')
       .run(Date.now(), Date.now(), task.id);
     await updateStatus(task.id, 'merged');
-    await notifyOperatorQAPass(task, ctxAfter);
+
+    // Integration QA for an epic: finalize the parent epic. Suppress the
+    // generic QA-pass notification — finalizeEpic sends its own epic-aware
+    // message.
+    if (task.source === 'epic-qa' && task.parent_task_id) {
+      await finalizeEpic(task.parent_task_id, 'passed');
+    } else {
+      await notifyOperatorQAPass(task, ctxAfter);
+    }
+
+    // Epic QA fix landed — close the epic if all integration-QA fixes are done.
+    if (task.source === 'epic-qa-fix' && task.parent_task_id) {
+      await maybeFinalizeEpicAfterFix(task.parent_task_id);
+    }
     cleanupQAArtifacts(task.id);
     return;
   }
@@ -1186,10 +1337,26 @@ async function runQAStage(task: Task): Promise<void> {
   db.prepare("UPDATE tasks SET qa_status = 'failed' WHERE id = ?").run(task.id);
   await updateStatus(task.id, 'qa_failed');
   await createQAFixTask(task, failure);
-  await notifyOperatorQAFail(task, failure);
+
+  // Integration QA for an epic: halt the epic with finalizeEpic's escalation
+  // (it knows the epic context). Suppress the generic QA-fail notification.
+  if (task.source === 'epic-qa' && task.parent_task_id) {
+    await finalizeEpic(task.parent_task_id, 'failed', failure);
+  } else {
+    await notifyOperatorQAFail(task, failure);
+  }
+
   db.prepare('UPDATE tasks SET completed_at = ?, updated_at = ? WHERE id = ?')
     .run(Date.now(), Date.now(), task.id);
   await updateStatus(task.id, 'merged');
+
+  // Epic QA fix landed (with QA failure → another fix already spawned by
+  // createQAFixTask above). maybeFinalizeEpicAfterFix sees the new fix as
+  // pending and skips closing — but call it for symmetry with the pass
+  // path so any chain-end correctly finalizes when fixes finally clear.
+  if (task.source === 'epic-qa-fix' && task.parent_task_id) {
+    await maybeFinalizeEpicAfterFix(task.parent_task_id);
+  }
   cleanupQAArtifacts(task.id);
 }
 
@@ -1310,8 +1477,32 @@ function cleanupQAArtifacts(taskId: string): void {
 }
 
 /**
+ * Walk a task's parent chain to find the originating epic, if any. Returns
+ * the epic's task ID when one is found, else null. Used to route QA-fix
+ * tasks back to their epic regardless of how many fix-of-fix levels deep
+ * we are.
+ */
+function findAncestorEpicId(task: Task): string | null {
+  if (task.is_epic === 1) return task.id;
+  const visited = new Set<string>();
+  let current: Task | undefined = task;
+  while (current && !visited.has(current.id)) {
+    visited.add(current.id);
+    if (current.is_epic === 1) return current.id;
+    if (!current.parent_task_id) return null;
+    current = db.prepare('SELECT * FROM tasks WHERE id = ?').get(current.parent_task_id) as Task | undefined;
+  }
+  return null;
+}
+
+/**
  * Create a new inbox task that links back to the failed QA's parent. The dev
  * pipeline picks it up naturally on the next tick.
+ *
+ * For epic-tied QA failures (integration QA or any fix-of-fix descended
+ * from one), the new task is linked directly to the EPIC with source
+ * 'epic-qa-fix' so maybeFinalizeEpicAfterFix can detect when all fixes
+ * have landed and close the epic.
  */
 async function createQAFixTask(parent: Task, failure: any): Promise<void> {
   const { createTask } = await import('./queue');
@@ -1332,19 +1523,26 @@ async function createQAFixTask(parent: Task, failure: any): Promise<void> {
     `Read full failure details at tasks/${parent.id}/qa-failure.json before coding.`,
   ].filter(Boolean).join('\n');
 
+  const epicId = findAncestorEpicId(parent);
+  const fixSource = epicId ? 'epic-qa-fix' : 'qa-auto';
+  const fixParentId = epicId || parent.id;
+  const titlePrefix = epicId ? 'Epic QA fix' : 'QA fix';
+
   createTask(
     newId,
-    `QA fix: ${parent.title}`,
+    `${titlePrefix}: ${parent.title.replace(/^Integration QA:\s*/, '').replace(/^Epic QA fix:\s*/, '')}`,
     description,
-    'qa-auto',
+    fixSource,
     undefined,
     parent.priority,
   );
-  // Link parent → child via column (createTask doesn't accept it directly)
   db.prepare('UPDATE tasks SET parent_task_id = ?, updated_at = ? WHERE id = ?')
-    .run(parent.id, Date.now(), newId);
+    .run(fixParentId, Date.now(), newId);
   await syncToSupabase('task_update', { id: newId });
-  logEvent(newId, 'system', 'qa_auto_task', `Auto-created QA fix task for parent ${parent.id}`);
+  logEvent(newId, 'system', 'qa_auto_task',
+    epicId
+      ? `Auto-created epic QA fix for epic ${epicId} (chained from ${parent.id})`
+      : `Auto-created QA fix task for parent ${parent.id}`);
 }
 
 async function notifyOperatorQAPass(task: Task, ctx: any): Promise<void> {
@@ -1570,6 +1768,243 @@ function getNextPendingStage(): Task | null {
   `).get() as Task | null;
 }
 
+/**
+ * Cheap idempotent tick for an epic. Reads phase state and either:
+ * - halts the epic if any phase is failed/dismissed (escalation to operator)
+ * - merges epic→staging + spawns integration QA when all phases land
+ * - no-ops while phases are still in progress
+ *
+ * Designed to be safe to run repeatedly — the next pipeline cycle will re-run
+ * if the epic is still in progress. Each terminal action transitions status
+ * out of epic_in_progress so we don't double-fire.
+ */
+async function runEpicOrchestrator(epicTask: Task): Promise<void> {
+  const phases = db.prepare(`
+    SELECT id, status, phase_index, title FROM tasks
+    WHERE parent_task_id = ? AND source = 'epic-phase'
+    ORDER BY phase_index ASC
+  `).all(epicTask.id) as Array<{ id: string; status: string; phase_index: number; title: string }>;
+
+  if (phases.length === 0) {
+    logEvent(epicTask.id, 'system', 'epic_no_phases', 'Epic has no phase children — marking failed');
+    await handleFailure(epicTask, {
+      status: 'failed',
+      output: 'Epic has no phase children to orchestrate',
+      durationMs: 0, exitCode: 1,
+    });
+    return;
+  }
+
+  const blocking = phases.find(p => p.status === 'failed' || p.status === 'dismissed');
+  if (blocking) {
+    await haltEpicOnPhase(epicTask, blocking);
+    return;
+  }
+
+  const allLanded = phases.every(p => p.status === 'merged' || p.status === 'deployed');
+  if (!allLanded) return; // phases still in flight; nothing to do
+
+  await mergeEpicToStaging(epicTask, phases);
+}
+
+async function haltEpicOnPhase(
+  epicTask: Task,
+  phase: { id: string; title: string; status: string },
+): Promise<void> {
+  db.prepare('UPDATE tasks SET status = ?, error = ?, updated_at = ? WHERE id = ?')
+    .run('awaiting_human',
+      JSON.stringify({
+        previous_status: 'epic_in_progress',
+        failed_phase_id: phase.id,
+        phase_status: phase.status,
+      }),
+      Date.now(), epicTask.id);
+
+  const msg = [
+    `Epic ${epicTask.id} halted: phase ${phase.id} is "${phase.status}".`,
+    `Phase title: ${phase.title}`,
+    '',
+    `Resolve the phase (/retry ${phase.id} or /answer ${phase.id} <guidance>),`,
+    `or /dismiss ${epicTask.id} to abandon the epic.`,
+  ].join('\n');
+  createEscalation(epicTask.id, msg, JSON.stringify({ kind: 'epic_blocked', failed_phase_id: phase.id }));
+  logEvent(epicTask.id, 'system', 'epic_halted',
+    `Halted on phase ${phase.id} (${phase.status})`);
+  await syncToSupabase('task_update', { id: epicTask.id });
+  await notifyOperator(msg);
+}
+
+async function mergeEpicToStaging(
+  epicTask: Task,
+  phases: Array<{ id: string; phase_index: number; title: string }>,
+): Promise<void> {
+  const epicBranch = epicTask.epic_branch || `epic/${epicTask.id}`;
+  const octokit = await getOctokit();
+
+  const phaseLines = phases
+    .slice()
+    .sort((a, b) => a.phase_index - b.phase_index)
+    .map(p => `- Phase ${p.phase_index}: ${p.title} (${p.id})`);
+  const prBody = [
+    `Integration of epic ${epicTask.id}: ${epicTask.title}`,
+    '',
+    `${phases.length} phases merged on ${epicBranch}:`,
+    ...phaseLines,
+    '',
+    `Per-phase reviews already covered correctness; this PR is a coordinator-only merge.`,
+  ].join('\n');
+
+  let prNumber: number | null = null;
+  let prUrl: string | null = null;
+
+  try {
+    const { data } = await octokit.pulls.create({
+      owner: GITHUB_OWNER,
+      repo: GITHUB_REPO,
+      title: `Epic: ${epicTask.title}`,
+      head: epicBranch,
+      base: GITHUB_STAGING_BRANCH,
+      body: prBody,
+    });
+    prNumber = data.number;
+    prUrl = data.html_url;
+  } catch (err: any) {
+    if (err.status === 422) {
+      // Try to recover an existing PR for this epic branch
+      try {
+        const { data: existing } = await octokit.pulls.list({
+          owner: GITHUB_OWNER, repo: GITHUB_REPO,
+          head: `${GITHUB_OWNER}:${epicBranch}`, state: 'open',
+        });
+        if (existing.length > 0) {
+          prNumber = existing[0].number;
+          prUrl = existing[0].html_url;
+          logEvent(epicTask.id, 'system', 'epic_pr_reused', `Using existing epic PR #${prNumber}`);
+        }
+      } catch { /* fall through */ }
+    }
+    if (!prNumber) {
+      logEvent(epicTask.id, 'system', 'epic_pr_failed',
+        `Could not open epic→staging PR: ${err?.message || err}`);
+      await handleFailure(epicTask, {
+        status: 'failed',
+        output: `Failed to open epic→staging PR: ${err?.message || err}`,
+        durationMs: 0, exitCode: 1,
+      });
+      return;
+    }
+  }
+
+  // Coordinator-only merge — no review since per-phase reviews already
+  // covered correctness. Use 'merge' (not 'squash') so each phase's squash
+  // commit stays visible on staging history.
+  try {
+    await octokit.pulls.merge({
+      owner: GITHUB_OWNER,
+      repo: GITHUB_REPO,
+      pull_number: prNumber!,
+      merge_method: 'merge',
+    });
+    logEvent(epicTask.id, 'system', 'epic_merged',
+      `Epic merged to ${GITHUB_STAGING_BRANCH} via PR #${prNumber}`);
+  } catch (err: any) {
+    // Idempotent: PR may already be merged from a previous attempt
+    try {
+      const { data: pr } = await octokit.pulls.get({
+        owner: GITHUB_OWNER, repo: GITHUB_REPO,
+        pull_number: prNumber!,
+      });
+      if (!pr.merged) {
+        logEvent(epicTask.id, 'system', 'epic_merge_failed', `Merge failed: ${err?.message || err}`);
+        await handleFailure(epicTask, {
+          status: 'failed',
+          output: `Failed to merge epic→staging PR: ${err?.message || err}`,
+          durationMs: 0, exitCode: 1,
+        });
+        return;
+      }
+      logEvent(epicTask.id, 'system', 'epic_already_merged', `Epic PR #${prNumber} was already merged`);
+    } catch (innerErr: any) {
+      logEvent(epicTask.id, 'system', 'epic_merge_failed',
+        `Could not verify merge state: ${innerErr?.message || innerErr}`);
+      await handleFailure(epicTask, {
+        status: 'failed',
+        output: `Failed to verify epic→staging merge state: ${innerErr?.message || innerErr}`,
+        durationMs: 0, exitCode: 1,
+      });
+      return;
+    }
+  }
+
+  db.prepare('UPDATE tasks SET pr_url = ?, pr_number = ?, updated_at = ? WHERE id = ?')
+    .run(prUrl, prNumber, Date.now(), epicTask.id);
+
+  // Spawn integration QA. The QA task moves through normal qa_pending →
+  // qa_running → merged with qa_status=passed/failed; runQAStage hooks
+  // finalizeEpic on the epic_parent_id.
+  const qaSpawn = await spawnIntegrationQATask(epicTask);
+  if (!qaSpawn.success) {
+    logEvent(epicTask.id, 'system', 'epic_qa_spawn_failed', qaSpawn.message);
+    await handleFailure(epicTask, {
+      status: 'failed',
+      output: `Could not spawn integration QA: ${qaSpawn.message}`,
+      durationMs: 0, exitCode: 1,
+    });
+    return;
+  }
+
+  await updateStatus(epicTask.id, 'epic_integrating');
+  await notifyOperator(
+    `Epic merged to staging: ${epicTask.title}\n` +
+    `PR: ${prUrl}\n` +
+    `Integration QA queued (will start in a few min — Vercel deploy buffer).`
+  );
+}
+
+/**
+ * Tick for epic_integrating: detect QA child outcomes that runQAStage's
+ * happy-path hook didn't catch (e.g. QA agent session itself failed). On
+ * detected stuck states, escalate the epic.
+ */
+async function runEpicIntegrationTick(epicTask: Task): Promise<void> {
+  const qaTask = db.prepare(`
+    SELECT id, status, qa_status FROM tasks
+    WHERE parent_task_id = ? AND source = 'epic-qa'
+    ORDER BY created_at DESC LIMIT 1
+  `).get(epicTask.id) as { id: string; status: string; qa_status: string | null } | undefined;
+
+  if (!qaTask) {
+    logEvent(epicTask.id, 'system', 'epic_integrating_orphan',
+      'epic_integrating but no integration QA child found — investigate');
+    return;
+  }
+
+  // Happy path is handled by runQAStage's finalizeEpic call. We only act here
+  // when the QA task ended up in failed / awaiting_human (agent crash, etc.).
+  if (qaTask.status === 'failed' || qaTask.status === 'awaiting_human') {
+    db.prepare('UPDATE tasks SET status = ?, error = ?, updated_at = ? WHERE id = ?')
+      .run('awaiting_human',
+        JSON.stringify({
+          previous_status: 'epic_integrating',
+          integration_qa_blocked: true,
+          qa_task_id: qaTask.id,
+        }),
+        Date.now(), epicTask.id);
+
+    const msg = [
+      `Epic ${epicTask.id}: integration QA agent is stuck (${qaTask.status}).`,
+      `QA task: ${qaTask.id}`,
+      `Resolve the QA task or /dismiss ${epicTask.id} to abandon.`,
+    ].join('\n');
+    createEscalation(epicTask.id, msg, JSON.stringify({ kind: 'epic_qa_stuck', qa_task_id: qaTask.id }));
+    logEvent(epicTask.id, 'system', 'epic_qa_stuck',
+      `Integration QA in ${qaTask.status} — epic awaiting human`);
+    await syncToSupabase('task_update', { id: epicTask.id });
+    await notifyOperator(msg);
+  }
+  // qa_pending / qa_running / merged → just wait
+}
+
 async function processTaskStage(task: Task): Promise<void> {
   switch (task.status) {
     case 'inbox':
@@ -1611,6 +2046,12 @@ async function processTaskStage(task: Task): Promise<void> {
     case 'qa_running':
       await runQAStage(task);
       break;
+    case 'epic_in_progress':
+      await runEpicOrchestrator(task);
+      break;
+    case 'epic_integrating':
+      await runEpicIntegrationTick(task);
+      break;
   }
 }
 
@@ -1625,7 +2066,8 @@ export async function processNextTask(): Promise<void> {
     WHERE status IN ('inbox', 'researching', 'design_pending', 'designing',
                      'wireframes_rendering', 'design_validation',
                      'developing', 'review_pending', 'reviewing',
-                     'qa_pending', 'qa_running')
+                     'qa_pending', 'qa_running',
+                     'epic_in_progress', 'epic_integrating')
       AND NOT (status = 'qa_pending' AND qa_ready_at IS NOT NULL AND qa_ready_at > ?)
     ORDER BY
       CASE status
@@ -1640,6 +2082,8 @@ export async function processNextTask(): Promise<void> {
         WHEN 'inbox' THEN 9
         WHEN 'qa_running' THEN 10
         WHEN 'qa_pending' THEN 11
+        WHEN 'epic_in_progress' THEN 12
+        WHEN 'epic_integrating' THEN 13
       END,
       priority ASC,
       created_at ASC

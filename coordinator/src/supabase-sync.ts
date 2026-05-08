@@ -124,6 +124,13 @@ export async function syncToSupabase(
           pr_number: task.pr_number,
           retry_count: task.retry_count,
           error: task.error,
+          parent_task_id: task.parent_task_id,
+          is_epic: task.is_epic === 1,
+          epic_branch: task.epic_branch,
+          ship_mode: task.ship_mode,
+          phase_index: task.phase_index,
+          total_phases: task.total_phases,
+          depends_on_task_id: task.depends_on_task_id,
           updated_at: new Date(task.updated_at).toISOString(),
           completed_at: task.completed_at ? new Date(task.completed_at).toISOString() : null,
         }, { onConflict: 'instance_id,id' });

@@ -7,11 +7,11 @@ interface EscalationRow {
   instance_id: string;
   task_id: string;
   question: string;
-  /** "awaiting_human" (regular escalation) or "awaiting_design_approval" — drives the chat hint shown to the operator. */
+  /** "awaiting_human", "awaiting_design_approval", or "epic_awaiting_approval" — drives the chat hint shown to the operator. */
   task_status: string;
 }
 
-const HUMAN_WAIT_STATUSES = ['awaiting_human', 'awaiting_design_approval'];
+const HUMAN_WAIT_STATUSES = ['awaiting_human', 'awaiting_design_approval', 'epic_awaiting_approval'];
 
 async function fetchActiveEscalations(): Promise<EscalationRow[]> {
   // Cross-instance: escalations page the operator regardless of which
@@ -78,11 +78,19 @@ export function EscalationBanner() {
     return inst?.display_name || id;
   };
 
-  // Two reply commands — /answer for regular escalations, /design_reply for
-  // design-approval rows. The natural-language router handles the right
-  // routing automatically, but slash commands are documented for power users.
+  // Reply-command hints depend on which kinds of escalations are pending.
+  // /answer for regular escalations, /design_reply for design approvals,
+  // /approve_epic + /cancel_epic for epic decomposition gates. The
+  // natural-language router handles routing automatically, but slash
+  // commands are documented for power users.
   const hasRegular = escalations.some(e => e.task_status === 'awaiting_human');
   const hasDesign = escalations.some(e => e.task_status === 'awaiting_design_approval');
+  const hasEpic = escalations.some(e => e.task_status === 'epic_awaiting_approval');
+
+  const hintParts: string[] = [];
+  if (hasRegular) hintParts.push('/answer {id} {your answer}');
+  if (hasDesign) hintParts.push('/design_reply {id} approved (or describe changes)');
+  if (hasEpic) hintParts.push('/approve_epic {id} or /cancel_epic {id}');
 
   return (
     <div className="bg-amber-500/10 border border-amber-500/30 rounded-2xl p-4">
@@ -95,11 +103,15 @@ export function EscalationBanner() {
       <div className="space-y-2">
         {escalations.map((esc: any) => {
           const isDesign = esc.task_status === 'awaiting_design_approval';
+          const isEpic = esc.task_status === 'epic_awaiting_approval';
+          const kindLabel = isDesign ? ' · design approval'
+            : isEpic ? ' · epic plan approval'
+            : '';
           return (
             <div key={`${esc.instance_id}:${esc.id}`} className="text-xs">
               <span className="text-muted-foreground">
                 [{instanceLabel(esc.instance_id)}] Task {esc.task_id}
-                {isDesign ? ' · design approval' : ''}:
+                {kindLabel}:
               </span>{' '}
               <span>{esc.question}</span>
             </div>
@@ -107,10 +119,7 @@ export function EscalationBanner() {
         })}
       </div>
       <p className="text-xs text-muted-foreground mt-2">
-        Reply via WhatsApp:
-        {hasRegular && <> /answer {'{id}'} {'{your answer}'}</>}
-        {hasRegular && hasDesign && <> · </>}
-        {hasDesign && <> /design_reply {'{id}'} approved (or describe changes)</>}
+        Reply via WhatsApp: {hintParts.join(' · ')}
       </p>
     </div>
   );

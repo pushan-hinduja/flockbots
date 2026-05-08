@@ -13,11 +13,12 @@ const AI_RESOLVER_MAX_FILES = 3;
 const AI_RESOLVER_MAX_MARKERS_PER_FILE = 20;
 const AI_RESOLVER_TIMEOUT_MS = 5 * 60 * 1000; // 5 minutes
 
-export async function createWorktree(taskId: string): Promise<string> {
+export async function createWorktree(taskId: string, baseBranch?: string): Promise<string> {
   if (!TARGET_REPO_PATH) throw new Error('TARGET_REPO_PATH not configured');
   const git: SimpleGit = simpleGit(TARGET_REPO_PATH);
   const branchName = `task/${taskId}`;
   const worktreePath = join(WORKTREE_DIR, `task-${taskId}`);
+  const base = baseBranch || GITHUB_STAGING_BRANCH;
 
   // Clean up stale worktree/branch from a previous attempt
   if (existsSync(worktreePath)) {
@@ -33,14 +34,43 @@ export async function createWorktree(taskId: string): Promise<string> {
   // when the remote actually has zero branches.
   await ensureRemoteStagingExists(git, taskId);
 
-  // Fetch latest staging without checking it out (avoids mutating main repo HEAD)
-  await git.fetch('origin', GITHUB_STAGING_BRANCH);
+  // Fetch latest base branch without checking it out (avoids mutating main repo HEAD)
+  await git.fetch('origin', base);
 
-  // Create worktree from origin/staging — does not touch main repo working directory
-  await git.raw(['worktree', 'add', '-b', branchName, worktreePath, `origin/${GITHUB_STAGING_BRANCH}`]);
+  // Create worktree from origin/<base> — does not touch main repo working directory
+  await git.raw(['worktree', 'add', '-b', branchName, worktreePath, `origin/${base}`]);
 
-  logEvent(taskId, 'system', 'worktree_created', `Worktree at ${worktreePath}, branch ${branchName}`);
+  logEvent(taskId, 'system', 'worktree_created',
+    `Worktree at ${worktreePath}, branch ${branchName} (from ${base})`);
   return worktreePath;
+}
+
+/**
+ * Push staging's tip to origin/epic/<epicId> if the epic branch doesn't
+ * already exist. Idempotent — silent no-op when the branch is already on
+ * origin. Used at epic approval time so phase 1's worktree can branch
+ * from a real remote ref.
+ */
+export async function ensureEpicBranchExists(epicId: string): Promise<void> {
+  if (!TARGET_REPO_PATH) throw new Error('TARGET_REPO_PATH not configured');
+  const git: SimpleGit = simpleGit(TARGET_REPO_PATH);
+  const epicBranch = `epic/${epicId}`;
+
+  const ref = await git.raw(['ls-remote', '--heads', 'origin', epicBranch]).catch(() => '');
+  if (ref.trim().length > 0) {
+    logEvent(epicId, 'system', 'epic_branch_existing', `origin/${epicBranch} already exists — reusing`);
+    return;
+  }
+
+  await ensureRemoteStagingExists(git, epicId);
+  await git.fetch('origin', GITHUB_STAGING_BRANCH);
+  const stagingSha = (await git.raw(['rev-parse', `origin/${GITHUB_STAGING_BRANCH}`])).trim();
+  if (!stagingSha) {
+    throw new Error(`Could not resolve origin/${GITHUB_STAGING_BRANCH} when seeding ${epicBranch}`);
+  }
+  await git.raw(['push', 'origin', `${stagingSha}:refs/heads/${epicBranch}`]);
+  logEvent(epicId, 'system', 'epic_branch_created',
+    `Pushed origin/${GITHUB_STAGING_BRANCH}@${stagingSha.slice(0, 7)} → origin/${epicBranch}`);
 }
 
 /**
@@ -191,17 +221,17 @@ async function analyzeConflicts(worktreePath: string): Promise<{ files: string[]
  * internal op, not a task-level session that should be kill-able via WhatsApp.
  */
 async function tryAiConflictResolver(
-  taskId: string, worktreePath: string, conflictedFiles: string[]
+  taskId: string, worktreePath: string, conflictedFiles: string[], baseBranch: string,
 ): Promise<{ resolved: boolean; message: string }> {
-  const prompt = `You are resolving a git merge conflict in the current worktree. Another task merged to ${GITHUB_STAGING_BRANCH} while this branch was in progress. Your job: preserve this branch's original intent while absorbing the incoming changes from staging.
+  const prompt = `You are resolving a git merge conflict in the current worktree. Another task merged to ${baseBranch} while this branch was in progress. Your job: preserve this branch's original intent while absorbing the incoming changes from ${baseBranch}.
 
 Conflicted files:
 ${conflictedFiles.map(f => `- ${f}`).join('\n')}
 
 Steps:
 1. For each conflicted file, Read it. Git has inserted <<<<<<<, =======, >>>>>>> markers.
-2. Above "=======" is this branch's change (HEAD). Below is staging's change.
-3. Combine them coherently — keep this branch's logic, incorporate compatible staging changes. Don't blindly pick one side.
+2. Above "=======" is this branch's change (HEAD). Below is the base branch's change.
+3. Combine them coherently — keep this branch's logic, incorporate compatible base-branch changes. Don't blindly pick one side.
 4. Run \`git add <file>\` for each resolved file.
 5. Run \`git commit --no-edit\` (the merge commit message is already set).
 6. Run \`git status\` to verify clean state.
@@ -285,26 +315,29 @@ Stop when the merge is committed and \`git status\` is clean.`;
 }
 
 /**
- * Rebase a worktree branch on latest staging before PR creation. Escalates
- * through cheaper recovery strategies before giving up:
- *   1. git rebase origin/staging       (linear history, preferred)
- *   2. git merge origin/staging        (3-way merge, handles more cases)
- *   3. AI conflict resolver            (small conflicts only)
+ * Rebase a worktree branch on its base before PR creation. The base is
+ * `staging` for normal tasks; for phases of an epic it's `epic/<epicId>`
+ * so prior phases' merged work is integrated. Escalates through cheaper
+ * recovery strategies before giving up:
+ *   1. git rebase origin/<base>       (linear history, preferred)
+ *   2. git merge origin/<base>        (3-way merge, handles more cases)
+ *   3. AI conflict resolver           (small conflicts only)
  *   4. Return conflict → pipeline wipes worktree and re-devs
  */
-export async function rebaseOnStaging(taskId: string): Promise<RebaseResult> {
+export async function rebaseOnBase(taskId: string, baseBranch?: string): Promise<RebaseResult> {
   const worktreePath = getWorktreePath(taskId);
   if (!existsSync(worktreePath)) {
     return { ok: false, reason: 'other', message: 'Worktree does not exist' };
   }
 
+  const base = baseBranch || GITHUB_STAGING_BRANCH;
   const git = simpleGit(worktreePath);
 
   // ── Step 1: rebase ──
   try {
-    await git.fetch('origin', GITHUB_STAGING_BRANCH);
-    await git.rebase([`origin/${GITHUB_STAGING_BRANCH}`]);
-    logEvent(taskId, 'system', 'rebase_success', `Rebased on latest ${GITHUB_STAGING_BRANCH}`);
+    await git.fetch('origin', base);
+    await git.rebase([`origin/${base}`]);
+    logEvent(taskId, 'system', 'rebase_success', `Rebased on latest ${base}`);
     return { ok: true, strategy: 'rebase' };
   } catch (err: any) {
     const message = err.message || String(err);
@@ -319,9 +352,9 @@ export async function rebaseOnStaging(taskId: string): Promise<RebaseResult> {
 
   // ── Step 2: 3-way merge ──
   try {
-    await git.merge([`origin/${GITHUB_STAGING_BRANCH}`, '--no-edit']);
+    await git.merge([`origin/${base}`, '--no-edit']);
     logEvent(taskId, 'system', 'merge_success',
-      `3-way merge with ${GITHUB_STAGING_BRANCH} succeeded (rebase had conflicted)`);
+      `3-way merge with ${base} succeeded (rebase had conflicted)`);
     return { ok: true, strategy: 'merge' };
   } catch (err: any) {
     const message = err.message || String(err);
@@ -349,7 +382,7 @@ export async function rebaseOnStaging(taskId: string): Promise<RebaseResult> {
 
   logEvent(taskId, 'system', 'ai_resolver_started',
     `Invoking AI conflict resolver on ${conflicts.files.length} file(s), max ${conflicts.maxMarkersPerFile} markers/file`);
-  const aiResult = await tryAiConflictResolver(taskId, worktreePath, conflicts.files);
+  const aiResult = await tryAiConflictResolver(taskId, worktreePath, conflicts.files, base);
   if (aiResult.resolved) {
     logEvent(taskId, 'system', 'ai_resolve_success', aiResult.message);
     return { ok: true, strategy: 'ai-resolve' };

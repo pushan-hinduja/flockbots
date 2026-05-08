@@ -246,6 +246,8 @@ AVAILABLE COMMANDS:
 - /design_reply {taskId} {text}          — Approve or revise wireframes for a task awaiting design approval
                                           (text "approved" / "yes" / "lgtm" → ship to dev;
                                           anything else is parsed as per-screen feedback)
+- /approve_epic {epicId}                 — Approve a decomposed epic plan and queue its phases
+- /cancel_epic {epicId}                  — Cancel a decomposed epic before phases run
 - /retry {taskId}                        — Retry a failed task                      [DESTRUCTIVE]
 - /dismiss {taskId}                      — Dismiss a failed task                    [DESTRUCTIVE]
 - /deploy                                — Merge staging → master                    [DESTRUCTIVE]
@@ -283,6 +285,11 @@ RULES:
    FULL reply verbatim as text. The downstream Haiku parser handles approval-vs-feedback
    classification, so do NOT rewrite or summarize. Pick the design-approval taskId by
    recency or whichever the operator references.
+3b. If the operator is replying to an epic listed under "Awaiting epic approval", use
+   /approve_epic {epicId} for affirmative replies (yes/approve/go/start/lgtm) or
+   /cancel_epic {epicId} for negative (no/cancel/abort/skip). For free-text feedback
+   that's neither yes nor no, set command=null and ask them to confirm yes/no — v1
+   doesn't yet support mid-plan revisions. Pick the epic by recency or by reference.
 4. Pronouns / references ("that task", "the second one") should resolve against the task list in state.
 5. If intent is unclear, set command=null and ask a clarifying question in reply.
 6. Replies are short (1–2 sentences), friendly, not robotic. No emojis.
@@ -322,6 +329,23 @@ async function buildStructuredState(
     for (const t of awaitingDesign) {
       const title = (t.title || '').slice(0, 80);
       lines.push(`  - ${t.id} "${title}"`);
+    }
+  }
+
+  // Epics waiting on operator approval of a decomposition — yes/no via
+  // /approve_epic or /cancel_epic.
+  const awaitingEpic = db.prepare(`
+    SELECT id, title, total_phases FROM tasks
+    WHERE status = 'epic_awaiting_approval'
+    ORDER BY updated_at DESC
+    LIMIT 5
+  `).all() as any[];
+  if (awaitingEpic.length > 0) {
+    lines.push('Awaiting epic approval (reply yes/no to approve the phase plan):');
+    for (const t of awaitingEpic) {
+      const title = (t.title || '').slice(0, 80);
+      const phases = t.total_phases ? `${t.total_phases} phases` : '? phases';
+      lines.push(`  - ${t.id} "${title}" (${phases})`);
     }
   }
 
