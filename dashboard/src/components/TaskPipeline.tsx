@@ -64,6 +64,41 @@ function getFailedAtStage(task: any): string | null {
   }
 }
 
+// Some previous_status values are not themselves columns in PIPELINE_STAGES
+// (e.g. 'design_pending' is bundled into 'designing', 'review_pending' into
+// 'reviewing'). Map them so the failed card lands in the right column.
+function mapPreviousStatusToColumn(prev: string): string | null {
+  if (!prev) return null;
+  if (PIPELINE_STAGES.includes(prev)) return prev;
+  switch (prev) {
+    case 'design_pending':
+    case 'wireframes_rendering':
+    case 'awaiting_design_approval':
+      return 'design_validation';
+    case 'testing':
+      return 'developing';
+    case 'review_pending':
+      return 'reviewing';
+    case 'qa_pending':
+    case 'qa_running':
+      return 'merged';
+    default:
+      return null;
+  }
+}
+
+/** Bucket failed tasks into the column matching their previous_status. */
+function failedTasksByColumn(tasks: any[]): Record<string, any[]> {
+  const out: Record<string, any[]> = {};
+  for (const t of tasks) {
+    if (t.status !== 'failed') continue;
+    const col = mapPreviousStatusToColumn(getFailedAtStage(t) || '');
+    if (!col) continue;
+    (out[col] = out[col] || []).push(t);
+  }
+  return out;
+}
+
 function RetryMenu({ task, onClose }: { task: any; onClose: () => void }) {
   const failedAt = getFailedAtStage(task);
   // Use the full stage order so intermediate statuses (review_pending, design_pending, testing) resolve correctly
@@ -111,13 +146,24 @@ function RetryMenu({ task, onClose }: { task: any; onClose: () => void }) {
 
 function TaskCard({ task }: { task: any }) {
   const [showMenu, setShowMenu] = useState(false);
-  const canRevert = task.status !== 'merged' && task.status !== 'inbox';
+  const isFailed = task.status === 'failed';
+  const canRevert = isFailed || (task.status !== 'merged' && task.status !== 'inbox');
   const isQaAuto = task.source === 'qa-auto';
   const isQaRunning = task.status === 'qa_pending' || task.status === 'qa_running';
 
   return (
-    <div className="bg-background border border-border rounded-xl p-3 text-xs min-w-0 relative">
+    <div
+      className={`bg-background border rounded-xl p-3 text-xs min-w-0 relative ${
+        isFailed ? 'border-destructive/60' : 'border-border'
+      }`}
+    >
       <div className="flex items-start gap-2">
+        {isFailed && (
+          <span
+            className="w-1.5 h-1.5 rounded-full bg-destructive flex-shrink-0 mt-1.5"
+            title="Failed at this stage"
+          />
+        )}
         <p className="font-medium truncate flex-1">{task.title}</p>
         {(isQaAuto || isQaRunning) && (
           <span
@@ -133,7 +179,11 @@ function TaskCard({ task }: { task: any }) {
         {canRevert && (
           <button
             onClick={() => setShowMenu(!showMenu)}
-            className="p-0.5 rounded text-muted-foreground/40 hover:text-muted-foreground hover:bg-secondary transition-colors flex-shrink-0"
+            className={`p-0.5 rounded transition-colors flex-shrink-0 ${
+              isFailed
+                ? 'text-destructive hover:text-destructive hover:bg-destructive/10'
+                : 'text-muted-foreground/40 hover:text-muted-foreground hover:bg-secondary'
+            }`}
             title="Retry from earlier stage"
           >
             <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
@@ -142,10 +192,23 @@ function TaskCard({ task }: { task: any }) {
             </svg>
           </button>
         )}
+        {isFailed && (
+          <button
+            onClick={() => sendAction(task.instance_id, task.id, 'dismiss')}
+            className="p-0.5 rounded text-muted-foreground/60 hover:text-destructive hover:bg-secondary transition-colors flex-shrink-0"
+            title="Dismiss"
+          >
+            <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+              <line x1="18" y1="6" x2="6" y2="18" />
+              <line x1="6" y1="6" x2="18" y2="18" />
+            </svg>
+          </button>
+        )}
       </div>
       {task.effort_size && (
-        <p className="text-muted-foreground mt-1">
+        <p className={`mt-1 ${isFailed ? 'text-destructive/80' : 'text-muted-foreground'}`}>
           {task.effort_size} · {modelLabel(task.dev_model)}
+          {isFailed && ' · failed here'}
         </p>
       )}
       {showMenu && <RetryMenu task={task} onClose={() => setShowMenu(false)} />}
@@ -185,12 +248,24 @@ function FailedCard({ task }: { task: any }) {
 }
 
 export function TaskPipeline({ tasks }: TaskPipelineProps) {
+  // Failed tasks appear in the column matching their previous_status (with a
+  // red dot + red border on the card). Failed tasks whose previous_status
+  // doesn't map to any pipeline column fall back to the bottom "Failed"
+  // section.
+  const failedByCol = failedTasksByColumn(tasks);
   const grouped = PIPELINE_STAGES.reduce((acc, stage) => {
-    acc[stage] = tasks.filter((t: any) => t.status === stage);
+    const active = tasks.filter((t: any) => t.status === stage);
+    const inStageFailed = failedByCol[stage] || [];
+    acc[stage] = [...active, ...inStageFailed];
     return acc;
   }, {} as Record<string, any[]>);
 
-  const failed = tasks.filter((t: any) => t.status === 'failed');
+  const failedInColumns = new Set(
+    Object.values(failedByCol).flat().map((t: any) => t.id)
+  );
+  const orphanFailed = tasks.filter(
+    (t: any) => t.status === 'failed' && !failedInColumns.has(t.id)
+  );
   const awaiting = tasks.filter((t: any) => t.status === 'awaiting_human');
 
   if (tasks.length === 0) {
@@ -220,15 +295,18 @@ export function TaskPipeline({ tasks }: TaskPipelineProps) {
           const hasItems = stageTasks.length > 0;
           const isLast = i === stages.length - 1;
 
+          const stageHasFailed = stageTasks.some((t: any) => t.status === 'failed');
           return (
             <div key={stage} className="flex gap-3">
-              {/* Timeline track */}
+              {/* Timeline track — red dot if any task failed in this stage */}
               <div className="flex flex-col items-center w-5 flex-shrink-0">
                 <div
                   className={`w-2 h-2 rounded-full mt-1 flex-shrink-0 ${
-                    hasItems
-                      ? 'bg-foreground'
-                      : 'bg-muted-foreground/30'
+                    stageHasFailed
+                      ? 'bg-destructive'
+                      : hasItems
+                        ? 'bg-foreground'
+                        : 'bg-muted-foreground/30'
                   }`}
                 />
                 {!isLast && (
@@ -239,7 +317,9 @@ export function TaskPipeline({ tasks }: TaskPipelineProps) {
               {/* Stage content */}
               <div className={`flex-1 min-w-0 ${hasItems ? 'pb-3' : 'pb-2'}`}>
                 <div className="flex items-center gap-1.5">
-                  <span className={`text-xs font-medium ${hasItems ? 'text-foreground' : 'text-muted-foreground'}`}>
+                  <span className={`text-xs font-medium ${
+                    stageHasFailed ? 'text-destructive' : hasItems ? 'text-foreground' : 'text-muted-foreground'
+                  }`}>
                     {STAGE_LABELS[stage]}
                   </span>
                   {hasItems && (
@@ -259,8 +339,12 @@ export function TaskPipeline({ tasks }: TaskPipelineProps) {
         })}
       </div>
 
-      {/* Special states */}
-      {(failed.length > 0 || awaiting.length > 0) && (
+      {/* Special states. Failed tasks normally render inline within their
+          previous-stage column (with red dot + border); only orphans whose
+          previous_status doesn't map to a pipeline column fall to this
+          bucket. Awaiting-human tasks always live here — they're a wait
+          state, not a stage. */}
+      {(orphanFailed.length > 0 || awaiting.length > 0) && (
         <div className="mt-3 pt-3 border-t border-border space-y-3">
           {awaiting.length > 0 && (
             <div>
@@ -274,13 +358,13 @@ export function TaskPipeline({ tasks }: TaskPipelineProps) {
               ))}
             </div>
           )}
-          {failed.length > 0 && (
+          {orphanFailed.length > 0 && (
             <div>
               <span className="text-xs font-medium text-destructive">
-                Failed ({failed.length})
+                Failed ({orphanFailed.length})
               </span>
               <div className="space-y-1.5 mt-1.5">
-                {failed.map((t: any) => (
+                {orphanFailed.map((t: any) => (
                   <FailedCard key={t.id} task={t} />
                 ))}
               </div>

@@ -22,6 +22,7 @@ import {
   isEpicPhase, getBaseBranchForTask,
   spawnIntegrationQATask, finalizeEpic, maybeFinalizeEpicAfterFix,
 } from './epic';
+import { presentMessage } from './presenter';
 
 const TARGET_REPO_PATH = process.env.TARGET_REPO_PATH || '';
 const TASKS_DIR = tasksDir();
@@ -203,7 +204,17 @@ export async function handleEscalation(task: Task, result: SessionResult, custom
   const header = `Task ${task.id} needs input\n${shortTitle}\n\n`;
   const maxQuestionLen = 4000 - header.length;
   const whatsappMsg = header + question.slice(0, maxQuestionLen);
-  await notifyOperator(whatsappMsg);
+  const presented = await presentMessage({
+    intent: 'agent_escalation_question',
+    data: {
+      taskId: task.id,
+      taskTitle: task.title,
+      question: question.slice(0, maxQuestionLen),
+      replyHints: [`/answer ${task.id} <your reply>`],
+    },
+    fallback: whatsappMsg,
+  });
+  await notifyOperator(presented);
   // Re-fetch current status from DB — the in-memory task object may be stale because
   // processTaskStage transitions status (e.g. inbox → researching) before calling the agent
   const currentStatus = (db.prepare('SELECT status FROM tasks WHERE id = ?').get(task.id) as { status: string })?.status || task.status;
@@ -222,7 +233,19 @@ async function handleFailure(task: Task, result: SessionResult): Promise<void> {
   db.prepare('UPDATE tasks SET error = ?, updated_at = ? WHERE id = ?')
     .run(errorInfo, Date.now(), task.id);
   await updateStatus(task.id, 'failed');
-  await notifyOperator(`Task failed: ${task.title}\n${result.output.slice(0, 500)}`);
+  const fallback = `Task failed: ${task.title}\n${result.output.slice(0, 500)}`;
+  const presented = await presentMessage({
+    intent: 'task_failed',
+    data: {
+      taskId: task.id,
+      taskTitle: task.title,
+      previousStage: currentStatus,
+      errorOutput: result.output.slice(0, 500),
+      replyHints: [`/retry ${task.id}`, `/dismiss ${task.id}`],
+    },
+    fallback,
+  });
+  await notifyOperator(presented);
 }
 
 export async function handleAgentResult(task: Task, result: SessionResult): Promise<void> {
@@ -1062,9 +1085,21 @@ Your job this round:
             ? (db.prepare('SELECT title FROM tasks WHERE id = ?').get(task.parent_task_id) as any)?.title
             : null;
           const epicLine = epicTitle ? `\nEpic: ${epicTitle}` : '';
-          await notifyOperator(
-            `Phase ${task.phase_index}/${task.total_phases} merged: ${task.title}${epicLine}\nPR: ${task.pr_url}`
-          );
+          const phaseFallback = `Phase ${task.phase_index}/${task.total_phases} merged: ${task.title}${epicLine}\nPR: ${task.pr_url}`;
+          const phasePresented = await presentMessage({
+            intent: 'epic_phase_complete',
+            data: {
+              taskId: task.id,
+              phaseIndex: task.phase_index,
+              totalPhases: task.total_phases,
+              phaseTitle: task.title,
+              epicId: task.parent_task_id,
+              epicTitle,
+              prUrl: task.pr_url,
+            },
+            fallback: phaseFallback,
+          });
+          await notifyOperator(phasePresented);
         } else {
           await notifyOperator(`${task.title}\nPR: ${task.pr_url}`);
         }
@@ -1831,7 +1866,23 @@ async function haltEpicOnPhase(
   logEvent(epicTask.id, 'system', 'epic_halted',
     `Halted on phase ${phase.id} (${phase.status})`);
   await syncToSupabase('task_update', { id: epicTask.id });
-  await notifyOperator(msg);
+  const haltPresented = await presentMessage({
+    intent: 'epic_halted_on_phase',
+    data: {
+      epicId: epicTask.id,
+      epicTitle: epicTask.title,
+      phaseId: phase.id,
+      phaseTitle: phase.title,
+      phaseStatus: phase.status,
+      replyHints: [
+        `/retry ${phase.id}`,
+        `/answer ${phase.id} <guidance>`,
+        `/dismiss ${epicTask.id}`,
+      ],
+    },
+    fallback: msg,
+  });
+  await notifyOperator(haltPresented);
 }
 
 async function mergeEpicToStaging(
@@ -1954,11 +2005,23 @@ async function mergeEpicToStaging(
   }
 
   await updateStatus(epicTask.id, 'epic_integrating');
-  await notifyOperator(
+  const mergeFallback =
     `Epic merged to staging: ${epicTask.title}\n` +
     `PR: ${prUrl}\n` +
-    `Integration QA queued (will start in a few min — Vercel deploy buffer).`
-  );
+    `Integration QA queued (will start in a few min — Vercel deploy buffer).`;
+  const mergePresented = await presentMessage({
+    intent: 'epic_merged_to_staging',
+    data: {
+      epicId: epicTask.id,
+      epicTitle: epicTask.title,
+      prUrl,
+      phasesCount: phases.length,
+      qaTaskId: qaSpawn.qaTaskId,
+      qaWaitMinutes: Math.round((parseInt(process.env.QA_DEPLOY_WAIT_MS || String(5 * 60 * 1000)) || 5 * 60 * 1000) / 60000),
+    },
+    fallback: mergeFallback,
+  });
+  await notifyOperator(mergePresented);
 }
 
 /**
@@ -2000,7 +2063,18 @@ async function runEpicIntegrationTick(epicTask: Task): Promise<void> {
     logEvent(epicTask.id, 'system', 'epic_qa_stuck',
       `Integration QA in ${qaTask.status} — epic awaiting human`);
     await syncToSupabase('task_update', { id: epicTask.id });
-    await notifyOperator(msg);
+    const stuckPresented = await presentMessage({
+      intent: 'epic_integration_qa_stuck',
+      data: {
+        epicId: epicTask.id,
+        epicTitle: epicTask.title,
+        qaTaskId: qaTask.id,
+        qaStatus: qaTask.status,
+        replyHints: [`/retry ${qaTask.id}`, `/dismiss ${epicTask.id}`],
+      },
+      fallback: msg,
+    });
+    await notifyOperator(stuckPresented);
   }
   // qa_pending / qa_running / merged → just wait
 }

@@ -8,7 +8,7 @@ import { handleDesignReply } from '../coordinator/src/design-reply-handler';
 import { approveEpic, cancelEpic } from '../coordinator/src/epic';
 import { randomUUID } from 'crypto';
 
-const VALID_EFFORT_LEVELS = ['medium', 'high', 'xhigh', 'max'];
+const VALID_EFFORT_LEVELS = ['medium', 'high', 'max'];
 const MODEL_ALIASES: Record<string, string> = {
   'opus': 'claude-opus-4-7',
   'opus-4-7': 'claude-opus-4-7',
@@ -64,7 +64,7 @@ export async function handleWhatsAppMessage(from: string, text: string): Promise
         '  /cancel_epic {id} - Cancel a decomposed epic before phases run',
         '',
         'Overrides (apply to current stage; kills + reruns if in-flight)',
-        '  /effort {id} {medium|high|xhigh|max}',
+        '  /effort {id} {medium|high|max}',
         '  /model {id} {opus|sonnet}',
         '',
         'Pipeline',

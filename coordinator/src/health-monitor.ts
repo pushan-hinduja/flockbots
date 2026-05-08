@@ -1,6 +1,7 @@
 import { db, logEvent } from './queue';
 import { getBudgetEstimate } from './rate-limiter';
 import { notifyOperator } from './notifier';
+import { presentMessage } from './presenter';
 import { syncToSupabase } from './supabase-sync';
 
 // Track alert state to avoid spamming
@@ -67,9 +68,14 @@ export async function checkSystemHealth(): Promise<void> {
 
   // Send consolidated alert
   if (alerts.length > 0) {
-    const message = `Health Alert\n${alerts.map((a, i) => `${i + 1}. ${a}`).join('\n')}`;
-    await notifyOperator(message);
-    logEvent(null, 'health', 'alert_sent', message);
+    const fallback = `Health Alert\n${alerts.map((a, i) => `${i + 1}. ${a}`).join('\n')}`;
+    const presented = await presentMessage({
+      intent: 'system_health_alert',
+      data: { alerts },
+      fallback,
+    });
+    await notifyOperator(presented);
+    logEvent(null, 'health', 'alert_sent', fallback);
   }
 
   // Sync health summary to Supabase

@@ -1,12 +1,12 @@
-import { useRef, useEffect, useState } from 'react';
+import { useRef, useEffect, useState, useMemo } from 'react';
 import type { SystemStatus } from '../hooks/useSystemStatus';
 import { useSubAgents } from '../hooks/useSubAgents';
 import { useAgentCustomizations } from '../hooks/useAgentCustomizations';
 import { useInstance } from '../contexts/InstanceContext';
 import { loadAllSprites } from '../office/sprites';
-import { createInitialState, snapAgentsToInitialPositions, startGameLoop, updateCharacters, render, isCharacterOccludedByWall, type EngineState } from '../office/engine';
-import { CANVAS_W, CANVAS_H, DESK_POSITIONS } from '../office/layout';
-import { CharState } from '../office/types';
+import { createInitialState, snapAgentsToInitialPositions, startGameLoop, updateCharacters, render, isCharacterOccludedByWall, baseRoleId, type EngineState } from '../office/engine';
+import { CANVAS_W, CANVAS_H, DESK_POSITIONS, WAIT_SPOTS } from '../office/layout';
+import { CharState, Direction } from '../office/types';
 
 // Fixed pixel offsets (relative to parent's desk) for up to 4 sub-agent clones.
 // Spawn_idx % 4 picks the slot. These are chosen to sit next to the parent
@@ -51,30 +51,99 @@ function streamAgentForClick(dashboardAgentId: string, taskStatus: string): stri
   return dashboardAgentId;
 }
 
+/**
+ * Group tasks by the responsible agent, split into active (currently working)
+ * and waiting (in a human-wait state). When a role has BOTH at the same time,
+ * the engine renders the primary at the lounge (waiting wins) and the
+ * coordinator-spawned parallel session is rendered as a separate "extra"
+ * overlay at the desk via getParallelExtras / ExtraAgent.
+ */
+function classifyTaskByAgent(t: any): { agentId: string | null; bucket: 'active' | 'waiting' | null } {
+  if (t.status === 'awaiting_human') {
+    let prev = '';
+    try { prev = JSON.parse(t.error)?.previous_status || ''; } catch {}
+    return { agentId: ESCALATION_AGENT_MAP[prev] || 'pm', bucket: 'waiting' };
+  }
+  if (t.status === 'awaiting_design_approval') return { agentId: 'ux', bucket: 'waiting' };
+  if (t.status === 'epic_awaiting_approval') return { agentId: 'pm', bucket: 'waiting' };
+  const a = STATUS_MAP[t.status];
+  if (a) return { agentId: a, bucket: 'active' };
+  return { agentId: null, bucket: null };
+}
+
 function getAgentSets(tasks: any[]): { active: Set<string>; waiting: Set<string> } {
   const active = new Set<string>(), waiting = new Set<string>();
   for (const t of tasks) {
-    if (t.status === 'awaiting_human') {
-      let prev = '';
-      try { prev = JSON.parse(t.error)?.previous_status || ''; } catch {}
-      const a = ESCALATION_AGENT_MAP[prev];
-      if (a) waiting.add(a); else waiting.add('pm');
-    } else if (t.status === 'awaiting_design_approval') {
-      // Designer is the responsible agent — proofs are sitting waiting for
-      // operator approval. Send Luna to the lounge so the office reflects
-      // the actual blocker (human, not designer).
-      waiting.add('ux');
-    } else if (t.status === 'epic_awaiting_approval') {
-      // PM authored the decomposition; send the PM agent to the lounge.
-      waiting.add('pm');
-    } else {
-      const a = STATUS_MAP[t.status];
-      if (a) active.add(a);
-    }
+    const { agentId, bucket } = classifyTaskByAgent(t);
+    if (!agentId || !bucket) continue;
+    if (bucket === 'waiting') waiting.add(agentId);
+    else active.add(agentId);
   }
+  // When both: primary character goes to lounge (waiting wins). The active
+  // session is rendered via getParallelExtras as a duplicate at the desk.
   for (const id of waiting) active.delete(id);
   return { active, waiting };
 }
+
+interface ParallelExtra {
+  agentId: string;
+  taskId: string;
+  taskTitle: string;
+  taskStatus: string;
+}
+
+/**
+ * When a role has BOTH a waiting task AND an active task in flight, the
+ * coordinator has spawned a parallel session: the original is blocked on
+ * human input, but the agent picked up the next inbox task while waiting.
+ * Surface that as an additional character ("<Name> 2") at the desk so the
+ * office matches reality — without this, the dashboard would show the
+ * primary stuck at the lounge while the streaming view shows code being
+ * written.
+ *
+ * Bounded to one extra per role (per-agent locks prevent multi-active for
+ * the same role; stacked-waiting isn't visualized in v1 — only the count
+ * in the EscalationBanner conveys it).
+ */
+function getParallelExtras(tasks: any[]): ParallelExtra[] {
+  const activeByRole: Record<string, any[]> = {};
+  const waitingByRole: Record<string, any[]> = {};
+  for (const t of tasks) {
+    const { agentId, bucket } = classifyTaskByAgent(t);
+    if (!agentId || !bucket) continue;
+    const dst = bucket === 'waiting' ? waitingByRole : activeByRole;
+    (dst[agentId] = dst[agentId] || []).push(t);
+  }
+  const extras: ParallelExtra[] = [];
+  for (const role of Object.keys(activeByRole)) {
+    if (!(waitingByRole[role] || []).length) continue;
+    const activeTask = activeByRole[role][0];
+    extras.push({
+      agentId: role,
+      taskId: activeTask.id,
+      taskTitle: activeTask.title,
+      taskStatus: activeTask.status,
+    });
+  }
+  return extras;
+}
+
+// How long an exiting extra is kept around walking to the lounge before we
+// delete its character entry. Tuned to give the agent enough time to traverse
+// the office at WALK_SPEED without leaving an idle ghost sitting in the
+// lounge for too long.
+const EXTRA_DESPAWN_MS = 8000;
+
+interface ExtraLifecycle {
+  taskId: string;
+  taskTitle: string;
+  taskStatus: string;
+  state: 'working' | 'exiting';
+  /** Set when state transitions to 'exiting'; despawn timer is offset from this. */
+  exitingSince?: number;
+}
+
+const synthId = (role: string) => `${role}:2`;
 
 function getActivityLabels(tasks: any[]): Record<string, string> {
   const labels: Record<string, string> = {};
@@ -112,7 +181,16 @@ export function PixelOffice({ tasks, tasksLoaded, systemStatus, onAgentClick, ba
   // Merged agent config — names + sprite rows reflect user customizations.
   // Used for overlay labels, legend, and propagated into engine state so the
   // canvas re-renders with new sprites on change.
-  const { agents: AGENTS } = useAgentCustomizations();
+  const { agents: AGENTS, byId: agentsById } = useAgentCustomizations();
+
+  // Parallel extras: when a role has both an active task and a waiting task
+  // (the coordinator picked up the next inbox item while the original task
+  // is blocked on human input), spawn a duplicate "<Name> 2" engine character
+  // that walks from the lounge to the desk, works there, and walks back to
+  // the lounge to despawn when the parallel session ends.
+  const parallelExtras = useMemo(() => getParallelExtras(tasks), [tasks]);
+  const lifecyclesRef = useRef<Map<string, ExtraLifecycle>>(new Map());
+  const [extraIds, setExtraIds] = useState<string[]>([]);
 
   // When customizations change OR the engine finishes initializing, mutate
   // existing characters in-place so the next render frame picks up the new
@@ -182,17 +260,145 @@ export function PixelOffice({ tasks, tasksLoaded, systemStatus, onAgentClick, ba
     }
   }, [tasksLoaded, tasks, selectedInstance]);
 
+  // Parallel-extras lifecycle: spawn new ones, mark vanished ones as exiting.
+  // Spawning inserts a fresh engine character at the primary's lounge spot
+  // ("right in front of" the waiting agent) — the engine then walks it to
+  // the role's desk via the active-set membership wired in startGameLoop.
+  useEffect(() => {
+    if (!loaded) return;
+    const state = stateRef.current;
+    if (!state) return;
+
+    const desired = new Map<string, typeof parallelExtras[number]>();
+    for (const ex of parallelExtras) desired.set(ex.agentId, ex);
+    const lifecycles = lifecyclesRef.current;
+
+    let listChanged = false;
+
+    // Spawn new extras OR refresh task association on existing ones.
+    for (const [role, ex] of desired) {
+      const id = synthId(role);
+      const existing = lifecycles.get(role);
+      if (!existing) {
+        const baseAgent = agentsById[role];
+        const primary = state.characters.get(role);
+        if (!baseAgent) continue;
+        // Spawn position: "right in front of" the waiting primary's lounge
+        // chair. If the primary isn't in a wait spot for some reason, fall
+        // back to its current position so the extra appears next to it.
+        const spawnAt = primary && primary.waitSpotIdx >= 0
+          ? { x: WAIT_SPOTS[primary.waitSpotIdx].x, y: WAIT_SPOTS[primary.waitSpotIdx].y + 24 }
+          : primary
+            ? { x: primary.x, y: primary.y + 8 }
+            : { x: WAIT_SPOTS[0].x, y: WAIT_SPOTS[0].y + 24 };
+
+        state.characters.set(id, {
+          id,
+          name: `${baseAgent.name} 2`,
+          role: baseAgent.role,
+          bodyRow: baseAgent.bodyRow,
+          hairRow: baseAgent.hairRow,
+          suitRow: baseAgent.suitRow,
+          x: spawnAt.x,
+          y: spawnAt.y,
+          state: CharState.IDLE,
+          dir: Direction.DOWN,
+          animTimer: 0,
+          animFrame: 0,
+          path: [],
+          pathIdx: 0,
+          idleSpot: -1,
+          idleTimer: 0,
+          wanderCount: 0,
+          pingPongCooldown: 0,
+          blockedTimer: 0,
+          waitSpotIdx: -1,
+        });
+        lifecycles.set(role, {
+          taskId: ex.taskId,
+          taskTitle: ex.taskTitle,
+          taskStatus: ex.taskStatus,
+          state: 'working',
+        });
+        listChanged = true;
+      } else {
+        // Update task association; if it was exiting (rare — would mean a new
+        // active task arrived during the despawn window), revive to working.
+        existing.taskId = ex.taskId;
+        existing.taskTitle = ex.taskTitle;
+        existing.taskStatus = ex.taskStatus;
+        if (existing.state === 'exiting') {
+          existing.state = 'working';
+          existing.exitingSince = undefined;
+        }
+      }
+    }
+
+    // Mark vanished extras as exiting. Don't remove from state.characters
+    // yet — the despawn timer effect handles deletion after the agent has
+    // had time to walk to the lounge.
+    for (const [role, lc] of lifecycles) {
+      if (!desired.has(role) && lc.state === 'working') {
+        lc.state = 'exiting';
+        lc.exitingSince = Date.now();
+      }
+    }
+
+    if (listChanged) {
+      setExtraIds(Array.from(lifecycles.keys()).map(synthId));
+    }
+  }, [parallelExtras, agentsById, loaded]);
+
+  // Despawn timer — remove exiting extras after their walk-to-lounge window.
+  useEffect(() => {
+    const interval = setInterval(() => {
+      const state = stateRef.current;
+      if (!state) return;
+      const lifecycles = lifecyclesRef.current;
+      let removed = false;
+      const now = Date.now();
+      for (const [role, lc] of lifecycles) {
+        if (lc.state !== 'exiting' || !lc.exitingSince) continue;
+        if (now - lc.exitingSince < EXTRA_DESPAWN_MS) continue;
+        const id = synthId(role);
+        state.characters.delete(id);
+        lifecycles.delete(role);
+        delete tagRefs.current[id];
+        removed = true;
+      }
+      if (removed) {
+        setExtraIds(Array.from(lifecycles.keys()).map(synthId));
+      }
+    }, 1000);
+    return () => clearInterval(interval);
+  }, []);
+
   // Game loop
   useEffect(() => {
     if (!loaded || !canvasRef.current || !stateRef.current) return;
     const canvas = canvasRef.current;
     const state = stateRef.current;
 
+    // Augment active/waiting with parallel-extras synth IDs. 'working' extras
+    // route to active (engine walks them to the role's desk); 'exiting' route
+    // to waiting (engine walks them to the lounge before they despawn).
     const cleanup = startGameLoop(
       canvas,
       state,
-      () => getAgentSets(tasksRef.current).active,
-      () => getAgentSets(tasksRef.current).waiting,
+      () => {
+        const set = new Set(getAgentSets(tasksRef.current).active);
+        for (const [role, lc] of lifecyclesRef.current) {
+          if (lc.state === 'working') set.add(synthId(role));
+        }
+        return set;
+      },
+      () => {
+        const set = new Set(getAgentSets(tasksRef.current).waiting);
+        for (const [role, lc] of lifecyclesRef.current) {
+          if (lc.state === 'exiting') set.add(synthId(role));
+        }
+        return set;
+      },
       () => statusRef.current === 'offline',
     );
 
@@ -204,25 +410,31 @@ export function PixelOffice({ tasks, tasksLoaded, systemStatus, onAgentClick, ba
       const sx = rect.width / CANVAS_W;
       const sy = rect.height / CANVAS_H;
       const isOffline = statusRef.current === 'offline';
-      const { active, waiting } = getAgentSets(tasksRef.current);
+      const { active: baseActive, waiting: baseWaiting } = getAgentSets(tasksRef.current);
       const activities = getActivityLabels(tasksRef.current);
+      const lifecycles = lifecyclesRef.current;
 
-      for (const def of AGENTS) {
-        const ch = state.characters.get(def.id);
-        const el = tagRefs.current[def.id];
-        if (!ch || !el) continue;
-
-        if (isOffline) { el.style.display = 'none'; continue; }
-        if (isCharacterOccludedByWall(ch.x, ch.y)) { el.style.display = 'none'; continue; }
+      // Helper: position + style a tag for either a base agent or an extra.
+      // Extras share their base role's activity label but their own
+      // active-set membership for the spinning-up indicator.
+      const updateTag = (charId: string, isExtra: boolean) => {
+        const ch = state.characters.get(charId);
+        const el = tagRefs.current[charId];
+        if (!ch || !el) return;
+        if (isOffline) { el.style.display = 'none'; return; }
+        if (isCharacterOccludedByWall(ch.x, ch.y)) { el.style.display = 'none'; return; }
 
         el.style.display = '';
         el.style.left = `${ch.x * sx}px`;
         el.style.top = `${(ch.y - 20) * sy}px`;
 
-        // Detect "spinning up" — agent is assigned work but still walking to desk
-        const isSpinningUp = active.has(def.id) && ch.state === CharState.WALK;
+        const role = baseRoleId(charId);
+        const lcState = isExtra ? lifecycles.get(role)?.state : null;
+        const isActiveForChar = isExtra
+          ? lcState === 'working'
+          : baseActive.has(charId);
+        const isSpinningUp = isActiveForChar && ch.state === CharState.WALK;
 
-        // Style based on state
         if (ch.state === CharState.WORK) {
           el.style.backgroundColor = 'rgba(52,148,92,0.92)';
           el.style.cursor = 'pointer';
@@ -241,14 +453,30 @@ export function PixelOffice({ tasks, tasksLoaded, systemStatus, onAgentClick, ba
           el.style.pointerEvents = 'none';
         }
 
-        // Activity label
         const actEl = el.querySelector('[data-activity]') as HTMLElement | null;
         if (actEl) {
-          const label = isSpinningUp ? 'Starting...' : (activities[def.id] || '');
+          let label = '';
+          if (isExtra) {
+            const lc = lifecycles.get(role);
+            if (isSpinningUp) label = 'Starting...';
+            else if (ch.state === CharState.WORK && lc) label = ACTIVITY_LABELS[lc.taskStatus] || '';
+            else if (ch.state === CharState.WALK_TO_WAIT || ch.state === CharState.WAIT) label = 'Wrapping up';
+          } else {
+            label = isSpinningUp ? 'Starting...' : (activities[charId] || '');
+          }
           actEl.textContent = label;
           actEl.style.display = label ? '' : 'none';
         }
+      };
+
+      for (const def of AGENTS) updateTag(def.id, false);
+      for (const id of Object.keys(tagRefs.current)) {
+        if (id.includes(':')) updateTag(id, true);
       }
+      // baseActive / baseWaiting referenced for typing — keep the references
+      // alive so future contributors don't accidentally drop the augmented
+      // wiring above.
+      void baseWaiting;
       overlayId = requestAnimationFrame(updateOverlays);
     }
     overlayId = requestAnimationFrame(updateOverlays);
@@ -335,6 +563,34 @@ export function PixelOffice({ tasks, tasksLoaded, systemStatus, onAgentClick, ba
                 }}
               >
                 {sa.sub_name}
+              </div>
+            );
+          })}
+
+          {/* Parallel-extras label tags. The actual sprite is rendered by
+              the engine on the canvas (real character with pathfinding); the
+              tag here just floats above it and follows it as it moves, same
+              as the base agent tags above. */}
+          {extraIds.map(id => {
+            const role = baseRoleId(id);
+            const baseAgent = agentsById[role];
+            if (!baseAgent) return null;
+            return (
+              <div
+                key={id}
+                ref={el => { tagRefs.current[id] = el; }}
+                onClick={() => {
+                  if (!onAgentClick) return;
+                  const lc = lifecyclesRef.current.get(role);
+                  if (!lc || lc.state !== 'working') return;
+                  const streamId = streamAgentForClick(role, lc.taskStatus);
+                  onAgentClick(streamId, lc.taskId, lc.taskTitle);
+                }}
+                className="absolute text-[9px] font-medium px-1.5 py-0.5 rounded-md text-white whitespace-nowrap shadow-sm hover:brightness-110 transition-all"
+                style={{ transform: 'translate(-50%, -100%)', transition: 'left 0.05s linear, top 0.05s linear' }}
+              >
+                <div>{baseAgent.name} 2 <span className="opacity-70">· {baseAgent.role}</span></div>
+                <div data-activity className="text-[8px] opacity-80 text-center" style={{ display: 'none' }} />
               </div>
             );
           })}

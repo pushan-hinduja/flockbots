@@ -7,7 +7,11 @@ const TASKS_DIR = tasksDir();
 
 const VALID_EFFORT_SIZES = ['XS', 'S', 'M', 'L', 'XL'];
 const VALID_MODELS = ['claude-opus-4-7', 'claude-sonnet-4-6'];
-const VALID_EFFORT_LEVELS = ['medium', 'high', 'xhigh', 'max'];
+// Mirrors Claude Code's --effort flag values. 'low' is unused in our codebase
+// (PM/UX/QA defaults are medium+), but accepting it keeps validation consistent
+// with the CLI surface. 'xhigh' is no longer accepted — PM should emit max for
+// XL/L+ instead. session-manager normalizes any legacy xhigh to max at call time.
+const VALID_EFFORT_LEVELS = ['low', 'medium', 'high', 'max'];
 
 interface ValidationResult {
   valid: boolean;

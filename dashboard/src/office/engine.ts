@@ -123,6 +123,18 @@ export const AGENT_DEFS = [
   { id: 'reviewer', name: 'Oscar',  role: 'Review', bodyRow: 3, hairRow: 3, suitRow: 3 },
 ];
 
+/**
+ * Resolve a (possibly synthetic) character id to its base role id. Synthetic
+ * ids of the form `<role>:<n>` are used for parallel-session extras spawned
+ * by the React layer when the primary is stuck in a wait state and the
+ * coordinator picks up another task. They share the role's desk + work
+ * direction with the primary.
+ */
+export function baseRoleId(id: string): string {
+  const idx = id.indexOf(':');
+  return idx >= 0 ? id.slice(0, idx) : id;
+}
+
 const WORK_DIRECTIONS: Record<string, Direction> = {
   pm: Direction.UP,
   ux: Direction.UP,
@@ -232,13 +244,14 @@ export function snapAgentsToInitialPositions(
   for (const [id, ch] of state.characters) {
     const isActive = activeAgents.has(id);
     const isWaiting = waitingAgents.has(id);
-    const deskPos = DESK_POSITIONS[id];
+    const role = baseRoleId(id);
+    const deskPos = DESK_POSITIONS[role];
 
     if (isActive && deskPos) {
       ch.x = deskPos.x;
       ch.y = deskPos.y;
       ch.state = CharState.WORK;
-      ch.dir = WORK_DIRECTIONS[id] ?? Direction.UP;
+      ch.dir = WORK_DIRECTIONS[role] ?? Direction.UP;
       ch.path = [];
       ch.pathIdx = 0;
       ch.animFrame = 0;
@@ -631,7 +644,8 @@ export function updateCharacters(
     ch.pingPongCooldown = Math.max(0, ch.pingPongCooldown - dt);
     const shouldWork = activeAgents.has(id);
     const shouldWait = waitingAgents.has(id);
-    const deskPos = DESK_POSITIONS[id];
+    const role = baseRoleId(id);
+    const deskPos = DESK_POSITIONS[role];
     const inHandoff = handoff && (handoff.from === id || handoff.to === id);
 
     // Release any stale wait-spot claim when the agent no longer needs to wait.
@@ -673,7 +687,7 @@ export function updateCharacters(
         ch.state = CharState.WALK;
       } else if (deskPos && isNearTarget(ch, deskPos)) {
         ch.state = CharState.WORK;
-        ch.dir = WORK_DIRECTIONS[id] ?? Direction.UP;
+        ch.dir = WORK_DIRECTIONS[role] ?? Direction.UP;
       } else {
         ch.state = CharState.IDLE;
       }
@@ -749,7 +763,7 @@ export function updateCharacters(
             ch.dir = Direction.DOWN;
           } else if (deskPos && Math.abs(ch.x - deskPos.x) < TILE_SIZE && Math.abs(ch.y - deskPos.y) < TILE_SIZE) {
             ch.state = CharState.WORK;
-            ch.dir = WORK_DIRECTIONS[id] ?? Direction.UP;
+            ch.dir = WORK_DIRECTIONS[role] ?? Direction.UP;
           } else {
             ch.state = CharState.IDLE;
             ch.dir = Direction.DOWN;

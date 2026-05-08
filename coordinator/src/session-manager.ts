@@ -108,8 +108,17 @@ const EFFORT_LEVEL: Record<string, EffortLevel> = {
   'S':  'medium',
   'M':  'high',
   'L':  'high',
-  'XL': 'xhigh',
+  'XL': 'max',
 };
+
+// Claude Code's --effort flag accepts only low/medium/high/max. The legacy
+// 'xhigh' label was meant as "between high and max" but the CLI rejects it.
+// Normalize any leftover xhigh (from already-persisted rows) up to max so
+// older tasks resumed after this fix don't break at the dev/reviewer step.
+function normalizeEffortForCli(level: EffortLevel): 'low' | 'medium' | 'high' | 'max' {
+  if (level === 'xhigh') return 'max';
+  return level;
+}
 
 export interface SessionResult {
   status: 'complete' | 'failed' | 'questions_pending' | 'escalate' | 'rate_limited' | 'killed';
@@ -387,7 +396,7 @@ export async function runAgent(config: AgentConfig): Promise<SessionResult> {
         : config.agent === 'ux' ? 'high'
         : config.agent === 'qa' ? 'medium'
         : (EFFORT_LEVEL[config.effortSize || 'M'] || 'medium'));
-  args.push('--effort', effortLevel);
+  args.push('--effort', normalizeEffortForCli(effortLevel));
 
   // Add working directory and task artifacts
   args.push('--add-dir', config.cwd);

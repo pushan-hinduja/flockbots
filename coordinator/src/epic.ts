@@ -7,6 +7,7 @@ import {
 import { tasksDir } from './paths';
 import { syncToSupabase } from './supabase-sync';
 import { notifyOperator } from './notifier';
+import { presentMessage } from './presenter';
 import { randomUUID } from 'crypto';
 
 const TASKS_DIR = tasksDir();
@@ -175,7 +176,9 @@ export async function enterEpicApprovalGate(
     return `${p.index}. ${p.title} (${p.effort?.size || '?'}, ${turns}) — seam: ${p.seam}`;
   });
 
-  const msg = [
+  // Deterministic fallback — used as the dashboard escalation row body and
+  // as the chat message if the presenter LLM fails. Stable on its own.
+  const fallback = [
     `Epic plan ready: ${task.title}`,
     `${decomposition.phases.length} phases · ship_mode=${decomposition.ship_mode}`,
     '',
@@ -186,11 +189,39 @@ export async function enterEpicApprovalGate(
     `Reply YES (or "/approve_epic ${task.id}") to start, NO (or "/cancel_epic ${task.id}") to cancel.`,
   ].filter(Boolean).join('\n');
 
+  // Friendly chat message via the Haiku presenter. Inbound replies are
+  // already routed via the WhatsApp router's rule 3b (yes/no/free-text →
+  // /approve_epic or /cancel_epic) so the operator can answer naturally.
+  const chatMsg = await presentMessage({
+    intent: 'epic_approval_request',
+    data: {
+      taskId: task.id,
+      taskTitle: task.title,
+      phaseCount: decomposition.phases.length,
+      shipMode: decomposition.ship_mode,
+      rationale: decomposition.rationale || null,
+      phases: decomposition.phases.map((p) => ({
+        index: p.index,
+        title: p.title,
+        size: p.effort?.size || '?',
+        estimatedTurns: p.effort?.estimated_turns || null,
+        seam: p.seam,
+      })),
+      replyHints: {
+        approve: ['yes', 'approve', 'go', 'start', 'lgtm', `/approve_epic ${task.id}`],
+        cancel:  ['no', 'cancel', 'abort', 'skip', `/cancel_epic ${task.id}`],
+      },
+    },
+    fallback,
+  });
+
   await updateStatus(task.id, 'epic_awaiting_approval');
-  createEscalation(task.id, msg, JSON.stringify({ kind: 'epic_approval' }));
+  // Use the deterministic fallback for the dashboard escalation row so its
+  // banner stays stable regardless of what the presenter produced.
+  createEscalation(task.id, fallback, JSON.stringify({ kind: 'epic_approval' }));
   logEvent(task.id, 'system', 'epic_approval_requested',
     `Decomposition into ${decomposition.phases.length} phases awaiting approval`);
-  await notifyOperator(msg);
+  await notifyOperator(chatMsg);
 }
 
 export async function cancelEpic(epicId: string): Promise<string> {
@@ -491,9 +522,18 @@ export async function finalizeEpic(
     if (!completed) return;
     logEvent(epicId, 'system', 'epic_done',
       `Epic completed — integration QA passed (${completed.total_phases || '?'} phases)`);
-    await notifyOperator(
-      `Epic complete: ${completed.title}\nIntegration QA passed. PR: ${completed.pr_url || '(none)'}`
-    );
+    const fallback = `Epic complete: ${completed.title}\nIntegration QA passed. PR: ${completed.pr_url || '(none)'}`;
+    const presented = await presentMessage({
+      intent: 'epic_complete',
+      data: {
+        epicId,
+        epicTitle: completed.title,
+        prUrl: completed.pr_url,
+        phasesCount: completed.total_phases,
+      },
+      fallback,
+    });
+    await notifyOperator(presented);
     return;
   }
 
@@ -517,7 +557,19 @@ export async function finalizeEpic(
   ].filter(Boolean).join('\n');
   createEscalation(epicId, msg, JSON.stringify({ kind: 'epic_integration_failed' }));
   await syncToSupabase('task_update', { id: epicId });
-  await notifyOperator(msg);
+  const presented = await presentMessage({
+    intent: 'epic_integration_qa_failed',
+    data: {
+      epicId,
+      epicTitle: epic.title,
+      failingStep: failure?.failing_step || null,
+      expected: failure?.expected || null,
+      actual: failure?.actual || null,
+      replyHints: [`/dismiss ${epicId}`],
+    },
+    fallback: msg,
+  });
+  await notifyOperator(presented);
 }
 
 /**
@@ -556,9 +608,17 @@ export async function maybeFinalizeEpicAfterFix(epicId: string): Promise<void> {
   if (!completed) return;
   logEvent(epicId, 'system', 'epic_done_after_fix',
     'Epic closed after all integration QA fix tasks merged');
-  await notifyOperator(
-    `Epic complete: ${completed.title}\nAll integration-QA fixes merged. PR: ${completed.pr_url || '(none)'}`
-  );
+  const fallback = `Epic complete: ${completed.title}\nAll integration-QA fixes merged. PR: ${completed.pr_url || '(none)'}`;
+  const presented = await presentMessage({
+    intent: 'epic_complete_after_fix',
+    data: {
+      epicId,
+      epicTitle: completed.title,
+      prUrl: completed.pr_url,
+    },
+    fallback,
+  });
+  await notifyOperator(presented);
 }
 
 export async function approveEpic(

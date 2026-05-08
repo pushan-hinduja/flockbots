@@ -1,5 +1,6 @@
 import { db, logEvent, Task } from './queue';
 import { notifyOperator } from './notifier';
+import { presentMessage } from './presenter';
 import { syncToSupabase } from './supabase-sync';
 
 /**
@@ -49,11 +50,23 @@ export async function checkStaleTasks(): Promise<void> {
         db.prepare('UPDATE tasks SET status = ?, error = ?, updated_at = ? WHERE id = ?')
           .run('awaiting_human', JSON.stringify({ previous_status: task.status, reason: 'staleness_timeout' }), now, task.id);
 
-        await notifyOperator(
+        const fallback =
           `Task stuck: ${task.title}\n` +
           `Status "${task.status}" for ${Math.round(age / 60000)} min\n` +
-          `Retried ${task.retry_count} times — needs manual review`
-        );
+          `Retried ${task.retry_count} times — needs manual review`;
+        const presented = await presentMessage({
+          intent: 'task_stalled',
+          data: {
+            taskId: task.id,
+            taskTitle: task.title,
+            status: task.status,
+            stuckMinutes: Math.round(age / 60000),
+            retryCount: task.retry_count,
+            replyHints: [`/retry ${task.id}`, `/dismiss ${task.id}`],
+          },
+          fallback,
+        });
+        await notifyOperator(presented);
         await syncToSupabase('task_update', { id: task.id });
       } else {
         // Retry: reset to the beginning of the current stage

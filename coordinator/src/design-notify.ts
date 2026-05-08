@@ -15,6 +15,7 @@ import { tasksDir } from './paths';
 import type { Task } from './queue';
 import { logEvent } from './queue';
 import { notifyOperator, notifyOperatorMedia } from './notifier';
+import { presentMessage } from './presenter';
 import type { WireframeIndex, WireframeScreen, Viewport } from './wireframe-renderer';
 
 /**
@@ -59,7 +60,28 @@ export async function notifyDesignApproval(task: Task): Promise<void> {
   // Send the caption as text first so the operator sees the framing before
   // the image sequence — one big text + N small images is easier to scan
   // than N captioned images.
-  await notifyOperator(caption);
+  const presented = await presentMessage({
+    intent: 'wireframe_proofs_for_review',
+    data: {
+      taskId: task.id,
+      taskTitle,
+      round,
+      isFirstRound: round === 1,
+      screens: toShow.map((s, i) => ({
+        index: i + 1,
+        title: s.title,
+        description: s.description || null,
+        viewports: s.viewports || ['desktop'],
+      })),
+      pmOpenNotes: openNotes,
+      replyHints: [
+        'reply "approved" / "lgtm" to ship to dev',
+        'or describe changes per screen by number',
+      ],
+    },
+    fallback: caption,
+  });
+  await notifyOperator(presented);
 
   // One media message per (screen × viewport). Skip screens with no
   // mediaUrls (Supabase not configured or upload failed) and fall back

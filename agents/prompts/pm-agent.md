@@ -115,8 +115,8 @@ Responsibilities:
            "estimated_turns": <number>,
            "dev_model": "claude-sonnet-4-6" | "claude-opus-4-7",
            "reviewer_model": "claude-opus-4-7",
-           "dev_effort": "medium" | "high" | "xhigh",
-           "reviewer_effort": "high" | "xhigh",
+           "dev_effort": "medium" | "high" | "max",
+           "reviewer_effort": "high" | "max",
            "use_swarm": false,
            "skip_design": true | false
          },
@@ -161,8 +161,8 @@ Responsibilities:
      "rationale": "<1-2 sentences>",
      "dev_model": "claude-opus-4-7" | "claude-sonnet-4-6",
      "reviewer_model": "claude-opus-4-7" | "claude-sonnet-4-6",
-     "dev_effort": "medium" | "high" | "xhigh" | "max",
-     "reviewer_effort": "medium" | "high" | "xhigh" | "max",
+     "dev_effort": "medium" | "high" | "max",
+     "reviewer_effort": "medium" | "high" | "max",
      "use_swarm": true | false,
      "skip_design": true | false
    }
@@ -181,14 +181,15 @@ Responsibilities:
    | XS   | claude-sonnet-4-6 | medium     | claude-opus-4-7    | high            |
    | S    | claude-sonnet-4-6 | medium     | claude-opus-4-7    | high            |
    | M    | claude-sonnet-4-6 | high       | claude-opus-4-7    | high            |
-   | L    | claude-opus-4-7   | high       | claude-opus-4-7    | xhigh           |
-   | XL   | claude-opus-4-7   | xhigh      | claude-opus-4-7    | xhigh           |
+   | L    | claude-opus-4-7   | high       | claude-opus-4-7    | max             |
+   | XL   | claude-opus-4-7   | max        | claude-opus-4-7    | max             |
 
-   Upgrade reviewer_effort to "max" (overriding the table) for security-sensitive diffs:
-   anything touching auth, payments, database migrations, secrets handling, permissions.
-   Flag this by setting reviewer_effort: "max" and noting "security-sensitive" in rationale.
-
-   "max" for dev_effort is reserved for founder overrides via WhatsApp — do not select it yourself.
+   Effort levels map directly to Claude Code's --effort flag (low/medium/high/max).
+   Use max as the table indicates — XL dev, L+ reviewer — and do not pick max for
+   smaller sizes than the table specifies; it burns tokens without a corresponding
+   gain. For security-sensitive diffs (auth, payments, database migrations, secrets
+   handling, permissions), already-max stays max but flag "security-sensitive" in
+   the rationale so the operator sees why.
 
    Guidelines for skip_design:
    - Set true for: backend bug fixes, API changes, config updates, database migrations,

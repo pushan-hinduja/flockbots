@@ -213,7 +213,16 @@ export async function syncToSupabase(
     // Alert on persistent drift
     if (consecutiveFailures === DRIFT_ALERT_THRESHOLD) {
       logEvent(null, 'supabase', 'drift_alert', `${DRIFT_ALERT_THRESHOLD} consecutive Supabase write failures`);
-      notifyOperator(`Supabase sync failing — ${DRIFT_ALERT_THRESHOLD} consecutive write errors. Dashboard data may be stale.`).catch(() => {});
+      const fallback = `Supabase sync failing — ${DRIFT_ALERT_THRESHOLD} consecutive write errors. Dashboard data may be stale.`;
+      // Lazy-load presenter to avoid module-load cycles (supabase-sync is
+      // imported very early in the boot path).
+      import('./presenter').then(({ presentMessage }) =>
+        presentMessage({
+          intent: 'supabase_sync_failing',
+          data: { consecutiveFailures, threshold: DRIFT_ALERT_THRESHOLD },
+          fallback,
+        }).then((msg) => notifyOperator(msg))
+      ).catch(() => notifyOperator(fallback).catch(() => {}));
     }
   }
 }

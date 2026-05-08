@@ -252,7 +252,7 @@ AVAILABLE COMMANDS:
 - /dismiss {taskId}                      — Dismiss a failed task                    [DESTRUCTIVE]
 - /deploy                                — Merge staging → master                    [DESTRUCTIVE]
 - /rollback {taskId}                     — Revert a merged task                      [DESTRUCTIVE]
-- /effort {taskId} {medium|high|xhigh|max} — Override effort level for dev or reviewer
+- /effort {taskId} {medium|high|max} — Override effort level for dev or reviewer
                                           (applies to current stage; kills in-flight session and reruns)
                                           [DESTRUCTIVE if task is currently running]
 - /model {taskId} {opus|sonnet}          — Override model for dev or reviewer
@@ -275,7 +275,7 @@ RULES:
    put the command in confirmation_action, set command=null, and phrase reply as a yes/no question.
 2. /effort and /model are DESTRUCTIVE when the target task is currently running (status is researching,
    designing, developing, or reviewing). Set needs_confirmation=true. Phrase the reply with the
-   trade-off, e.g. "Bumping dev_effort to xhigh will kill the running dev session (~N minutes of tokens
+   trade-off, e.g. "Bumping dev_effort to max will kill the running dev session (~N minutes of tokens
    wasted) and restart with the new setting. Confirm?". If the task is NOT currently running, run the
    command directly (no confirmation needed) — it just updates the override for the next stage run.
 3. If the operator is clearly answering a pending escalation (e.g. "use OAuth", "keep the sidebar"),
