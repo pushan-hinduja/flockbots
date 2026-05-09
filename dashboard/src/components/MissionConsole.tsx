@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import { supabase } from '../supabase';
 import { useTaskPipeline } from '../hooks/useTaskPipeline';
 import { useRealtimeEvents } from '../hooks/useRealtimeEvents';
@@ -37,6 +37,33 @@ const PIPELINE_STAGES = [
 ] as const;
 
 type StageId = typeof PIPELINE_STAGES[number]['id'];
+
+/**
+ * Map a task's previous_status (parsed from error JSON when status='awaiting_human'
+ * or 'failed') to the pipeline-flow stage that should host it. Returns null if the
+ * previous status doesn't map to any visible pipeline stage.
+ *
+ * Mirrors the bundling baked into PIPELINE_STAGES (e.g. design_pending +
+ * wireframes_rendering + awaiting_design_approval all live under
+ * 'design_validation'; testing under 'developing'; review_pending under
+ * 'reviewing'; qa_* under 'merged').
+ */
+function prevStatusToStageId(prev: string): StageId | null {
+  if (!prev) return null;
+  for (const s of PIPELINE_STAGES) {
+    if ((s.statuses as readonly string[]).includes(prev)) return s.id;
+  }
+  if (prev === 'design_pending' || prev === 'wireframes_rendering' || prev === 'awaiting_design_approval') return 'design_validation';
+  if (prev === 'testing') return 'developing';
+  if (prev === 'review_pending') return 'reviewing';
+  if (prev.startsWith('qa_')) return 'merged';
+  return null;
+}
+
+function readPrevStatus(t: any): string {
+  try { return JSON.parse(t.error || '{}').previous_status || ''; }
+  catch { return ''; }
+}
 
 // Which agent "owns" each task status when rendering the roster.
 // qa_pending is intentionally NOT mapped — during the post-merge deploy wait
@@ -216,22 +243,41 @@ export function MissionConsole() {
   // Special-case merged: an awaiting_human task that escalated during QA still
   // belongs in the merged bar (the feature did merge — only post-merge QA is
   // stuck). We detect it via error.previous_status, mirroring agentStates.
-  const stageCounts = useMemo(() => {
-    const out: Record<StageId, number> = {
+  // stageCounts: total tasks per stage including awaiting_human + failed tasks
+  // bucketed back into the stage they were in before they got stuck.
+  // awaitingByStage / failedByStage: those portions specifically, used by the
+  // flow SVG to draw an orange (warn) and red (danger) segment on the bar so
+  // the operator sees at a glance which stages have stuck or broken tasks.
+  const { stageCounts, awaitingByStage, failedByStage } = useMemo(() => {
+    const counts: Record<StageId, number> = {
+      inbox: 0, researching: 0, designing: 0, design_validation: 0,
+      dev_ready: 0, developing: 0, reviewing: 0, merged: 0,
+    };
+    const awaiting: Record<StageId, number> = {
+      inbox: 0, researching: 0, designing: 0, design_validation: 0,
+      dev_ready: 0, developing: 0, reviewing: 0, merged: 0,
+    };
+    const failed: Record<StageId, number> = {
       inbox: 0, researching: 0, designing: 0, design_validation: 0,
       dev_ready: 0, developing: 0, reviewing: 0, merged: 0,
     };
     for (const stage of PIPELINE_STAGES) {
-      out[stage.id] = tasks.filter((t: any) => (stage.statuses as readonly string[]).includes(t.status)).length;
+      counts[stage.id] = tasks.filter((t: any) => (stage.statuses as readonly string[]).includes(t.status)).length;
     }
-    out.merged += tasks.filter((t: any) => {
-      if (t.status !== 'awaiting_human') return false;
-      try {
-        const prev = JSON.parse(t.error || '{}').previous_status || '';
-        return prev.startsWith('qa_');
-      } catch { return false; }
-    }).length;
-    return out;
+    for (const t of tasks) {
+      if (t.status === 'awaiting_human') {
+        const stageId = prevStatusToStageId(readPrevStatus(t));
+        if (!stageId) continue;
+        counts[stageId]++;
+        awaiting[stageId]++;
+      } else if (t.status === 'failed') {
+        const stageId = prevStatusToStageId(readPrevStatus(t));
+        if (!stageId) continue;
+        counts[stageId]++;
+        failed[stageId]++;
+      }
+    }
+    return { stageCounts: counts, awaitingByStage: awaiting, failedByStage: failed };
   }, [tasks]);
 
   const totalActiveTasks = useMemo(() =>
@@ -496,11 +542,10 @@ export function MissionConsole() {
 
   const handleSignOut = async () => { await supabase.auth.signOut(); };
 
-  // ----- Escalations banner (lightweight version) -----
-  // Both regular escalations and design-approval gates block on a human reply,
-  // so they're counted together in the in-page banner. The cross-instance
-  // EscalationBanner component (rendered by Dashboard.tsx) breaks them out
-  // with per-row context + the right slash-command hint.
+  // ----- Escalations banner (in-page summary) -----
+  // Regular escalations, design-approval gates, and epic-plan-approval gates
+  // all block on a human reply, so they're counted together in the
+  // mc-esc strip at the top of the body.
   const awaitingHuman = tasks.filter((t: any) =>
     t.status === 'awaiting_human' ||
     t.status === 'awaiting_design_approval' ||
@@ -554,7 +599,7 @@ export function MissionConsole() {
             <div className="mc-esc">
               <span className="dot" />
               <span className="body">
-                <b>{awaitingHuman.length} escalation{awaitingHuman.length !== 1 ? 's' : ''}</b> awaiting human · reply via WhatsApp to resume
+                <b>{awaitingHuman.length} escalation{awaitingHuman.length !== 1 ? 's' : ''}</b> awaiting human · reply to resume
               </span>
             </div>
           )}
@@ -666,6 +711,8 @@ export function MissionConsole() {
                 {pipeView === 'flow'
                   ? <PipelineFlow
                       stageCounts={stageCounts}
+                      awaitingByStage={awaitingByStage}
+                      failedByStage={failedByStage}
                       selectedStage={selectedStage}
                       onSelect={setSelectedStage}
                       selectedMeta={selectedMeta}
@@ -748,25 +795,18 @@ export function MissionConsole() {
               <div className="mc-tape">
                 <div className="mc-tape-inner">
                   {visibleTape.length === 0 && <div className="mc-tape-empty">NO EVENTS</div>}
-                  {visibleTape.map(r => {
-                    const isExpanded = expandedTapeRows.has(r.id);
-                    return (
-                      <div
-                        key={r.id}
-                        className={`mc-tape-row ${r.bucket}${r.tone ? ' ' + r.tone : ''}${isExpanded ? ' expanded' : ''}`}
-                        onClick={() => setExpandedTapeRows(prev => {
-                          const next = new Set(prev);
-                          if (next.has(r.id)) next.delete(r.id); else next.add(r.id);
-                          return next;
-                        })}
-                        title={isExpanded ? 'Click to collapse' : 'Click to expand full message'}
-                      >
-                        <span className="ts">{r.ts}</span>
-                        <span className="src">{r.agent}</span>
-                        <span className="msg">{r.message}</span>
-                      </div>
-                    );
-                  })}
+                  {visibleTape.map(r => (
+                    <TapeRow
+                      key={r.id}
+                      row={r}
+                      isExpanded={expandedTapeRows.has(r.id)}
+                      onToggle={() => setExpandedTapeRows(prev => {
+                        const next = new Set(prev);
+                        if (next.has(r.id)) next.delete(r.id); else next.add(r.id);
+                        return next;
+                      })}
+                    />
+                  ))}
                 </div>
               </div>
             </div>
@@ -834,6 +874,52 @@ export function MissionConsole() {
 // Sub-components
 // -----------------------------------------------------------------------------
 
+/**
+ * Activity-tape row that only becomes clickable when its message would overflow
+ * its single-line cell. Static rows (short messages that fit) stay non-
+ * interactive so the cursor doesn't suggest there's anything to click. Once
+ * expanded, the row stays clickable so the operator can collapse it again.
+ */
+function TapeRow({
+  row,
+  isExpanded,
+  onToggle,
+}: {
+  row: { id: string; ts: string; agent: string; message: string; bucket: 'agent' | 'system'; tone: 'ok' | 'warn' | 'err' | null };
+  isExpanded: boolean;
+  onToggle: () => void;
+}) {
+  const msgRef = useRef<HTMLSpanElement>(null);
+  const [overflows, setOverflows] = useState(false);
+
+  useLayoutEffect(() => {
+    const el = msgRef.current;
+    if (!el) return;
+    // When expanded the row uses pre-wrap so scrollWidth equals clientWidth;
+    // we just want to know whether the *collapsed* form would overflow.
+    if (isExpanded) return;
+    const measure = () => setOverflows(el.scrollWidth > el.clientWidth + 1);
+    measure();
+    const ro = new ResizeObserver(measure);
+    ro.observe(el);
+    return () => ro.disconnect();
+  }, [row.message, isExpanded]);
+
+  const clickable = overflows || isExpanded;
+
+  return (
+    <div
+      className={`mc-tape-row ${row.bucket}${row.tone ? ' ' + row.tone : ''}${isExpanded ? ' expanded' : ''}${clickable ? ' clickable' : ''}`}
+      onClick={clickable ? onToggle : undefined}
+      title={clickable ? (isExpanded ? 'Click to collapse' : 'Click to expand full message') : undefined}
+    >
+      <span className="ts">{row.ts}</span>
+      <span className="src">{row.agent}</span>
+      <span className="msg" ref={msgRef}>{row.message}</span>
+    </div>
+  );
+}
+
 function HeatRow({ label, cells }: { label: string; cells: number[] }) {
   const max = Math.max(1, ...cells);
   return (
@@ -875,10 +961,12 @@ const QA_COLORS = {
 };
 
 function PipelineFlow({
-  stageCounts, selectedStage, onSelect, selectedMeta,
+  stageCounts, awaitingByStage, failedByStage, selectedStage, onSelect, selectedMeta,
   mergedBreakdown, awaitingHumanCount, deployedCount, onShowDeployed,
 }: {
   stageCounts: Record<StageId, number>;
+  awaitingByStage: Record<StageId, number>;
+  failedByStage: Record<StageId, number>;
   selectedStage: StageId;
   onSelect: (s: StageId) => void;
   selectedMeta: SelectedMeta;
@@ -935,6 +1023,30 @@ function PipelineFlow({
                       )}
                       {awaitingHumanH > 0 && (
                         <rect x={x - 22} y={baseY - passedH - failedH - inQAH - awaitingH - awaitingHumanH} width={44} height={awaitingHumanH} fill={QA_COLORS.awaitingHuman} opacity={isSelected ? 1 : 0.75} />
+                      )}
+                    </>
+                  );
+                })()
+              ) : (awaitingByStage[s.id] > 0 || failedByStage[s.id] > 0) ? (
+                // Split fill: stack from bottom — active (accent) → awaiting
+                // (orange/warn) → failed (red/danger). Heights proportional
+                // to each bucket's share of the stage total. Operator sees at
+                // a glance which stages have stuck or broken tasks.
+                (() => {
+                  const awaitingH = fillH * (awaitingByStage[s.id] / count);
+                  const failedH = fillH * (failedByStage[s.id] / count);
+                  const activeH = fillH - awaitingH - failedH;
+                  const baseY = y + h;
+                  return (
+                    <>
+                      {activeH > 0 && (
+                        <rect x={x - 22} y={baseY - activeH} width={44} height={activeH} fill={isSelected ? 'var(--accent)' : 'var(--accent-dim)'} />
+                      )}
+                      {awaitingH > 0 && (
+                        <rect x={x - 22} y={baseY - activeH - awaitingH} width={44} height={awaitingH} fill={QA_COLORS.awaitingHuman} opacity={isSelected ? 1 : 0.85} />
+                      )}
+                      {failedH > 0 && (
+                        <rect x={x - 22} y={baseY - activeH - awaitingH - failedH} width={44} height={failedH} fill={QA_COLORS.failed} opacity={isSelected ? 1 : 0.85} />
                       )}
                     </>
                   );
@@ -1031,6 +1143,8 @@ function PipelineFlow({
 
 function TaskCardView({ task, compact = false }: { task: any; compact?: boolean }) {
   const model = task.dev_model?.includes('opus') ? 'OPUS' : 'SONNET';
+  const isAwaiting = task.status === 'awaiting_human';
+  const isFailed = task.status === 'failed';
   // QA indicator — derived from qa_status (post-feature tasks) or live status
   // (qa_pending/qa_running for tasks currently in the QA flow). Pre-feature
   // merged tasks have qa_status=null and never went through QA, so they show
@@ -1049,10 +1163,23 @@ function TaskCardView({ task, compact = false }: { task: any; compact?: boolean 
     : qaState === 'failed' ? 'QA FAILED'
     : null;
 
+  const cardTitle = isAwaiting ? `${task.title} — awaiting operator input`
+    : isFailed ? `${task.title} — failed at this stage`
+    : task.title;
+
   return (
-    <div className="mc-kanban-card" title={task.title}>
+    <div
+      className={`mc-kanban-card${isAwaiting ? ' awaiting' : ''}${isFailed ? ' failed' : ''}`}
+      title={cardTitle}
+    >
       <div className="mc-kanban-card-head">
         <span className="sz">{(task.effort_size || '?').toUpperCase()} · {model}{task.use_swarm ? ' · SWARM' : ''}</span>
+        {isAwaiting && (
+          <span className="mc-await-dot" title="Awaiting operator input" />
+        )}
+        {isFailed && (
+          <span className="mc-failed-dot" title="Failed at this stage" />
+        )}
         {qaState && compact && (
           <span className={`mc-qa-dot mc-qa-dot-${qaState}`} data-label={qaLabel || ''} />
         )}
@@ -1233,7 +1360,18 @@ function PipelineKanban({ tasks }: { tasks: any[] }) {
       <button className="mc-kanban-nav left" disabled={!canLeft} onClick={() => scrollBy(-240)} aria-label="Scroll left">◀</button>
       <div className="mc-kanban" ref={scrollRef}>
         {PIPELINE_STAGES.map(stage => {
-          const stageTasks = tasks.filter((t: any) => (stage.statuses as readonly string[]).includes(t.status));
+          // Active tasks + awaiting_human + failed tasks all bucketed back
+          // into the stage they were last in. Awaiting cards get an orange
+          // dot, failed cards get a red dot — both via classes on
+          // TaskCardView.
+          const activeTasks = tasks.filter((t: any) => (stage.statuses as readonly string[]).includes(t.status));
+          const awaitingHere = tasks.filter((t: any) =>
+            t.status === 'awaiting_human' && prevStatusToStageId(readPrevStatus(t)) === stage.id
+          );
+          const failedHere = tasks.filter((t: any) =>
+            t.status === 'failed' && prevStatusToStageId(readPrevStatus(t)) === stage.id
+          );
+          const stageTasks = [...activeTasks, ...awaitingHere, ...failedHere];
           return (
             <KanbanColumn
               key={stage.id}

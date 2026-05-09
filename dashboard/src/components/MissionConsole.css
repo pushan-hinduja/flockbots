@@ -920,6 +920,37 @@ button.mc-instance-pill:hover { color: var(--accent); }
 }
 .mc-kanban-card b { color: var(--fg); font-weight: 400; display: block; }
 
+/* Awaiting-human variant — orange border + pulsing dot match the warn
+   accent used by the in-page escalation banner and the flow chart's
+   awaiting-human bar segment. */
+.mc-kanban-card.awaiting { border-color: var(--warn); }
+.mc-await-dot {
+  display: inline-block;
+  width: 8px; height: 8px;
+  border-radius: 50%;
+  background: var(--warn);
+  box-shadow: 0 0 6px var(--warn);
+  animation: mc-await-pulse 1.6s ease-in-out infinite;
+  flex-shrink: 0;
+}
+@keyframes mc-await-pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.45; }
+}
+
+/* Failed variant — red border + steady red dot. Matches the danger
+   accent used by the flow chart's failed bar segment and the QA-fail
+   indicator color. */
+.mc-kanban-card.failed { border-color: var(--err, #e06a6a); }
+.mc-failed-dot {
+  display: inline-block;
+  width: 8px; height: 8px;
+  border-radius: 50%;
+  background: var(--err, #e06a6a);
+  box-shadow: 0 0 6px var(--err, #e06a6a);
+  flex-shrink: 0;
+}
+
 /* Header row — effort size on the left, optional QA indicator on the right */
 .mc-kanban-card-head {
   display: flex; align-items: center; justify-content: space-between;
@@ -1119,9 +1150,13 @@ button.mc-instance-pill:hover { color: var(--accent); }
   height: 20px;
   line-height: 20px;
   overflow: hidden;
-  cursor: pointer;
 }
-.mc-tape-row:hover .msg { color: var(--fg); }
+/* Only rows whose message overflows its cell (or is currently expanded) get
+   the clickable affordance. Static-fit rows stay non-interactive so the
+   cursor doesn't lie about there being anything to click. The .clickable
+   class is applied by TapeRow after measuring scrollWidth vs clientWidth. */
+.mc-tape-row.clickable { cursor: pointer; }
+.mc-tape-row.clickable:hover .msg { color: var(--fg); }
 /* Click-to-expand: row grows to fit the full message, msg wraps instead of
    ellipsizing. Other columns (ts/src) stay top-aligned so the wrapped
    message reads naturally below them. */

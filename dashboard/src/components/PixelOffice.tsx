@@ -103,7 +103,7 @@ interface ParallelExtra {
  *
  * Bounded to one extra per role (per-agent locks prevent multi-active for
  * the same role; stacked-waiting isn't visualized in v1 — only the count
- * in the EscalationBanner conveys it).
+ * in the in-page escalation banner (mc-esc) conveys it).
  */
 function getParallelExtras(tasks: any[]): ParallelExtra[] {
   const activeByRole: Record<string, any[]> = {};
