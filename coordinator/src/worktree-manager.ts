@@ -2,6 +2,7 @@ import simpleGit, { SimpleGit } from 'simple-git';
 import { spawn } from 'child_process';
 import { join } from 'path';
 import { existsSync, readdirSync, readFileSync } from 'fs';
+import { createHash } from 'crypto';
 import { db, logEvent } from './queue';
 import { GITHUB_STAGING_BRANCH } from './github-auth';
 
@@ -163,6 +164,32 @@ export async function isWorktreeClean(taskId: string): Promise<boolean> {
   const git: SimpleGit = simpleGit(worktreePath);
   const status = await git.status();
   return status.isClean();
+}
+
+/**
+ * Hash of the worktree's working state — HEAD commit SHA + uncommitted file
+ * statuses + the actual diff content. Used by session-manager's auto-resume
+ * loop to detect whether a continuation segment made any progress: identical
+ * hashes across two segments = the agent is stuck and should escalate
+ * instead of consuming more budget.
+ *
+ * Returns the empty string when the path isn't a git worktree (e.g. PM/UX/QA
+ * agents that operate against the target repo or task dir, not a checked-out
+ * branch). Callers treat empty as "progress check unavailable, don't auto-
+ * resume" to be safe.
+ */
+export async function snapshotWorktree(worktreePath: string): Promise<string> {
+  if (!worktreePath || !existsSync(worktreePath)) return '';
+  if (!existsSync(join(worktreePath, '.git'))) return '';
+  try {
+    const git = simpleGit(worktreePath);
+    const headSha = (await git.revparse(['HEAD'])).trim();
+    const status = await git.raw(['status', '--porcelain']);
+    const diff = await git.raw(['diff', 'HEAD']);
+    return createHash('sha256').update(`${headSha}\n${status}\n${diff}`).digest('hex');
+  } catch {
+    return '';
+  }
 }
 
 export type RebaseResult =

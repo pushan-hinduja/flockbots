@@ -99,6 +99,20 @@ function failedTasksByColumn(tasks: any[]): Record<string, any[]> {
   return out;
 }
 
+/** Bucket awaiting_human tasks into the column matching their previous_status
+ *  so they stay visible in the flow + kanban with an amber indicator,
+ *  instead of vanishing into a bottom "awaiting" bucket. */
+function awaitingTasksByColumn(tasks: any[]): Record<string, any[]> {
+  const out: Record<string, any[]> = {};
+  for (const t of tasks) {
+    if (t.status !== 'awaiting_human') continue;
+    const col = mapPreviousStatusToColumn(getFailedAtStage(t) || '');
+    if (!col) continue;
+    (out[col] = out[col] || []).push(t);
+  }
+  return out;
+}
+
 function RetryMenu({ task, onClose }: { task: any; onClose: () => void }) {
   const failedAt = getFailedAtStage(task);
   // Use the full stage order so intermediate statuses (review_pending, design_pending, testing) resolve correctly
@@ -147,14 +161,17 @@ function RetryMenu({ task, onClose }: { task: any; onClose: () => void }) {
 function TaskCard({ task }: { task: any }) {
   const [showMenu, setShowMenu] = useState(false);
   const isFailed = task.status === 'failed';
-  const canRevert = isFailed || (task.status !== 'merged' && task.status !== 'inbox');
+  const isAwaiting = task.status === 'awaiting_human';
+  const canRevert = isFailed || isAwaiting || (task.status !== 'merged' && task.status !== 'inbox');
   const isQaAuto = task.source === 'qa-auto';
   const isQaRunning = task.status === 'qa_pending' || task.status === 'qa_running';
 
   return (
     <div
       className={`bg-background border rounded-xl p-3 text-xs min-w-0 relative ${
-        isFailed ? 'border-destructive/60' : 'border-border'
+        isFailed ? 'border-destructive/60'
+          : isAwaiting ? 'border-amber-500/60'
+          : 'border-border'
       }`}
     >
       <div className="flex items-start gap-2">
@@ -162,6 +179,12 @@ function TaskCard({ task }: { task: any }) {
           <span
             className="w-1.5 h-1.5 rounded-full bg-destructive flex-shrink-0 mt-1.5"
             title="Failed at this stage"
+          />
+        )}
+        {isAwaiting && (
+          <span
+            className="w-1.5 h-1.5 rounded-full bg-amber-500 flex-shrink-0 mt-1.5 animate-pulse"
+            title="Awaiting operator input at this stage"
           />
         )}
         <p className="font-medium truncate flex-1">{task.title}</p>
@@ -206,9 +229,14 @@ function TaskCard({ task }: { task: any }) {
         )}
       </div>
       {task.effort_size && (
-        <p className={`mt-1 ${isFailed ? 'text-destructive/80' : 'text-muted-foreground'}`}>
+        <p className={`mt-1 ${
+          isFailed ? 'text-destructive/80'
+            : isAwaiting ? 'text-amber-600 dark:text-amber-500/80'
+            : 'text-muted-foreground'
+        }`}>
           {task.effort_size} · {modelLabel(task.dev_model)}
           {isFailed && ' · failed here'}
+          {isAwaiting && ' · awaiting input'}
         </p>
       )}
       {showMenu && <RetryMenu task={task} onClose={() => setShowMenu(false)} />}
@@ -248,25 +276,32 @@ function FailedCard({ task }: { task: any }) {
 }
 
 export function TaskPipeline({ tasks }: TaskPipelineProps) {
-  // Failed tasks appear in the column matching their previous_status (with a
-  // red dot + red border on the card). Failed tasks whose previous_status
-  // doesn't map to any pipeline column fall back to the bottom "Failed"
-  // section.
+  // Failed AND awaiting-human tasks both render inline within the column
+  // matching their previous_status (red dot + border for failed, pulsing
+  // amber dot + border for awaiting). Orphans (whose previous_status
+  // doesn't map to any pipeline column) fall back to the bottom buckets.
   const failedByCol = failedTasksByColumn(tasks);
+  const awaitingByCol = awaitingTasksByColumn(tasks);
   const grouped = PIPELINE_STAGES.reduce((acc, stage) => {
     const active = tasks.filter((t: any) => t.status === stage);
     const inStageFailed = failedByCol[stage] || [];
-    acc[stage] = [...active, ...inStageFailed];
+    const inStageAwaiting = awaitingByCol[stage] || [];
+    acc[stage] = [...active, ...inStageAwaiting, ...inStageFailed];
     return acc;
   }, {} as Record<string, any[]>);
 
   const failedInColumns = new Set(
     Object.values(failedByCol).flat().map((t: any) => t.id)
   );
+  const awaitingInColumns = new Set(
+    Object.values(awaitingByCol).flat().map((t: any) => t.id)
+  );
   const orphanFailed = tasks.filter(
     (t: any) => t.status === 'failed' && !failedInColumns.has(t.id)
   );
-  const awaiting = tasks.filter((t: any) => t.status === 'awaiting_human');
+  const orphanAwaiting = tasks.filter(
+    (t: any) => t.status === 'awaiting_human' && !awaitingInColumns.has(t.id)
+  );
 
   if (tasks.length === 0) {
     return (
@@ -296,19 +331,28 @@ export function TaskPipeline({ tasks }: TaskPipelineProps) {
           const isLast = i === stages.length - 1;
 
           const stageHasFailed = stageTasks.some((t: any) => t.status === 'failed');
+          const stageHasAwaiting = stageTasks.some((t: any) => t.status === 'awaiting_human');
+          // Color priority: failed (red) wins over awaiting (amber) wins over
+          // active (foreground) wins over empty (muted).
+          const dotClass = stageHasFailed
+            ? 'bg-destructive'
+            : stageHasAwaiting
+              ? 'bg-amber-500'
+              : hasItems
+                ? 'bg-foreground'
+                : 'bg-muted-foreground/30';
+          const labelClass = stageHasFailed
+            ? 'text-destructive'
+            : stageHasAwaiting
+              ? 'text-amber-600 dark:text-amber-500'
+              : hasItems
+                ? 'text-foreground'
+                : 'text-muted-foreground';
           return (
             <div key={stage} className="flex gap-3">
-              {/* Timeline track — red dot if any task failed in this stage */}
+              {/* Timeline track */}
               <div className="flex flex-col items-center w-5 flex-shrink-0">
-                <div
-                  className={`w-2 h-2 rounded-full mt-1 flex-shrink-0 ${
-                    stageHasFailed
-                      ? 'bg-destructive'
-                      : hasItems
-                        ? 'bg-foreground'
-                        : 'bg-muted-foreground/30'
-                  }`}
-                />
+                <div className={`w-2 h-2 rounded-full mt-1 flex-shrink-0 ${dotClass}`} />
                 {!isLast && (
                   <div className="w-px flex-1 min-h-[16px] bg-border" />
                 )}
@@ -317,9 +361,7 @@ export function TaskPipeline({ tasks }: TaskPipelineProps) {
               {/* Stage content */}
               <div className={`flex-1 min-w-0 ${hasItems ? 'pb-3' : 'pb-2'}`}>
                 <div className="flex items-center gap-1.5">
-                  <span className={`text-xs font-medium ${
-                    stageHasFailed ? 'text-destructive' : hasItems ? 'text-foreground' : 'text-muted-foreground'
-                  }`}>
+                  <span className={`text-xs font-medium ${labelClass}`}>
                     {STAGE_LABELS[stage]}
                   </span>
                   {hasItems && (
@@ -339,19 +381,18 @@ export function TaskPipeline({ tasks }: TaskPipelineProps) {
         })}
       </div>
 
-      {/* Special states. Failed tasks normally render inline within their
-          previous-stage column (with red dot + border); only orphans whose
-          previous_status doesn't map to a pipeline column fall to this
-          bucket. Awaiting-human tasks always live here — they're a wait
-          state, not a stage. */}
-      {(orphanFailed.length > 0 || awaiting.length > 0) && (
+      {/* Bottom buckets are now orphans-only — both failed and awaiting
+          tasks normally render inline within their previous-stage column
+          with the appropriate colored indicator. Only tasks whose
+          previous_status doesn't map to any pipeline column land here. */}
+      {(orphanFailed.length > 0 || orphanAwaiting.length > 0) && (
         <div className="mt-3 pt-3 border-t border-border space-y-3">
-          {awaiting.length > 0 && (
+          {orphanAwaiting.length > 0 && (
             <div>
               <span className="text-xs font-medium text-amber-500">
-                Awaiting Human ({awaiting.length})
+                Awaiting Human ({orphanAwaiting.length})
               </span>
-              {awaiting.map((t: any) => (
+              {orphanAwaiting.map((t: any) => (
                 <div key={t.id} className="mt-1.5">
                   <TaskCard task={t} />
                 </div>

@@ -223,6 +223,28 @@ export async function handleEscalation(task: Task, result: SessionResult, custom
   await updateStatus(task.id, 'awaiting_human');
 }
 
+async function handleMaxTurnsEscalation(task: Task, result: SessionResult): Promise<void> {
+  // session-manager's auto-resume loop already tried to continue the work
+  // across segments and only escalates here when no progress was detected
+  // in the last segment (or auto-resume isn't available for this agent).
+  // finalAgentMessage at this point is the cumulative segment-by-segment
+  // handoff history, not just the last segment.
+  const handoff = result.finalAgentMessage || '(no handoff notes captured)';
+  const message = [
+    `Task ${task.id} stopped — agent ran out of budget and the auto-resume loop`,
+    `gave up because the last continuation made no observable progress.`,
+    '',
+    `**Handoff history (segment by segment):**`,
+    handoff.slice(0, 3500),
+    '',
+    `Partial work is preserved in the worktree. Options:`,
+    `- /retry ${task.id} to start fresh (resets the worktree)`,
+    `- raise effort first, e.g. /effort ${task.id} max`,
+    `- inspect the worktree manually and commit if it's close enough`,
+  ].join('\n');
+  await handleEscalation(task, result, message);
+}
+
 async function handleFailure(task: Task, result: SessionResult): Promise<void> {
   // Re-fetch current status from DB — in-memory task object may be stale
   const currentStatus = (db.prepare('SELECT status FROM tasks WHERE id = ?').get(task.id) as { status: string })?.status || task.status;
@@ -253,6 +275,13 @@ export async function handleAgentResult(task: Task, result: SessionResult): Prom
     case 'questions_pending':
     case 'escalate':
       await handleEscalation(task, result);
+      break;
+    case 'max_turns_reached':
+      // Agent ran out of turns mid-work. Worktree is preserved so the
+      // operator can /retry (fresh attempt with more turns / higher effort)
+      // or inspect + commit manually. Surface the agent's handoff note —
+      // it usually says exactly what's done and what's remaining.
+      await handleMaxTurnsEscalation(task, result);
       break;
     case 'rate_limited':
       logEvent(task.id, 'scheduler', 'rate_limited', 'Hit rate limit, will retry next cycle');

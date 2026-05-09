@@ -111,6 +111,7 @@ const EFFORT_LEVEL: Record<string, EffortLevel> = {
   'XL': 'max',
 };
 
+
 // Claude Code's --effort flag accepts only low/medium/high/max. The legacy
 // 'xhigh' label was meant as "between high and max" but the CLI rejects it.
 // Normalize any leftover xhigh (from already-persisted rows) up to max so
@@ -121,22 +122,71 @@ function normalizeEffortForCli(level: EffortLevel): 'low' | 'medium' | 'high' | 
 }
 
 export interface SessionResult {
-  status: 'complete' | 'failed' | 'questions_pending' | 'escalate' | 'rate_limited' | 'killed';
+  status: 'complete' | 'failed' | 'questions_pending' | 'escalate' | 'rate_limited' | 'killed' | 'max_turns_reached' | 'timeout';
   output: string;
   durationMs: number;
   exitCode: number;
   inputTokens?: number;
   outputTokens?: number;
+  /** Agent's final result text from the JSON envelope (often a handoff note
+   *  on cutoff cases). For escalations after auto-resume exhaustion, this is
+   *  the cumulative segment-by-segment handoff history. */
+  finalAgentMessage?: string;
 }
 
-const AGENT_DEFAULTS: Record<string, { tools: string[]; maxTurns: number }> = {
-  pm:       { tools: ['Read', 'Write', 'WebSearch', 'WebFetch'], maxTurns: 20 },
-  ux:       { tools: ['Read', 'Write'], maxTurns: 30 },
-  dev:      { tools: ['Read', 'Write', 'Edit', 'Bash', 'Glob', 'Grep'], maxTurns: 50 },
-  reviewer: { tools: ['Read', 'Bash', 'Glob', 'Grep'], maxTurns: 20 },
+/**
+ * Patterns that indicate the session ended because of an Anthropic-side usage
+ * cap (rate limit, weekly cap, hourly quota). Checked against both stderr and
+ * stdout because Claude CLI sometimes surfaces these in the JSON envelope on
+ * stdout, not stderr. Phrasings observed across CLI versions and Anthropic
+ * error responses.
+ */
+const RATE_LIMIT_PATTERNS = [
+  /rate[\s_-]?limit/i,
+  /usage[\s_-]?limit/i,
+  /weekly[\s_-]?limit/i,
+  /quota[\s_-]?(?:exceeded|reached|exhausted)/i,
+  /usage[\s_-]?cap/i,
+  /max[\s_-]?(?:sessions|requests)/i,
+  /please try again (?:in|later)/i,
+  /rate_limit_error/i,
+];
+
+function isRateLimitSignal(stderr: string, stdout: string): boolean {
+  const combined = `${stderr}\n${stdout.slice(-4000)}`;
+  return RATE_LIMIT_PATTERNS.some(p => p.test(combined));
+}
+
+/** Human-readable duration. 71218ms → "1m 11s". 336789ms → "5m 36s". */
+function formatDuration(ms: number): string {
+  const totalSec = Math.round(ms / 1000);
+  if (totalSec < 60) return `${totalSec}s`;
+  const m = Math.floor(totalSec / 60);
+  const s = totalSec % 60;
+  return s > 0 ? `${m}m ${s}s` : `${m}m`;
+}
+
+/** Compact model label for activity-tape readability. */
+function shortModel(model: string): string {
+  if (model.includes('opus')) return 'opus';
+  if (model.includes('sonnet')) return 'sonnet';
+  if (model.includes('haiku')) return 'haiku';
+  return model;
+}
+
+// Agent tool defaults. We no longer impose a default --max-turns cap on
+// these agents — sessionTimeout (15-60min depending on size) is the real
+// wall-clock bound, and Claude Code's --effort flag is the real budget
+// control. Explicit short-loop callers that want a turn cap (e.g. dev's
+// after-test-fail tight retry) still pass config.maxTurns and that wins.
+const AGENT_DEFAULTS: Record<string, { tools: string[] }> = {
+  pm:       { tools: ['Read', 'Write', 'WebSearch', 'WebFetch'] },
+  ux:       { tools: ['Read', 'Write'] },
+  dev:      { tools: ['Read', 'Write', 'Edit', 'Bash', 'Glob', 'Grep'] },
+  reviewer: { tools: ['Read', 'Bash', 'Glob', 'Grep'] },
   // QA: browser automation via Playwright MCP + DB queries via Supabase MCP.
   // Read/Write/Bash for task-dir ops; no Edit/Glob (doesn't touch source code).
-  qa:       { tools: ['Read', 'Write', 'Bash', 'Grep'], maxTurns: 100 },
+  qa:       { tools: ['Read', 'Write', 'Bash', 'Grep'] },
 };
 
 export { AGENT_DEFAULTS };
@@ -247,7 +297,22 @@ export function spawnClaude(
   });
 }
 
-function deriveStatus(taskId: string, agent: string, result: SpawnResult): SessionResult['status'] {
+function deriveStatus(
+  taskId: string,
+  agent: string,
+  result: SpawnResult,
+  resultEvent: any | null,
+): SessionResult['status'] {
+  // Distinct statuses for cutoffs — runAgentWithRetry treats both as
+  // "needs auto-resume if progress was made" rather than fresh-retrying:
+  //   - 'max_turns_reached': the CLI hit a turn cap (we don't set --max-turns
+  //     by default anymore; this only fires if Claude Code has its own
+  //     internal cap or if a caller passed an explicit maxTurns).
+  //   - 'timeout': spawnClaude killed the process via SIGTERM at the
+  //     sessionTimeout deadline (exit 124).
+  if (resultEvent?.subtype === 'error_max_turns') return 'max_turns_reached';
+  if (result.exitCode === 124) return 'timeout';
+
   if (result.exitCode !== 0) return 'failed';
 
   const questionsPath = join(TASKS_DIR, taskId, 'questions.md');
@@ -304,8 +369,12 @@ export async function runAgent(config: AgentConfig): Promise<SessionResult> {
   const taskContext = readTaskContext(config.taskId);
   const userPrompt = buildUserPrompt(config.agent, config.taskId, taskContext, config.extraPromptContext);
 
-  // 5. Build CLI args — smart file loading for dev/reviewer
-  const maxTurns = config.maxTurns || defaults.maxTurns;
+  // 5. Build CLI args — smart file loading for dev/reviewer.
+  // No default --max-turns cap. Real bounds are sessionTimeout (wall-clock)
+  // and --effort (Claude's own thinking budget). Explicit config.maxTurns
+  // is honored when callers want a tight loop (e.g. dev's after-test-fail
+  // 20-turn rerun, the AI conflict resolver's 5-turn budget).
+  const maxTurns = config.maxTurns;
   const tools = config.tools.length > 0 ? config.tools : defaults.tools;
 
   // Determine if we're resuming a previous session
@@ -370,9 +439,13 @@ export async function runAgent(config: AgentConfig): Promise<SessionResult> {
     '--model', config.model,
     '--permission-mode', 'bypassPermissions',
     '--allowedTools', toolsWithMcp.join(','),
-    '--max-turns', String(maxTurns),
     '--strict-mcp-config',  // Only allow MCP servers listed in --mcp-config (or none)
   ];
+  // --max-turns only when the caller explicitly bounded this run. By default
+  // sessionTimeout is the real cap; a fixed turn count cuts off legit XL work.
+  if (typeof maxTurns === 'number') {
+    args.push('--max-turns', String(maxTurns));
+  }
   if (mcpConfigPath) {
     args.push('--mcp-config', mcpConfigPath);
   }
@@ -404,10 +477,15 @@ export async function runAgent(config: AgentConfig): Promise<SessionResult> {
     args.push('--add-dir', taskDir);
   }
 
-  // 6. Spawn and run with effort-based timeout + optional streaming
+  // 6. Spawn and run with effort-based timeout + optional streaming.
+  // Activity-tape message keeps only the operator-relevant fields (variant,
+  // model, effort). maxTurns/timeout/session-id stay in pm2 stdout for
+  // post-mortem debugging — they're noise on the live tape.
   const sessionTimeout = SESSION_TIMEOUT[config.effortSize || 'M'] || DEFAULT_SESSION_TIMEOUT;
+  const effortLabel = normalizeEffortForCli(effortLevel);
   logEvent(config.taskId, config.agent, 'session_start',
-    `Starting ${config.agent} (${variant}) | model: ${config.model} | maxTurns: ${maxTurns} | timeout: ${Math.round(sessionTimeout / 60000)}m | session: ${sessionId}`);
+    `Starting ${config.agent} (${variant}, ${shortModel(config.model)}, ${effortLabel} effort)`);
+  console.log(`[${config.taskId}] session_start: agent=${config.agent} variant=${variant} model=${config.model} effort=${effortLabel} maxTurns=${maxTurns ?? 'unbounded'} timeout=${Math.round(sessionTimeout / 60000)}m session=${sessionId}`);
 
   // Stream structured events to Supabase for live dashboard viewing
   let streamBuffer = '';
@@ -417,6 +495,12 @@ export async function runAgent(config: AgentConfig): Promise<SessionResult> {
   let currentToolInput = '';
   let currentToolUseId = '';
   let resultEvent: any = null;
+  // Captured from any event that carries session_id — needed for --resume
+  // when the session was killed mid-stream (timeout, etc.) before emitting
+  // the final 'result' event. Claude Code's stream-json typically includes
+  // session_id on the very first system_init event, so we'll have it even
+  // for sessions that never completed.
+  let earlySessionId: string | undefined;
 
   // Swarm visualization — track Agent-tool spawns so the dashboard can show
   // clones at the parent's desk. Keyed by tool_use_id so the matching tool_result
@@ -463,6 +547,12 @@ export async function runAgent(config: AgentConfig): Promise<SessionResult> {
     if (!line.trim()) return;
     try {
       const event = JSON.parse(line);
+
+      // Sticky-capture session_id from the first event that carries it (usually
+      // system_init). Survives mid-stream kills so --resume still works.
+      if (!earlySessionId && typeof event.session_id === 'string') {
+        earlySessionId = event.session_id;
+      }
 
       // Capture result event for usage data
       if (event.type === 'result') {
@@ -635,59 +725,226 @@ export async function runAgent(config: AgentConfig): Promise<SessionResult> {
 
   // Use Claude Code's session_id for logging so --resume can find it later.
   // When resuming, Claude Code keeps the same session_id across continuations.
-  const loggedSessionId = claudeSessionId || resumedFrom || sessionId;
+  // Prefer a real Claude session_id (from the result event, then the early
+  // capture, then the resumed-from fallback) over our random UUID — only the
+  // real one supports --resume on the next invocation.
+  const loggedSessionId = claudeSessionId || earlySessionId || resumedFrom || sessionId;
 
   // 8. Log usage
   logUsage(config.taskId, config.agent, loggedSessionId, config.model,
     result.exitCode, durationMs, inputTokens, outputTokens, cacheReadTokens, cacheCreateTokens, costUsd);
 
-  // 9. Check for rate limit
-  if (result.stderr.includes('rate limit') || result.stderr.includes('usage limit')) {
-    recordRateLimitHit(config.taskId, result.stderr);
+  // 9. Check for rate limit (regex against stderr + stdout — Anthropic's
+  // usage-cap responses sometimes land in the JSON envelope on stdout, not
+  // stderr, and phrasings vary across CLI versions: "rate limit",
+  // "weekly_limit_exceeded", "Claude AI usage limit reached", etc.)
+  if (isRateLimitSignal(result.stderr, result.stdout)) {
+    recordRateLimitHit(config.taskId, result.stderr || result.stdout.slice(-500));
+    const durHuman = formatDuration(durationMs);
+    logEvent(config.taskId, config.agent, 'session_end',
+      `Stopped ${config.agent} — Anthropic usage limit hit (${durHuman}); will retry off-peak`);
+    try { rmSync(tmpDir, { recursive: true }); } catch {}
     return { status: 'rate_limited', output: result.stderr, durationMs, exitCode: result.exitCode };
   }
 
-  // 10. Derive status
-  const status = deriveStatus(config.taskId, config.agent, result);
+  // 10. Derive status (uses resultEvent.subtype to detect max-turns hits
+  // distinctly from generic exit-1 failures)
+  const status = deriveStatus(config.taskId, config.agent, result, resultEvent);
 
-  const endMsg = `${config.agent} finished | status: ${status} | exit: ${result.exitCode} | duration: ${durationMs}ms`;
-  logEvent(config.taskId, config.agent, 'session_end',
-    result.exitCode !== 0 && result.stderr ? `${endMsg} | stderr: ${result.stderr.slice(0, 500)}` : endMsg);
+  // The agent's final result text — the last meaningful thing the model
+  // said before exit. For maxTurns hits this is usually a handoff note
+  // ("Done X, Y, Z. Remaining: ..."); for generic failures it's the last
+  // chunk of reasoning before the crash. Operator sees this directly on
+  // the activity tape so they know what happened without grepping pm2.
+  const finalAgentMessage: string | undefined = (typeof resultEvent?.result === 'string')
+    ? resultEvent.result.trim()
+    : undefined;
+
+  const durHuman = formatDuration(durationMs);
+  let endMsg: string;
+  if (status === 'complete') {
+    const summary = finalAgentMessage ? truncateForTape(finalAgentMessage, 240) : '';
+    endMsg = summary
+      ? `Finished ${config.agent} (${durHuman}) — ${summary}`
+      : `Finished ${config.agent} (${durHuman})`;
+  } else if (status === 'max_turns_reached') {
+    const note = finalAgentMessage ? truncateForTape(finalAgentMessage, 240) : '(no handoff note)';
+    const cap = typeof maxTurns === 'number' ? `${maxTurns}-turn` : 'turn';
+    endMsg = `Stopped ${config.agent} — hit ${cap} limit (${durHuman}) — ${note}`;
+  } else if (status === 'timeout') {
+    const note = finalAgentMessage ? truncateForTape(finalAgentMessage, 240) : '(no handoff note)';
+    endMsg = `Stopped ${config.agent} — wall-clock timeout (${durHuman}) — ${note}`;
+  } else if (status === 'questions_pending' || status === 'escalate') {
+    endMsg = `Stopped ${config.agent} — needs operator input (${durHuman})`;
+  } else {
+    // 'failed' — surface whatever signal we have. Order of preference:
+    // (a) agent's final result text (often explains the crash)
+    // (b) stderr last 240 chars
+    // (c) generic "exit code N"
+    const detail = finalAgentMessage
+      ? truncateForTape(finalAgentMessage, 240)
+      : result.stderr
+        ? truncateForTape(result.stderr, 240)
+        : `exit ${result.exitCode}`;
+    endMsg = `Stopped ${config.agent} — failed (${durHuman}): ${detail}`;
+  }
+  logEvent(config.taskId, config.agent, 'session_end', endMsg);
 
   // 11. Cleanup temp files
   try { rmSync(tmpDir, { recursive: true }); } catch {}
 
-  return { status, output: result.stdout, durationMs, exitCode: result.exitCode, inputTokens, outputTokens };
+  return {
+    status, output: result.stdout, durationMs, exitCode: result.exitCode,
+    inputTokens, outputTokens, finalAgentMessage,
+  };
 }
 
+/**
+ * Single-line, length-capped excerpt for the activity tape. Collapses
+ * whitespace + newlines so a multi-paragraph handoff note still fits in one
+ * row, with an ellipsis when truncated.
+ */
+function truncateForTape(text: string, max: number): string {
+  const collapsed = text.replace(/\s+/g, ' ').trim();
+  if (collapsed.length <= max) return collapsed;
+  return collapsed.slice(0, max - 1) + '…';
+}
+
+/**
+ * Run an agent with two distinct retry behaviors layered on top:
+ *
+ *   1. **Fresh-retry on hard failure** (status: 'failed'). Up to maxRetries
+ *      attempts, restart from a clean session. Same as before.
+ *
+ *   2. **Auto-resume on cutoff** (status: 'max_turns_reached' or 'timeout').
+ *      Worktree state is snapshotted before/after each segment. If the
+ *      segment made progress (snapshot changed), we set resume=true and
+ *      continue with the same Claude session_id — fresh wall-clock budget,
+ *      preserved context. If it made no progress, we escalate to the
+ *      operator with the cumulative segment-by-segment handoff history.
+ *
+ * Auto-resume only applies to dev/reviewer (the agents that work in a git
+ * worktree where progress is observable). PM/UX/QA fall through to
+ * escalation on cutoff per the previous behavior.
+ */
 export async function runAgentWithRetry(config: AgentConfig, maxRetries: number): Promise<SessionResult> {
-  let lastResult: SessionResult | null = null;
+  const { snapshotWorktree } = await import('./worktree-manager');
+  const handoffSegments: string[] = [];
   let currentConfig = config;
+  let attempt = 0;
+  let segmentNum = 1;
+  let cumulativeWallMs = 0;
 
-  for (let attempt = 0; attempt < maxRetries; attempt++) {
+  while (true) {
+    // Only snapshot for agents that work in a git worktree. PM/UX/QA's cwd
+    // is the operator's actual target repo (or task dir) — diffing it would
+    // pick up unrelated uncommitted state and burn IO on a potentially-huge
+    // repo, with no useful signal since auto-resume isn't applied to them
+    // anyway.
+    const supportsResume = currentConfig.agent === 'dev' || currentConfig.agent === 'reviewer';
+    const snapshotBefore = supportsResume ? await snapshotWorktree(currentConfig.cwd) : '';
     const result = await runAgent(currentConfig);
+    const snapshotAfter = supportsResume ? await snapshotWorktree(currentConfig.cwd) : '';
+    cumulativeWallMs += result.durationMs;
 
-    if (result.status !== 'failed' || attempt >= maxRetries - 1) {
-      return result;
+    if (result.finalAgentMessage) {
+      handoffSegments.push(`Segment ${segmentNum}: ${result.finalAgentMessage}`);
     }
 
-    lastResult = result;
+    // Cutoff path: max_turns or timeout. Try auto-resume if (a) the agent
+    // works in a worktree where we can see progress, and (b) this segment
+    // observably changed the worktree state.
+    if (result.status === 'max_turns_reached' || result.status === 'timeout') {
+      const progressObservable = snapshotBefore !== '' && snapshotAfter !== '';
+      const madeProgress = progressObservable && snapshotBefore !== snapshotAfter;
 
-    // If a resume attempt failed (e.g., session no longer exists, or --resume is incompatible
-    // with other flags), fall back to a fresh session for the next attempt
-    if (currentConfig.resume) {
-      logEvent(config.taskId, config.agent, 'resume_fallback',
-        `Resume failed, falling back to fresh session`);
-      currentConfig = { ...currentConfig, resume: false };
+      if (supportsResume && madeProgress) {
+        const note = result.finalAgentMessage
+          ? truncateForTape(result.finalAgentMessage, 200)
+          : '(no handoff note)';
+        logEvent(currentConfig.taskId, currentConfig.agent, 'auto_resume',
+          `Resuming ${currentConfig.agent} (continuation ${segmentNum + 1}, ${formatDuration(cumulativeWallMs)} so far) — ${note}`);
+        // Lazy-load notifier + presenter to avoid module-load coupling.
+        notifyAutoResume(currentConfig.taskId, currentConfig.agent, segmentNum + 1, result.finalAgentMessage)
+          .catch((err) => {
+            // Notification failure shouldn't block the loop, but surface to
+            // ops in pm2 stdout so a silent presenter outage is visible.
+            console.error(`[${currentConfig.taskId}] auto-resume notification failed: ${err?.message || err}`);
+          });
+        currentConfig = { ...currentConfig, resume: true };
+        segmentNum++;
+        continue;
+      }
+
+      // Either we can't observe progress, or none was made. Escalate with
+      // the cumulative handoff history so the operator sees what happened
+      // across every segment.
+      const reason = !supportsResume
+        ? 'auto-resume not supported for this agent'
+        : !progressObservable
+          ? 'progress check unavailable (no worktree)'
+          : 'no progress detected in last segment';
+      logEvent(currentConfig.taskId, currentConfig.agent, 'auto_resume_exhausted',
+        `Escalating after ${segmentNum} segment(s), ${formatDuration(cumulativeWallMs)} total — ${reason}`);
+      return {
+        ...result,
+        status: 'max_turns_reached',
+        finalAgentMessage: handoffSegments.length > 0
+          ? handoffSegments.join('\n\n')
+          : result.finalAgentMessage,
+      };
     }
 
-    logEvent(config.taskId, config.agent, 'retry',
-      `Attempt ${attempt + 1}/${maxRetries} failed (exit ${result.exitCode}), retrying...`);
+    // Hard failure path: fresh-retry up to maxRetries. Same as before.
+    if (result.status === 'failed' && attempt < maxRetries - 1) {
+      attempt++;
+      if (currentConfig.resume) {
+        logEvent(config.taskId, config.agent, 'resume_fallback',
+          `Resume failed, falling back to fresh session`);
+        currentConfig = { ...currentConfig, resume: false };
+      }
+      logEvent(config.taskId, config.agent, 'retry',
+        `Retrying ${config.agent} (attempt ${attempt + 1}/${maxRetries})`);
+      await new Promise(r => setTimeout(r, 5000));
+      continue;
+    }
 
-    await new Promise(r => setTimeout(r, 5000));
+    // Anything else (complete, escalate, rate_limited, killed, exhausted
+    // failed retries) — return as-is to the pipeline.
+    return result;
   }
+}
 
-  return lastResult!;
+/**
+ * Operator notification on auto-resume. Lazy-loaded to avoid pulling notifier
+ * + presenter into session-manager's module graph (notifier transitively
+ * imports things that would create a cycle on coordinator startup).
+ */
+async function notifyAutoResume(
+  taskId: string,
+  agent: string,
+  continuationNum: number,
+  handoff: string | undefined,
+): Promise<void> {
+  const { notifyOperator } = await import('./notifier');
+  const { presentMessage } = await import('./presenter');
+  const fallback = [
+    `Task ${taskId}: ${agent} continued (continuation ${continuationNum})`,
+    handoff ? `Last segment handoff: ${handoff.slice(0, 600)}` : '',
+    `Auto-resuming since the worktree shows progress. /dismiss ${taskId} if you want to stop the loop.`,
+  ].filter(Boolean).join('\n');
+  const presented = await presentMessage({
+    intent: 'agent_auto_resume',
+    data: {
+      taskId,
+      agent,
+      continuationNum,
+      lastSegmentHandoff: handoff || null,
+      replyHints: [`/dismiss ${taskId}`],
+    },
+    fallback,
+  });
+  await notifyOperator(presented);
 }
 
 export { TASKS_DIR, TARGET_REPO_PATH, PROJECT_ROOT };

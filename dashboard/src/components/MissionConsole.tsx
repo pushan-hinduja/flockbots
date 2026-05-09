@@ -194,6 +194,7 @@ export function MissionConsole() {
   const [pipeView, setPipeView] = useState<'flow' | 'kanban'>(() =>
     ((typeof window !== 'undefined' && localStorage.getItem(PIPE_VIEW_STORAGE_KEY)) as 'flow' | 'kanban') || DEFAULT_PIPE_VIEW);
   const [tapeFilter, setTapeFilter] = useState<'all' | 'system' | 'agents'>('all');
+  const [expandedTapeRows, setExpandedTapeRows] = useState<Set<string>>(new Set());
   const [selectedStage, setSelectedStage] = useState<StageId>('merged');
   const [streamModal, setStreamModal] = useState<StreamModalState | null>(null);
   const [clockTick, setClockTick] = useState(0);
@@ -747,13 +748,25 @@ export function MissionConsole() {
               <div className="mc-tape">
                 <div className="mc-tape-inner">
                   {visibleTape.length === 0 && <div className="mc-tape-empty">NO EVENTS</div>}
-                  {visibleTape.map(r => (
-                    <div key={r.id} className={`mc-tape-row ${r.bucket}${r.tone ? ' ' + r.tone : ''}`}>
-                      <span className="ts">{r.ts}</span>
-                      <span className="src">{r.agent}</span>
-                      <span className="msg">{r.message}</span>
-                    </div>
-                  ))}
+                  {visibleTape.map(r => {
+                    const isExpanded = expandedTapeRows.has(r.id);
+                    return (
+                      <div
+                        key={r.id}
+                        className={`mc-tape-row ${r.bucket}${r.tone ? ' ' + r.tone : ''}${isExpanded ? ' expanded' : ''}`}
+                        onClick={() => setExpandedTapeRows(prev => {
+                          const next = new Set(prev);
+                          if (next.has(r.id)) next.delete(r.id); else next.add(r.id);
+                          return next;
+                        })}
+                        title={isExpanded ? 'Click to collapse' : 'Click to expand full message'}
+                      >
+                        <span className="ts">{r.ts}</span>
+                        <span className="src">{r.agent}</span>
+                        <span className="msg">{r.message}</span>
+                      </div>
+                    );
+                  })}
                 </div>
               </div>
             </div>

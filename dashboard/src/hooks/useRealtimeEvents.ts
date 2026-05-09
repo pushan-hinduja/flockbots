@@ -23,8 +23,18 @@ export function useRealtimeEvents(limit: number = 50) {
         .order('created_at', { ascending: false })
         .limit(limit)
         .then(({ data, error }) => {
-          if (error) console.error('Failed to load events:', error.message);
-          setEvents(data || []);
+          // On fetch error (e.g., transient supabase blip while the
+          // coordinator's offline), keep the events we already have on
+          // screen so the activity tape doesn't visibly empty out.
+          // Likewise on a `null` data — only replace state when we have a
+          // real result. The realtime channel will catch us back up once
+          // the connection recovers.
+          if (error) {
+            console.error('Failed to load events:', error.message);
+            return;
+          }
+          if (!data) return;
+          setEvents(data);
         });
     };
 

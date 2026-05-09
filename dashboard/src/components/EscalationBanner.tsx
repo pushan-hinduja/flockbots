@@ -119,7 +119,7 @@ export function EscalationBanner() {
         })}
       </div>
       <p className="text-xs text-muted-foreground mt-2">
-        Reply via WhatsApp: {hintParts.join(' · ')}
+        Reply to resume: {hintParts.join(' · ')}
       </p>
     </div>
   );

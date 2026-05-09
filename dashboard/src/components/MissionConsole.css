@@ -1119,6 +1119,23 @@ button.mc-instance-pill:hover { color: var(--accent); }
   height: 20px;
   line-height: 20px;
   overflow: hidden;
+  cursor: pointer;
+}
+.mc-tape-row:hover .msg { color: var(--fg); }
+/* Click-to-expand: row grows to fit the full message, msg wraps instead of
+   ellipsizing. Other columns (ts/src) stay top-aligned so the wrapped
+   message reads naturally below them. */
+.mc-tape-row.expanded {
+  height: auto;
+  align-items: flex-start;
+  padding-top: 2px;
+  padding-bottom: 2px;
+}
+.mc-tape-row.expanded .msg {
+  white-space: pre-wrap;
+  word-break: break-word;
+  overflow: visible;
+  text-overflow: clip;
 }
 .mc-tape-row::before {
   content:""; position:absolute; left:2px; top:50%;
