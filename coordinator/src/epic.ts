@@ -186,12 +186,12 @@ export async function enterEpicApprovalGate(
     '',
     decomposition.rationale ? `Why: ${decomposition.rationale}` : '',
     '',
-    `Reply YES (or "/approve_epic ${task.id}") to start, NO (or "/cancel_epic ${task.id}") to cancel.`,
+    `Reply yes to start, no to cancel.`,
   ].filter(Boolean).join('\n');
 
   // Friendly chat message via the Haiku presenter. Inbound replies are
-  // already routed via the WhatsApp router's rule 3b (yes/no/free-text →
-  // /approve_epic or /cancel_epic) so the operator can answer naturally.
+  // routed via the WhatsApp router so the operator can answer in plain
+  // language ("yes" / "no" / free-text).
   const chatMsg = await presentMessage({
     intent: 'epic_approval_request',
     data: {
@@ -208,8 +208,8 @@ export async function enterEpicApprovalGate(
         seam: p.seam,
       })),
       replyHints: {
-        approve: ['yes', 'approve', 'go', 'start', 'lgtm', `/approve_epic ${task.id}`],
-        cancel:  ['no', 'cancel', 'abort', 'skip', `/cancel_epic ${task.id}`],
+        approve: ['yes', 'approve', 'go', 'start', 'lgtm'],
+        cancel:  ['no', 'cancel', 'abort', 'skip'],
       },
     },
     fallback,
@@ -553,7 +553,7 @@ export async function finalizeEpic(
     failure?.expected ? `Expected: ${failure.expected}` : '',
     failure?.actual ? `Actual: ${failure.actual}` : '',
     '',
-    `A QA-fix task was auto-created and linked to this epic. The epic will close automatically once the fix(es) land. /dismiss ${epicId} to abandon.`,
+    `A QA-fix task was auto-created and linked to this epic. The epic will close automatically once the fix(es) land. Reply if you'd like to abandon the epic instead.`,
   ].filter(Boolean).join('\n');
   createEscalation(epicId, msg, JSON.stringify({ kind: 'epic_integration_failed' }));
   await syncToSupabase('task_update', { id: epicId });
@@ -565,7 +565,6 @@ export async function finalizeEpic(
       failingStep: failure?.failing_step || null,
       expected: failure?.expected || null,
       actual: failure?.actual || null,
-      replyHints: [`/dismiss ${epicId}`],
     },
     fallback: msg,
   });

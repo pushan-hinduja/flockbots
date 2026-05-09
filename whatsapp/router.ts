@@ -349,6 +349,24 @@ async function buildStructuredState(
     }
   }
 
+  // Recently-failed tasks — surfaced separately from the active list so the
+  // LLM can route /retry or /dismiss commands targeting them by ID. Without
+  // this, the "Never invent task IDs" rule blocks the operator from
+  // referring to a failed task in natural language ("dismiss task abc123").
+  const recentFailed = db.prepare(`
+    SELECT id, title FROM tasks
+    WHERE status = 'failed'
+    ORDER BY updated_at DESC
+    LIMIT 5
+  `).all() as any[];
+  if (recentFailed.length > 0) {
+    lines.push('Recently failed (can /retry or /dismiss):');
+    for (const t of recentFailed) {
+      const title = (t.title || '').slice(0, 80);
+      lines.push(`  - ${t.id} "${title}"`);
+    }
+  }
+
   const tasks = db.prepare(`
     SELECT id, title, status, effort_size
     FROM tasks

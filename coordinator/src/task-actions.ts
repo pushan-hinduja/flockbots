@@ -78,10 +78,14 @@ export async function dismissTask(taskId: string): Promise<string> {
     return `Task ${taskId} is already ${task.status}`;
   }
 
-  // Epic cascade: dismiss children before dismissing the epic itself.
+  // Epic cascade: dismiss children before dismissing the epic itself. We
+  // intentionally INCLUDE failed children — 'failed' isn't truly terminal,
+  // it's the state where dismiss matters most. Genuinely terminal states
+  // (merged, deployed, dismissed already, epic_done) stay skipped so we
+  // don't redundantly write or "un-do" shipped work.
   let cascadedSummary = '';
   if (task.is_epic === 1) {
-    const TERMINAL = ['merged', 'dismissed', 'failed', 'deployed', 'epic_done'];
+    const TERMINAL = ['merged', 'dismissed', 'deployed', 'epic_done'];
     const children = db.prepare(`
       SELECT id, status FROM tasks
       WHERE parent_task_id = ? AND status NOT IN (${TERMINAL.map(() => '?').join(',')})

@@ -90,13 +90,17 @@ export interface AgentConfig {
   mcpConfigPath?: string; // Explicit MCP config override (for QA, etc.). If unset, auto-generates KG-only config.
 }
 
-// Effort-based session timeouts (ms)
+// Per-segment session timeouts (ms). With auto-resume in place the *total*
+// budget per task can span many of these segments — the timeout is just
+// when the agent gets cut off mid-thought and the resume loop picks back
+// up. Bumped L to 60min and XL to 90min so substantial work fits in one
+// segment more often, reducing context-warmup waste from too many resumes.
 const SESSION_TIMEOUT: Record<string, number> = {
   'XS': 15 * 60 * 1000,
   'S':  15 * 60 * 1000,
   'M':  30 * 60 * 1000,
-  'L':  45 * 60 * 1000,
-  'XL': 60 * 60 * 1000,
+  'L':  60 * 60 * 1000,
+  'XL': 90 * 60 * 1000,
 };
 const DEFAULT_SESSION_TIMEOUT = 30 * 60 * 1000;
 
@@ -152,10 +156,41 @@ const RATE_LIMIT_PATTERNS = [
   /rate_limit_error/i,
 ];
 
-function isRateLimitSignal(stderr: string, stdout: string): boolean {
-  const combined = `${stderr}\n${stdout.slice(-4000)}`;
-  return RATE_LIMIT_PATTERNS.some(p => p.test(combined));
+function isRateLimitSignal(stderr: string, resultEvent: any | null): boolean {
+  // Always inspect stderr — Claude CLI surfaces real Anthropic API errors
+  // (including 429/quota responses) on stderr.
+  const sources: string[] = [stderr];
+  // Only inspect the agent's final result text when the result was
+  // explicitly flagged as an error. Scanning all of stdout false-positives
+  // any time the agent's code or comments contain phrases like "rate limit"
+  // (e.g. when implementing throttling logic in the user's project).
+  const subtype = typeof resultEvent?.subtype === 'string' ? resultEvent.subtype : '';
+  const isErrorResult = resultEvent?.is_error === true || subtype.startsWith('error');
+  if (isErrorResult && typeof resultEvent?.result === 'string') {
+    sources.push(resultEvent.result);
+  }
+  return RATE_LIMIT_PATTERNS.some(p => p.test(sources.join('\n')));
 }
+
+/**
+ * runAgentWithRetry resume strategy by agent. After a max_turns / timeout
+ * cutoff:
+ *   - 'snapshot': only resume when the worktree observably changed since
+ *     the previous segment (dev — modifies files/commits in the worktree).
+ *   - 'count': resume up to MAX_COUNT_RESUMES regardless of worktree
+ *     state (pm/ux/reviewer/qa — their artifacts live in the task dir,
+ *     not the worktree, so snapshotting wouldn't see progress; the cap
+ *     prevents runaway loops on a stuck agent).
+ *   - 'none': never auto-resume.
+ */
+const RESUME_STRATEGY: Record<string, 'snapshot' | 'count' | 'none'> = {
+  dev: 'snapshot',
+  pm: 'count',
+  ux: 'count',
+  reviewer: 'count',
+  qa: 'count',
+};
+const MAX_COUNT_RESUMES = 3;
 
 /** Human-readable duration. 71218ms → "1m 11s". 336789ms → "5m 36s". */
 function formatDuration(ms: number): string {
@@ -734,12 +769,15 @@ export async function runAgent(config: AgentConfig): Promise<SessionResult> {
   logUsage(config.taskId, config.agent, loggedSessionId, config.model,
     result.exitCode, durationMs, inputTokens, outputTokens, cacheReadTokens, cacheCreateTokens, costUsd);
 
-  // 9. Check for rate limit (regex against stderr + stdout — Anthropic's
-  // usage-cap responses sometimes land in the JSON envelope on stdout, not
-  // stderr, and phrasings vary across CLI versions: "rate limit",
-  // "weekly_limit_exceeded", "Claude AI usage limit reached", etc.)
-  if (isRateLimitSignal(result.stderr, result.stdout)) {
-    recordRateLimitHit(config.taskId, result.stderr || result.stdout.slice(-500));
+  // 9. Check for rate limit. Inspect stderr (where Claude CLI surfaces
+  // real Anthropic API errors) and the result event's text only when the
+  // result was flagged as an error. Scanning all of stdout — which we did
+  // briefly in rc.3 — false-positives any time the agent's code or
+  // comments contain "rate limit" (e.g. throttle logic in user code).
+  if (isRateLimitSignal(result.stderr, resultEvent)) {
+    const detail = result.stderr
+      || (resultEvent?.is_error && typeof resultEvent.result === 'string' ? resultEvent.result.slice(0, 500) : '');
+    recordRateLimitHit(config.taskId, detail);
     const durHuman = formatDuration(durationMs);
     logEvent(config.taskId, config.agent, 'session_end',
       `Stopped ${config.agent} — Anthropic usage limit hit (${durHuman}); will retry off-peak`);
@@ -834,58 +872,65 @@ export async function runAgentWithRetry(config: AgentConfig, maxRetries: number)
   let attempt = 0;
   let segmentNum = 1;
   let cumulativeWallMs = 0;
+  let countResumes = 0;
 
   while (true) {
-    // Only snapshot for agents that work in a git worktree. PM/UX/QA's cwd
-    // is the operator's actual target repo (or task dir) — diffing it would
-    // pick up unrelated uncommitted state and burn IO on a potentially-huge
-    // repo, with no useful signal since auto-resume isn't applied to them
-    // anyway.
-    const supportsResume = currentConfig.agent === 'dev' || currentConfig.agent === 'reviewer';
-    const snapshotBefore = supportsResume ? await snapshotWorktree(currentConfig.cwd) : '';
+    // Resume strategy varies by agent:
+    //   - dev → 'snapshot': only resume when the worktree observably
+    //     changed in the last segment. Dev edits files / commits, so the
+    //     snapshot is a real signal of progress vs. spinning.
+    //   - pm / ux / reviewer / qa → 'count': resume up to MAX_COUNT_RESUMES
+    //     regardless of worktree state. Their artifacts (research.json,
+    //     wireframes, review.md, qa-report.md) live in the task dir, not
+    //     the worktree, so snapshotting the worktree is meaningless. Cap
+    //     prevents runaway loops on a genuinely-stuck agent.
+    const strategy = RESUME_STRATEGY[currentConfig.agent] || 'none';
+    const snapshotBefore = strategy === 'snapshot' ? await snapshotWorktree(currentConfig.cwd) : '';
     const result = await runAgent(currentConfig);
-    const snapshotAfter = supportsResume ? await snapshotWorktree(currentConfig.cwd) : '';
+    const snapshotAfter = strategy === 'snapshot' ? await snapshotWorktree(currentConfig.cwd) : '';
     cumulativeWallMs += result.durationMs;
 
     if (result.finalAgentMessage) {
       handoffSegments.push(`Segment ${segmentNum}: ${result.finalAgentMessage}`);
     }
 
-    // Cutoff path: max_turns or timeout. Try auto-resume if (a) the agent
-    // works in a worktree where we can see progress, and (b) this segment
-    // observably changed the worktree state.
+    // Cutoff path: max_turns or timeout.
     if (result.status === 'max_turns_reached' || result.status === 'timeout') {
-      const progressObservable = snapshotBefore !== '' && snapshotAfter !== '';
-      const madeProgress = progressObservable && snapshotBefore !== snapshotAfter;
+      let decision: { resume: boolean; reason: string };
+      if (strategy === 'snapshot') {
+        const observable = snapshotBefore !== '' && snapshotAfter !== '';
+        const madeProgress = observable && snapshotBefore !== snapshotAfter;
+        decision = madeProgress
+          ? { resume: true, reason: 'worktree changed during last segment' }
+          : !observable
+            ? { resume: false, reason: 'progress check unavailable (no worktree)' }
+            : { resume: false, reason: 'no progress detected in last segment' };
+      } else if (strategy === 'count') {
+        decision = countResumes < MAX_COUNT_RESUMES
+          ? { resume: true, reason: `count-based continuation ${countResumes + 1}/${MAX_COUNT_RESUMES}` }
+          : { resume: false, reason: `reached ${MAX_COUNT_RESUMES}-continuation cap` };
+      } else {
+        decision = { resume: false, reason: 'auto-resume not supported for this agent' };
+      }
 
-      if (supportsResume && madeProgress) {
+      if (decision.resume) {
         const note = result.finalAgentMessage
           ? truncateForTape(result.finalAgentMessage, 200)
           : '(no handoff note)';
         logEvent(currentConfig.taskId, currentConfig.agent, 'auto_resume',
           `Resuming ${currentConfig.agent} (continuation ${segmentNum + 1}, ${formatDuration(cumulativeWallMs)} so far) — ${note}`);
-        // Lazy-load notifier + presenter to avoid module-load coupling.
         notifyAutoResume(currentConfig.taskId, currentConfig.agent, segmentNum + 1, result.finalAgentMessage)
           .catch((err) => {
-            // Notification failure shouldn't block the loop, but surface to
-            // ops in pm2 stdout so a silent presenter outage is visible.
             console.error(`[${currentConfig.taskId}] auto-resume notification failed: ${err?.message || err}`);
           });
         currentConfig = { ...currentConfig, resume: true };
         segmentNum++;
+        countResumes++;
         continue;
       }
 
-      // Either we can't observe progress, or none was made. Escalate with
-      // the cumulative handoff history so the operator sees what happened
-      // across every segment.
-      const reason = !supportsResume
-        ? 'auto-resume not supported for this agent'
-        : !progressObservable
-          ? 'progress check unavailable (no worktree)'
-          : 'no progress detected in last segment';
       logEvent(currentConfig.taskId, currentConfig.agent, 'auto_resume_exhausted',
-        `Escalating after ${segmentNum} segment(s), ${formatDuration(cumulativeWallMs)} total — ${reason}`);
+        `Escalating after ${segmentNum} segment(s), ${formatDuration(cumulativeWallMs)} total — ${decision.reason}`);
       return {
         ...result,
         status: 'max_turns_reached',
@@ -931,7 +976,7 @@ async function notifyAutoResume(
   const fallback = [
     `Task ${taskId}: ${agent} continued (continuation ${continuationNum})`,
     handoff ? `Last segment handoff: ${handoff.slice(0, 600)}` : '',
-    `Auto-resuming since the worktree shows progress. /dismiss ${taskId} if you want to stop the loop.`,
+    `Auto-resuming. Reply to stop the loop if you'd rather not continue.`,
   ].filter(Boolean).join('\n');
   const presented = await presentMessage({
     intent: 'agent_auto_resume',
@@ -940,7 +985,6 @@ async function notifyAutoResume(
       agent,
       continuationNum,
       lastSegmentHandoff: handoff || null,
-      replyHints: [`/dismiss ${taskId}`],
     },
     fallback,
   });

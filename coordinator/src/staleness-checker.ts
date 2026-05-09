@@ -62,7 +62,6 @@ export async function checkStaleTasks(): Promise<void> {
             status: task.status,
             stuckMinutes: Math.round(age / 60000),
             retryCount: task.retry_count,
-            replyHints: [`/retry ${task.id}`, `/dismiss ${task.id}`],
           },
           fallback,
         });

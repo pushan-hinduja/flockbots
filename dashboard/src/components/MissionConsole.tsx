@@ -280,9 +280,14 @@ export function MissionConsole() {
     return { stageCounts: counts, awaitingByStage: awaiting, failedByStage: failed };
   }, [tasks]);
 
+  // "PIPELINE · X TASKS" header count. Sum of stageCounts is the total
+  // visible in the chart (active + bucketed awaiting + bucketed failed),
+  // and naturally excludes epic rows since epic_* statuses aren't in any
+  // PIPELINE_STAGES.statuses entry. The epic itself is a meta-row that
+  // doesn't belong in any per-stage tally on the mission console.
   const totalActiveTasks = useMemo(() =>
-    tasks.filter((t: any) => !['merged', 'failed', 'dismissed', 'deployed'].includes(t.status)).length,
-  [tasks]);
+    Object.values(stageCounts).reduce((s, n) => s + n, 0),
+  [stageCounts]);
 
   // Tasks already shipped to production — shown only in the "Deployed" modal,
   // hidden from the pipeline chart and kanban (neither PIPELINE_STAGES nor
@@ -717,7 +722,6 @@ export function MissionConsole() {
                       onSelect={setSelectedStage}
                       selectedMeta={selectedMeta}
                       mergedBreakdown={mergedBreakdown}
-                      awaitingHumanCount={awaitingHuman.length}
                       deployedCount={deployedTasks.length}
                       onShowDeployed={() => setShowDeployedModal(true)}
                     />
@@ -962,7 +966,7 @@ const QA_COLORS = {
 
 function PipelineFlow({
   stageCounts, awaitingByStage, failedByStage, selectedStage, onSelect, selectedMeta,
-  mergedBreakdown, awaitingHumanCount, deployedCount, onShowDeployed,
+  mergedBreakdown, deployedCount, onShowDeployed,
 }: {
   stageCounts: Record<StageId, number>;
   awaitingByStage: Record<StageId, number>;
@@ -971,7 +975,6 @@ function PipelineFlow({
   onSelect: (s: StageId) => void;
   selectedMeta: SelectedMeta;
   mergedBreakdown: MergedBreakdown;
-  awaitingHumanCount: number;
   deployedCount: number;
   onShowDeployed: () => void;
 }) {
@@ -980,7 +983,14 @@ function PipelineFlow({
   const span = W - padL - padR;
   const N = PIPELINE_STAGES.length;
   const maxCount = Math.max(1, ...PIPELINE_STAGES.map(s => stageCounts[s.id]));
-  const total = PIPELINE_STAGES.reduce((s, st) => s + stageCounts[st.id], 0);
+  // Legend math: keep ACTIVE / AWAITING / FAILED disjoint so the rows sum
+  // to what the operator actually sees in the bars. stageCounts already has
+  // the awaiting + failed bucketed in (so the bar heights are right);
+  // subtract them out for the active-only count.
+  const totalAwaiting = PIPELINE_STAGES.reduce((s, st) => s + (awaitingByStage[st.id] || 0), 0);
+  const totalFailed = PIPELINE_STAGES.reduce((s, st) => s + (failedByStage[st.id] || 0), 0);
+  const totalChartTasks = PIPELINE_STAGES.reduce((s, st) => s + stageCounts[st.id], 0);
+  const totalActive = totalChartTasks - totalAwaiting - totalFailed;
 
   return (
     <>
@@ -1086,8 +1096,11 @@ function PipelineFlow({
         })}
       </svg>
       <div className="mc-pipe-legend">
-        <div className="row"><span className="sw" /><span>TOTAL ACTIVE</span><span className="c">{total}</span></div>
-        <div className="row"><span className="sw" style={{ background: 'var(--warn)' }} /><span>AWAITING HUMAN</span><span className="c">{awaitingHumanCount}</span></div>
+        <div className="row"><span className="sw" /><span>ACTIVE</span><span className="c">{totalActive}</span></div>
+        <div className="row"><span className="sw" style={{ background: 'var(--warn)' }} /><span>AWAITING HUMAN</span><span className="c">{totalAwaiting}</span></div>
+        {totalFailed > 0 && (
+          <div className="row"><span className="sw" style={{ background: QA_COLORS.failed }} /><span>FAILED</span><span className="c">{totalFailed}</span></div>
+        )}
       </div>
       <div className="mc-pipe-selected">
         <div className="k">SELECTED STAGE</div>

@@ -21,9 +21,15 @@ export function useTaskPipeline() {
     setTasksLoaded(false);
 
     const fetchTasks = () => {
+      // Exclude dismissed tasks at the query level — they're functionally
+      // deleted and never need to render anywhere in the UI. Defense-in-
+      // depth against stale rows that didn't get sync'd properly: even if
+      // dismissTask never reached Supabase for some reason, the dashboard
+      // still won't surface dismissed tasks to the operator.
       supabase.from('flockbots_tasks')
         .select('*')
         .eq('instance_id', selectedInstance)
+        .neq('status', 'dismissed')
         .order('updated_at', { ascending: false })
         .then(({ data, error }) => {
           if (error) console.error('Failed to load tasks:', error.message);
@@ -49,6 +55,13 @@ export function useTaskPipeline() {
         setTasks(prev => {
           if (payload.eventType === 'DELETE') {
             return prev.filter(t => t.id !== payload.old?.id);
+          }
+          // When a realtime UPDATE arrives flipping a task to 'dismissed',
+          // remove it from state instead of merging it back in. Mirrors the
+          // query-level filter so dismiss disappears the task instantly
+          // without waiting for the next fetchTasks / page reload.
+          if (payload.new?.status === 'dismissed') {
+            return prev.filter(t => t.id !== payload.new.id);
           }
           const updated = prev.filter(t => t.id !== payload.new?.id);
           if (payload.new) updated.unshift(payload.new);

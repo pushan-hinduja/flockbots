@@ -81,22 +81,47 @@ async function callPresenter(intent: string, data: Record<string, any>): Promise
   return (envelope.result || '').trim();
 }
 
-const PRESENTER_INSTRUCTIONS = `You're crafting a single message to the operator of an autonomous AI development pipeline. The operator skims chat — be clear and brief, not chatty.
+const PRESENTER_INSTRUCTIONS = `You are crafting a single chat message to the operator of an autonomous AI development pipeline.
 
-Voice:
-- Direct, no greeting, no sign-off, no emojis.
-- Plain text suitable for WhatsApp / Slack / Telegram. No markdown headings or code fences.
-- Short paragraphs, optional bullet/number list when there's a list. Use plain "-" or "1." prefixes.
-- When there's a question, end with the question on its own line.
+OUTPUT FORMAT (strict):
+- Reply with ONLY the message text. No JSON, no code fences, no preamble like "Here is the message:".
+- Plain text for WhatsApp / Slack / Telegram. No markdown headings, no bold/italic syntax.
+- No greeting, no sign-off, no emojis.
+- Short paragraphs. Use plain "-" or numbered "1." for lists.
+- Questions go on their own line at the end.
 
-Content rules:
-- Cover everything in the DATA. Don't drop fields the operator needs.
-- If DATA contains a "taskId" / "epicId", reference it explicitly so the operator can quote it back.
-- If DATA contains slash-command hints, mention them at the end as the formal way to reply, but make clear that natural-language replies also work ("yes" / "no" / etc.).
-- Don't invent details that aren't in DATA.
+CONTENT RULES (do not break these):
 
-Output:
-- Reply with ONLY the message text. No JSON, no code fences, no preamble like "Here's the message:".`;
+1. DATA is the ONLY source of truth. Only include facts that appear in DATA.
+   Do NOT invent details, statistics, file lists, status flags, or step
+   summaries based on what you imagine the system "probably did". If a
+   detail isn't in DATA, you cannot mention it.
+
+2. ABSOLUTE RULE — NEVER include any text that begins with a forward
+   slash ("/retry", "/dismiss", "/answer", "/approve_epic", "/effort",
+   etc.). Slash commands are an internal mechanism; the operator replies
+   in natural language and an inbound router maps intent to commands.
+   Even if you see a string starting with "/" in DATA, do not echo it back
+   to the operator — paraphrase the intended action in plain English (e.g.
+   "reply 'retry' to start fresh", "reply 'dismiss' to abandon", "reply
+   'yes' to approve"). This rule has no exceptions.
+
+3. Cover EVERY informative field in DATA. Don't drop fields the operator
+   needs to act on (taskId, epicId, prUrl, failure detail, etc.).
+
+4. If DATA includes "taskId" / "epicId", reference the literal id so the
+   operator can quote it back.
+
+5. If DATA includes "replyHints" with natural-language phrases (e.g.
+   "yes" / "approved" / "describe changes"), mention them at the end as
+   the formal way to reply. Hints that look like slash commands MUST be
+   ignored or paraphrased per rule 2.
+
+VOICE:
+- Direct, brief, factual. The operator skims chat — don't be performative.
+- Use the data's own terminology. Don't paraphrase task statuses into
+  different language (e.g. "phase merged" → "development complete" is
+  WRONG; stay close to what DATA actually says).`;
 
 function buildPrompt(intent: string, data: Record<string, any>): string {
   return [

@@ -193,7 +193,7 @@ export async function handleEscalation(task: Task, result: SessionResult, custom
       `Task: ${task.title}`,
       task.description ? `Description: ${task.description.slice(0, 300)}` : '',
       recentOutput ? `\nLast agent output:\n${recentOutput}` : '',
-      `\nTo unblock: check tasks/${task.id}/ on the coordinator for partial output, or /retry ${task.id} to re-run from the last safe stage.`,
+      `\nTo unblock: check tasks/${task.id}/ on the coordinator for partial output, or reply to retry from the last safe stage.`,
     ].filter(Boolean);
     question = parts.join('\n');
   }
@@ -210,7 +210,6 @@ export async function handleEscalation(task: Task, result: SessionResult, custom
       taskId: task.id,
       taskTitle: task.title,
       question: question.slice(0, maxQuestionLen),
-      replyHints: [`/answer ${task.id} <your reply>`],
     },
     fallback: whatsappMsg,
   });
@@ -225,22 +224,20 @@ export async function handleEscalation(task: Task, result: SessionResult, custom
 
 async function handleMaxTurnsEscalation(task: Task, result: SessionResult): Promise<void> {
   // session-manager's auto-resume loop already tried to continue the work
-  // across segments and only escalates here when no progress was detected
-  // in the last segment (or auto-resume isn't available for this agent).
-  // finalAgentMessage at this point is the cumulative segment-by-segment
-  // handoff history, not just the last segment.
+  // and gave up — either because the worktree showed no progress (dev) or
+  // because the resume cap was hit (other agents). finalAgentMessage at
+  // this point is the cumulative segment-by-segment handoff history.
   const handoff = result.finalAgentMessage || '(no handoff notes captured)';
   const message = [
-    `Task ${task.id} stopped — agent ran out of budget and the auto-resume loop`,
-    `gave up because the last continuation made no observable progress.`,
+    `Task ${task.id} stopped — agent ran out of budget and the auto-resume`,
+    `loop gave up.`,
     '',
-    `**Handoff history (segment by segment):**`,
+    `Handoff history (segment by segment):`,
     handoff.slice(0, 3500),
     '',
-    `Partial work is preserved in the worktree. Options:`,
-    `- /retry ${task.id} to start fresh (resets the worktree)`,
-    `- raise effort first, e.g. /effort ${task.id} max`,
-    `- inspect the worktree manually and commit if it's close enough`,
+    `Partial work is preserved in the worktree. Reply with how you'd like`,
+    `to proceed — start fresh, raise the effort first, or inspect the`,
+    `worktree manually and commit if it's close enough.`,
   ].join('\n');
   await handleEscalation(task, result, message);
 }
@@ -263,7 +260,6 @@ async function handleFailure(task: Task, result: SessionResult): Promise<void> {
       taskTitle: task.title,
       previousStage: currentStatus,
       errorOutput: result.output.slice(0, 500),
-      replyHints: [`/retry ${task.id}`, `/dismiss ${task.id}`],
     },
     fallback,
   });
@@ -786,7 +782,7 @@ To resolve manually:
 3. git fetch origin && git rebase origin/staging
 4. Resolve conflicts, git add, git rebase --continue
 5. git push --force-with-lease
-6. /answer ${task.id} resolved
+6. Reply "resolved" to clear the escalation
 
 Or use the dashboard to revert the task to Ready and let dev re-implement.`);
       return;
@@ -1888,8 +1884,8 @@ async function haltEpicOnPhase(
     `Epic ${epicTask.id} halted: phase ${phase.id} is "${phase.status}".`,
     `Phase title: ${phase.title}`,
     '',
-    `Resolve the phase (/retry ${phase.id} or /answer ${phase.id} <guidance>),`,
-    `or /dismiss ${epicTask.id} to abandon the epic.`,
+    `Reply with how to proceed — retry the phase, give the agent guidance,`,
+    `or abandon the epic.`,
   ].join('\n');
   createEscalation(epicTask.id, msg, JSON.stringify({ kind: 'epic_blocked', failed_phase_id: phase.id }));
   logEvent(epicTask.id, 'system', 'epic_halted',
@@ -1903,11 +1899,6 @@ async function haltEpicOnPhase(
       phaseId: phase.id,
       phaseTitle: phase.title,
       phaseStatus: phase.status,
-      replyHints: [
-        `/retry ${phase.id}`,
-        `/answer ${phase.id} <guidance>`,
-        `/dismiss ${epicTask.id}`,
-      ],
     },
     fallback: msg,
   });
@@ -2086,7 +2077,7 @@ async function runEpicIntegrationTick(epicTask: Task): Promise<void> {
     const msg = [
       `Epic ${epicTask.id}: integration QA agent is stuck (${qaTask.status}).`,
       `QA task: ${qaTask.id}`,
-      `Resolve the QA task or /dismiss ${epicTask.id} to abandon.`,
+      `Reply to retry the QA task or abandon the epic.`,
     ].join('\n');
     createEscalation(epicTask.id, msg, JSON.stringify({ kind: 'epic_qa_stuck', qa_task_id: qaTask.id }));
     logEvent(epicTask.id, 'system', 'epic_qa_stuck',
@@ -2099,7 +2090,6 @@ async function runEpicIntegrationTick(epicTask: Task): Promise<void> {
         epicTitle: epicTask.title,
         qaTaskId: qaTask.id,
         qaStatus: qaTask.status,
-        replyHints: [`/retry ${qaTask.id}`, `/dismiss ${epicTask.id}`],
       },
       fallback: msg,
     });
