@@ -1326,6 +1326,29 @@ button.mc-instance-pill:hover { color: var(--accent); }
 
   /* --- Accent switcher hidden on mobile --- */
   .mc-accent-switcher { display: none !important; }
+
+  /* --- Modals: drop backdrop padding so the dialog can use full width --- */
+  .mc-modal-backdrop { padding: 8px; }
+
+  /* --- Agent stream modal: must fit viewport on phones.
+     Default has max-width: 960px + min-height: 320px on the body, which
+     pushes the dialog past a small screen's bounds. Cap to viewport,
+     drop the body's min-height, and trim chrome that crowds the head. */
+  .mc-stream-modal {
+    max-width: 100%;
+    max-height: calc(100vh - 16px);
+    width: 100%;
+  }
+  .mc-stream-body {
+    min-height: 0;
+    padding: 10px 12px;
+    font-size: 10px;
+  }
+  .mc-stream-task { display: none; }
+  .mc-stream-role { display: none; }
+  .mc-stream-foot { padding: 6px 10px; font-size: 8px; letter-spacing: 0.15em; }
+  .mc-stream-loader-sprite { transform: scale(0.85); }
+  .mc-stream-block { padding: 6px 8px; font-size: 10px; }
 }
 
 /* Escalation banner (replaces old component styling) */

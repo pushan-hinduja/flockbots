@@ -120,11 +120,20 @@ export function validateDecomposition(epicId: string): DecompositionValidation {
 }
 
 /**
- * Helper: is this task a phase under an epic? Read parent flag fresh from DB
- * because the in-memory Task may predate the parent's promotion to epic.
+ * Helper: is this task a phase under an epic?
+ *
+ * IMPORTANT: must check both `parent.is_epic` AND `task.source ===
+ * 'epic-phase'`. Multiple task kinds attach to an epic via parent_task_id —
+ * phases (source='epic-phase'), the integration-QA task (source='epic-qa'),
+ * and integration-QA-fix tasks (source='epic-qa-fix') — but only phases
+ * should run through the phase-specific code paths (PM phase mode, branch
+ * from epic/<id>, skip-QA-on-merge, etc.). Without the source check, fix
+ * tasks get mis-treated as phases, branched from the already-merged epic
+ * branch with no commits to add, and fail at PR creation.
  */
 export function isEpicPhase(task: Task): boolean {
   if (!task.parent_task_id) return false;
+  if (task.source !== 'epic-phase') return false;
   const parent = db.prepare('SELECT is_epic FROM tasks WHERE id = ?')
     .get(task.parent_task_id) as { is_epic: number } | undefined;
   return parent?.is_epic === 1;
@@ -132,17 +141,23 @@ export function isEpicPhase(task: Task): boolean {
 
 export function getEpicForPhase(task: Task): Task | null {
   if (!task.parent_task_id) return null;
+  if (task.source !== 'epic-phase') return null;
   const parent = db.prepare('SELECT * FROM tasks WHERE id = ?').get(task.parent_task_id) as Task | undefined;
   return parent && parent.is_epic === 1 ? parent : null;
 }
 
 /**
- * Resolve the base branch a task should branch from / PR into. Phases of an
- * epic build on top of `epic/<epicId>`; everything else builds on staging.
- * Caller passes its own staging-branch fallback to avoid importing
- * github-auth here (keeps the dependency graph linear).
+ * Resolve the base branch a task should branch from / PR into. Only
+ * source='epic-phase' tasks build on top of `epic/<epicId>` — phases of an
+ * in-flight epic stack on each other through that branch. Everything else
+ * (standalone tasks, integration-QA, integration-QA-fix tasks) builds on
+ * staging. Critically: integration-QA-fix tasks come AFTER the epic has
+ * merged to staging, so the epic branch is stale; the fix needs to land on
+ * staging directly. Caller passes its own staging-branch fallback to avoid
+ * importing github-auth here (keeps the dependency graph linear).
  */
 export function getBaseBranchForTask(task: Task, stagingFallback: string): string {
+  if (task.source !== 'epic-phase') return stagingFallback;
   if (task.parent_task_id) {
     const parent = db.prepare('SELECT is_epic FROM tasks WHERE id = ?')
       .get(task.parent_task_id) as { is_epic: number } | undefined;
@@ -541,19 +556,30 @@ export async function finalizeEpic(
   // runQAStage via createQAFixTask (linked directly to this epic with
   // source='epic-qa-fix'). The epic stays awaiting_human until
   // maybeFinalizeEpicAfterFix finishes the cycle.
+  //
+  // staging_error is the exception: runQAStage skips creating a fix task
+  // because staging is broken (not the code), so the closing line has to
+  // reflect that — promising an auto-fix that doesn't exist would leave
+  // the epic stuck waiting for a child that will never arrive.
+  const isStagingError = failure?.category === 'staging_error';
   db.prepare('UPDATE tasks SET status = ?, error = ?, updated_at = ? WHERE id = ?')
     .run('awaiting_human',
       JSON.stringify({ previous_status: 'epic_integrating', integration_qa_failed: true }),
       Date.now(), epicId);
 
+  const closingLine = isStagingError
+    ? `No fix task was created — this is a staging environment issue, not a code regression. Investigate staging health, then reply to re-queue integration QA for this epic.`
+    : `A QA-fix task was auto-created and linked to this epic. The epic will close automatically once the fix(es) land. Reply if you'd like to abandon the epic instead.`;
+
   const msg = [
     `Epic ${epicId} integration QA FAILED.`,
     `Title: ${epic.title}`,
+    failure?.category ? `Category: ${failure.category}` : '',
     failure?.failing_step ? `Failing step: ${failure.failing_step}` : '',
     failure?.expected ? `Expected: ${failure.expected}` : '',
     failure?.actual ? `Actual: ${failure.actual}` : '',
     '',
-    `A QA-fix task was auto-created and linked to this epic. The epic will close automatically once the fix(es) land. Reply if you'd like to abandon the epic instead.`,
+    closingLine,
   ].filter(Boolean).join('\n');
   createEscalation(epicId, msg, JSON.stringify({ kind: 'epic_integration_failed' }));
   await syncToSupabase('task_update', { id: epicId });
@@ -562,9 +588,11 @@ export async function finalizeEpic(
     data: {
       epicId,
       epicTitle: epic.title,
+      category: failure?.category || null,
       failingStep: failure?.failing_step || null,
       expected: failure?.expected || null,
       actual: failure?.actual || null,
+      stagingError: isStagingError,
     },
     fallback: msg,
   });

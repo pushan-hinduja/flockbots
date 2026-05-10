@@ -1190,7 +1190,10 @@ Your job this round:
           model: (task.dev_model || 'claude-sonnet-4-6') as any,
           tools: AGENT_DEFAULTS.dev.tools,
           promptVariant: 'single',
-          maxTurns: 20,
+          // No --max-turns: review feedback can be substantive (5-blocker
+          // reviews routinely need 50+ turns to address). sessionTimeout +
+          // dev's snapshot-based auto-resume handle the bound — if the
+          // worktree stops changing, the resume loop escalates.
           effortSize: task.effort_size || 'M',
           effortLevel: (task.dev_effort || 'medium') as any,
           extraPromptContext: `CODE REVIEW — CHANGES REQUESTED (attempt ${task.retry_count + 1}/5)
@@ -1396,12 +1399,35 @@ async function runQAStage(task: Task): Promise<void> {
   logEvent(task.id, 'qa', 'qa_failed', `QA verification failed: ${failure.failing_step || 'unknown step'}`);
   db.prepare("UPDATE tasks SET qa_status = 'failed' WHERE id = ?").run(task.id);
   await updateStatus(task.id, 'qa_failed');
-  await createQAFixTask(task, failure);
+
+  // staging_error means the QA agent couldn't actually exercise the
+  // feature — Playwright MCP unavailable, repeated element timeouts,
+  // staging deploy broken, etc. Auto-spawning a code-fix task for that
+  // sends a dev to chase a phantom regression. Skip the fix task and
+  // escalate to the operator instead so they can fix staging.
+  const isStagingError = failure.category === 'staging_error';
+  if (!isStagingError) {
+    await createQAFixTask(task, failure);
+  } else {
+    logEvent(task.id, 'qa', 'qa_staging_error',
+      `Skipping auto-fix task: QA failed with staging_error (${failure.failing_step || 'unknown step'})`);
+  }
 
   // Integration QA for an epic: halt the epic with finalizeEpic's escalation
   // (it knows the epic context). Suppress the generic QA-fail notification.
   if (task.source === 'epic-qa' && task.parent_task_id) {
     await finalizeEpic(task.parent_task_id, 'failed', failure);
+  } else if (isStagingError) {
+    await handleEscalation(task, result, [
+      `QA could not run because of a staging environment error.`,
+      ``,
+      `Failing step: ${failure.failing_step || '(unknown)'}`,
+      `Detail: ${failure.actual || failure.expected || '(no detail captured)'}`,
+      ``,
+      `This is not a code regression — staging is broken or the QA agent`,
+      `couldn't reach the browser. No fix task was auto-created. Investigate`,
+      `staging health, then reply to re-queue QA for task ${task.id}.`,
+    ].join('\n'));
   } else {
     await notifyOperatorQAFail(task, failure);
   }
@@ -1768,7 +1794,9 @@ async function runPostMergeKnowledgeUpdate(task: Task): Promise<void> {
       taskId: task.id,
       model: 'claude-sonnet-4-6',
       tools: ['Read', 'Write', 'Glob', 'Grep'],
-      maxTurns: 10,
+      // No --max-turns: sessionTimeout (30min default for unsized PM
+      // calls) + count-based auto-resume bound this fire-and-forget
+      // doc-update path. The previous 10-turn cap was arbitrary.
       extraPromptContext: `POST-MERGE KNOWLEDGE UPDATE
 
 A feature was just merged. Review the diff below and update the relevant sharded skills files if any of these changed:

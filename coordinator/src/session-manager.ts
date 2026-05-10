@@ -93,16 +93,20 @@ export interface AgentConfig {
 // Per-segment session timeouts (ms). With auto-resume in place the *total*
 // budget per task can span many of these segments — the timeout is just
 // when the agent gets cut off mid-thought and the resume loop picks back
-// up. Bumped L to 60min and XL to 90min so substantial work fits in one
-// segment more often, reducing context-warmup waste from too many resumes.
+// up. Bumped repeatedly after observing every size routinely hit the
+// wall-clock mid-thought; resumes pick up and finish but each cutoff
+// burns context-warmup tokens on the next segment. Generous per-segment
+// budgets keep more work in a single segment. Real "stuck forever" is
+// rare with effort/turn limits removed, so the cost of being too
+// permissive here is low.
 const SESSION_TIMEOUT: Record<string, number> = {
-  'XS': 15 * 60 * 1000,
-  'S':  15 * 60 * 1000,
-  'M':  30 * 60 * 1000,
-  'L':  60 * 60 * 1000,
-  'XL': 90 * 60 * 1000,
+  'XS': 30 * 60 * 1000,
+  'S':  45 * 60 * 1000,
+  'M':  60 * 60 * 1000,
+  'L':  120 * 60 * 1000,
+  'XL': 180 * 60 * 1000,
 };
-const DEFAULT_SESSION_TIMEOUT = 30 * 60 * 1000;
+const DEFAULT_SESSION_TIMEOUT = 60 * 60 * 1000;
 
 // Fallback map from task size to effort level when no explicit effortLevel is passed.
 // Only used for dev/reviewer when PM didn't record an explicit dev_effort/reviewer_effort.
@@ -798,33 +802,44 @@ export async function runAgent(config: AgentConfig): Promise<SessionResult> {
     ? resultEvent.result.trim()
     : undefined;
 
+  // Activity-tape session-end summary. Stored at full length — the dashboard
+  // truncates visually with CSS and expand-on-click reveals the rest.
   const durHuman = formatDuration(durationMs);
   let endMsg: string;
   if (status === 'complete') {
-    const summary = finalAgentMessage ? truncateForTape(finalAgentMessage, 240) : '';
-    endMsg = summary
-      ? `Finished ${config.agent} (${durHuman}) — ${summary}`
+    endMsg = finalAgentMessage
+      ? `Finished ${config.agent} (${durHuman}) — ${collapseWhitespace(finalAgentMessage)}`
       : `Finished ${config.agent} (${durHuman})`;
   } else if (status === 'max_turns_reached') {
-    const note = finalAgentMessage ? truncateForTape(finalAgentMessage, 240) : '(no handoff note)';
+    const note = finalAgentMessage ? collapseWhitespace(finalAgentMessage) : '(no handoff note)';
     const cap = typeof maxTurns === 'number' ? `${maxTurns}-turn` : 'turn';
     endMsg = `Stopped ${config.agent} — hit ${cap} limit (${durHuman}) — ${note}`;
   } else if (status === 'timeout') {
-    const note = finalAgentMessage ? truncateForTape(finalAgentMessage, 240) : '(no handoff note)';
+    const note = finalAgentMessage ? collapseWhitespace(finalAgentMessage) : '(no handoff note)';
     endMsg = `Stopped ${config.agent} — wall-clock timeout (${durHuman}) — ${note}`;
   } else if (status === 'questions_pending' || status === 'escalate') {
     endMsg = `Stopped ${config.agent} — needs operator input (${durHuman})`;
   } else {
     // 'failed' — surface whatever signal we have. Order of preference:
-    // (a) agent's final result text (often explains the crash)
-    // (b) stderr last 240 chars
-    // (c) generic "exit code N"
+    //   (a) agent's final result text (often explains the crash)
+    //   (b) result event subtype (e.g. error_during_execution)
+    //   (c) stderr (the canonical CLI error sink)
+    //   (d) stdout tail (the JSON envelope often has clues even on crash)
+    //   (e) generic "exit code N"
+    // Plus dump full stdout/stderr to pm2 stderr for forensics — the
+    // activity tape is for skim, the logs are for grep.
+    const subtype = typeof resultEvent?.subtype === 'string' ? resultEvent.subtype : '';
     const detail = finalAgentMessage
-      ? truncateForTape(finalAgentMessage, 240)
-      : result.stderr
-        ? truncateForTape(result.stderr, 240)
-        : `exit ${result.exitCode}`;
+      ? collapseWhitespace(finalAgentMessage)
+      : subtype && subtype !== 'success'
+        ? `subtype=${subtype}${result.stderr ? ` | stderr: ${collapseWhitespace(result.stderr)}` : ''}`
+        : result.stderr
+          ? collapseWhitespace(result.stderr)
+          : result.stdout
+            ? `(no stderr, no result event) stdout tail: ${collapseWhitespace(result.stdout.slice(-1000))}`
+            : `exit ${result.exitCode}`;
     endMsg = `Stopped ${config.agent} — failed (${durHuman}): ${detail}`;
+    console.error(`[${config.taskId}] failed session full output:\n--- stdout ---\n${result.stdout}\n--- stderr ---\n${result.stderr}\n--- end ---`);
   }
   logEvent(config.taskId, config.agent, 'session_end', endMsg);
 
@@ -838,14 +853,13 @@ export async function runAgent(config: AgentConfig): Promise<SessionResult> {
 }
 
 /**
- * Single-line, length-capped excerpt for the activity tape. Collapses
- * whitespace + newlines so a multi-paragraph handoff note still fits in one
- * row, with an ellipsis when truncated.
+ * Single-line excerpt for the activity tape. Collapses whitespace + newlines
+ * so a multi-paragraph handoff note renders as one logical row; the
+ * dashboard's CSS handles visual ellipsis when collapsed and reveals the
+ * full text on click-to-expand.
  */
-function truncateForTape(text: string, max: number): string {
-  const collapsed = text.replace(/\s+/g, ' ').trim();
-  if (collapsed.length <= max) return collapsed;
-  return collapsed.slice(0, max - 1) + '…';
+function collapseWhitespace(text: string): string {
+  return text.replace(/\s+/g, ' ').trim();
 }
 
 /**
@@ -915,7 +929,7 @@ export async function runAgentWithRetry(config: AgentConfig, maxRetries: number)
 
       if (decision.resume) {
         const note = result.finalAgentMessage
-          ? truncateForTape(result.finalAgentMessage, 200)
+          ? collapseWhitespace(result.finalAgentMessage)
           : '(no handoff note)';
         logEvent(currentConfig.taskId, currentConfig.agent, 'auto_resume',
           `Resuming ${currentConfig.agent} (continuation ${segmentNum + 1}, ${formatDuration(cumulativeWallMs)} so far) — ${note}`);

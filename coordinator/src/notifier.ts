@@ -16,7 +16,12 @@ export async function notifyOperator(message: string): Promise<void> {
   }
   try {
     await chatProvider.send(message);
-    logEvent(null, 'notifier', 'chat_sent', message.slice(0, 100));
+    // Store the full message — the activity tape's expand-on-click reads
+    // event.message verbatim. Previously sliced to 100 chars, which left
+    // expand showing a mid-word cutoff for any non-trivial notification.
+    // SQLite TEXT is unbounded; the dashboard CSS handles visual
+    // truncation while the row is collapsed.
+    logEvent(null, 'notifier', 'chat_sent', message);
   } catch (err: any) {
     console.error('Chat send failed:', err.message);
     console.log('[Notification]', message);
@@ -42,10 +47,11 @@ export async function notifyOperatorMedia(
   }
   try {
     await chatProvider.sendMedia(caption, mediaUrl, type);
-    logEvent(null, 'notifier', 'chat_media_sent', `${type}: ${caption.slice(0, 60)}`);
+    // Full caption stored — see notifyOperator for rationale.
+    logEvent(null, 'notifier', 'chat_media_sent', `${type}: ${caption}`);
   } catch (err: any) {
     console.error('Chat media send failed:', err.message);
-    logEvent(null, 'notifier', 'chat_media_fallback', `${type} failed, sent text: ${err.message?.slice(0, 100)}`);
+    logEvent(null, 'notifier', 'chat_media_fallback', `${type} failed, sent text: ${err.message || ''}`);
     await notifyOperator(`${caption}\nMedia: ${mediaUrl}`);
   }
 }
